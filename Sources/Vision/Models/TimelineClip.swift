@@ -12,6 +12,9 @@ public struct TimelineClip: Identifiable, Hashable {
     public var orientation: ClipOrientation
     public var linkGroupId: UUID?
     public var isOrphan: Bool
+    public var speed: Double // 1.0 = normale, 0.5 = slow motion 50%, 2.0 = 200%
+    public var cageIndex: Int? // Indice della gabbia ritmata occupata
+    public var span: Int // Numero di gabbie occupate (default 1)
 
     public init(
         id: UUID = UUID(),
@@ -23,7 +26,10 @@ public struct TimelineClip: Identifiable, Hashable {
         mediaType: AVMediaType = .video,
         orientation: ClipOrientation? = nil,
         linkGroupId: UUID? = nil,
-        isOrphan: Bool = false
+        isOrphan: Bool = false,
+        speed: Double = 1.0,
+        cageIndex: Int? = nil,
+        span: Int = 1
     ) {
         self.id = id
         self.mediaItem = mediaItem
@@ -35,9 +41,22 @@ public struct TimelineClip: Identifiable, Hashable {
         self.orientation = orientation ?? mediaItem.orientation
         self.linkGroupId = linkGroupId
         self.isOrphan = isOrphan
+        self.speed = speed
+        self.cageIndex = cageIndex
+        self.span = max(1, span)
     }
 
     public var duration: CMTime {
+        let raw = CMTimeSubtract(sourceOut, sourceIn)
+        if speed > 0 && speed != 1.0 {
+            // Durata sulla timeline dilatata o compressa in base alla velocità
+            let sec = CMTimeGetSeconds(raw) / speed
+            return CMTime(seconds: sec, preferredTimescale: 600)
+        }
+        return raw
+    }
+
+    public var sourceDuration: CMTime {
         CMTimeSubtract(sourceOut, sourceIn)
     }
 

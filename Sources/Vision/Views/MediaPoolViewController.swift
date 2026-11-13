@@ -16,9 +16,11 @@ public protocol MediaPoolDelegate: AnyObject {
     func didActivateSection(_ section: FocusedSection)
     func didSwitchActiveTimeline(to timeline: TimelineModel)
     func didDeleteMediaItemFromPool(_ item: MediaItem)
+    func didUpdateTimelineFormat(_ timeline: TimelineModel)
 }
 
 public let kMediaItemPasteboardType = NSPasteboard.PasteboardType("com.vision.mediaitem.id")
+public let kSelectionPasteboardType = NSPasteboard.PasteboardType("com.vision.selection.id")
 
 final class DragDropContainerView: NSView {
     var onURLsDropped: (([URL]) -> Void)?
@@ -76,6 +78,7 @@ final class ContextMenuTableView: NSTableView {
 
 public enum MediaPoolListItem {
     case timeline(TimelineModel, index: Int)
+    case selection(SelectionModel, index: Int)
     case media(MediaItem)
     case folder(MediaFolder)
 }
@@ -89,6 +92,11 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         }
     }
     public private(set) var mediaItems: [MediaItem] = []
+
+    public func setMediaItems(_ items: [MediaItem]) {
+        self.mediaItems = items
+        self.refreshMediaPoolDisplay()
+    }
 
     public var displayedMediaItems: [MediaItem] {
         if let activeFId = EditorProject.shared.activeFolderId {
@@ -106,6 +114,9 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             for (idx, tl) in EditorProject.shared.timelines.enumerated() {
                 items.append(.timeline(tl, index: idx))
             }
+            for (idx, sel) in EditorProject.shared.selections.enumerated() {
+                items.append(.selection(sel, index: idx))
+            }
         }
         for m in displayedMediaItems {
             items.append(.media(m))
@@ -118,17 +129,43 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         return items
     }
 
+    public var onOpenSelectionInSelectionMode: ((SelectionModel) -> Void)?
+
+    public var selectedMediaItems: [MediaItem] {
+        let selectedRows = contentTableView.selectedRowIndexes
+        var items: [MediaItem] = []
+        for idx in selectedRows where idx < currentListItems.count {
+            if case .media(let m) = currentListItems[idx] {
+                items.append(m)
+            }
+        }
+        return items
+    }
+
+    public enum SidebarRow {
+        case allFiles
+        case folder(MediaFolder, Int)
+    }
+
+    public var sidebarRows: [SidebarRow] {
+        var rows: [SidebarRow] = [.allFiles]
+        for (idx, f) in EditorProject.shared.folders.enumerated() {
+            rows.append(.folder(f, idx))
+        }
+        return rows
+    }
+
     private enum ViewMode {
         case list
         case grid
     }
     private var currentViewMode: ViewMode = .list
 
-    // Top Header Controls
-    private let mediaPoolTabBtn = FlatButton(title: "Media pool")
-    private let timelineGridTabBtn = FlatButton(title: "Timeline grid")
-    private let listModeBtn = FlatButton()
-    private let gridModeBtn = FlatButton()
+    // Top Header Controls (Boxless Lucide Icons)
+    private let mediaPoolTabBtn = IconActionButton(toolTip: "Media Pool")
+    private let timelineGridTabBtn = IconActionButton(toolTip: "Timeline Grid")
+    private let listModeBtn = IconActionButton(toolTip: "Vista Elenco (List)")
+    private let gridModeBtn = IconActionButton(toolTip: "Vista Anteprime (Grid)")
 
     // Media Pool View Hierarchy
     private let mediaPoolContainer = NSView()
@@ -136,7 +173,6 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
 
     // Sidebar: Project & Folders
     private let sidebarContainer = NSView()
-    private let projectHeaderBtn = FlatButton()
     private let sidebarTableView = ContextMenuTableView()
     private let sidebarScrollView = NSScrollView()
 
@@ -207,8 +243,22 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             timelineGridContainer.bottomAnchor.constraint(equalTo: dropContainer.bottomAnchor)
         ])
 
-        updateProjectHeader()
         refreshMediaPoolDisplay()
+
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("MediaItemProxyGenerated"),
+            object: nil,
+            queue: .main
+        ) { [weak self] notif in
+            guard let self = self,
+                  let info = notif.userInfo,
+                  let itemId = info["itemId"] as? UUID,
+                  let proxyURL = info["proxyURL"] as? URL else { return }
+            if let idx = self.mediaItems.firstIndex(where: { $0.id == itemId }) {
+                self.mediaItems[idx].proxyURL = proxyURL
+                self.refreshMediaPoolDisplay()
+            }
+        }
 
         self.view = dropContainer
     }
@@ -217,50 +267,62 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         let tabsStack = NSStackView()
         tabsStack.translatesAutoresizingMaskIntoConstraints = false
         tabsStack.orientation = .horizontal
-        tabsStack.spacing = 6
+        tabsStack.spacing = 10
         tabsStack.alignment = .centerY
         topHeader.addSubview(tabsStack)
 
-        mediaPoolTabBtn.isAccentActive = true
+        mediaPoolTabBtn.image = Lucide.template(.fileVideoCamera, size: 17)
+        mediaPoolTabBtn.toolTip = "Media Pool"
+        mediaPoolTabBtn.activeTintColor = .systemCyan
+        mediaPoolTabBtn.isToggleActive = true
         mediaPoolTabBtn.target = self
         mediaPoolTabBtn.action = #selector(onMediaPoolTabClicked)
+        mediaPoolTabBtn.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        mediaPoolTabBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
         tabsStack.addArrangedSubview(mediaPoolTabBtn)
 
-        timelineGridTabBtn.isAccentActive = false
+        timelineGridTabBtn.image = Lucide.template(.galleryHorizontalEnd, size: 17)
+        timelineGridTabBtn.toolTip = "Timeline Grid"
+        timelineGridTabBtn.activeTintColor = .systemCyan
+        timelineGridTabBtn.isToggleActive = false
         timelineGridTabBtn.target = self
         timelineGridTabBtn.action = #selector(onTimelineGridTabClicked)
+        timelineGridTabBtn.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        timelineGridTabBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
         tabsStack.addArrangedSubview(timelineGridTabBtn)
 
         let viewModeStack = NSStackView()
         viewModeStack.translatesAutoresizingMaskIntoConstraints = false
         viewModeStack.orientation = .horizontal
-        viewModeStack.spacing = 4
+        viewModeStack.spacing = 8
         viewModeStack.alignment = .centerY
         topHeader.addSubview(viewModeStack)
 
-        listModeBtn.image = Lucide.image(.list, size: 16, color: .labelColor)
+        listModeBtn.image = Lucide.template(.list, size: 16)
         listModeBtn.toolTip = "Vista Elenco (List)"
-        listModeBtn.isAccentActive = true
+        listModeBtn.activeTintColor = .systemCyan
+        listModeBtn.isToggleActive = true
         listModeBtn.target = self
         listModeBtn.action = #selector(onListModeClicked)
-        listModeBtn.widthAnchor.constraint(equalToConstant: 30).isActive = true
-        listModeBtn.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        listModeBtn.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        listModeBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
         viewModeStack.addArrangedSubview(listModeBtn)
 
-        gridModeBtn.image = Lucide.image(.layoutGrid, size: 16, color: .labelColor)
+        gridModeBtn.image = Lucide.template(.squarePlay, size: 16)
         gridModeBtn.toolTip = "Vista Anteprime (Grid)"
-        gridModeBtn.isAccentActive = false
+        gridModeBtn.activeTintColor = .systemCyan
+        gridModeBtn.isToggleActive = false
         gridModeBtn.target = self
         gridModeBtn.action = #selector(onGridModeClicked)
-        gridModeBtn.widthAnchor.constraint(equalToConstant: 30).isActive = true
-        gridModeBtn.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        gridModeBtn.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        gridModeBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
         viewModeStack.addArrangedSubview(gridModeBtn)
 
         NSLayoutConstraint.activate([
-            tabsStack.leadingAnchor.constraint(equalTo: topHeader.leadingAnchor, constant: 8),
+            tabsStack.leadingAnchor.constraint(equalTo: topHeader.leadingAnchor, constant: 10),
             tabsStack.centerYAnchor.constraint(equalTo: topHeader.centerYAnchor),
 
-            viewModeStack.trailingAnchor.constraint(equalTo: topHeader.trailingAnchor, constant: -8),
+            viewModeStack.trailingAnchor.constraint(equalTo: topHeader.trailingAnchor, constant: -10),
             viewModeStack.centerYAnchor.constraint(equalTo: topHeader.centerYAnchor)
         ])
     }
@@ -295,16 +357,13 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         sidebarContainer.wantsLayer = true
         sidebarContainer.layer?.backgroundColor = NSColor(calibratedWhite: 0.14, alpha: 1.0).cgColor
 
-        projectHeaderBtn.translatesAutoresizingMaskIntoConstraints = false
-        projectHeaderBtn.image = Lucide.image(.clapperboard, size: 14, color: .systemCyan)
-        projectHeaderBtn.toolTip = "Progetto attivo (Clicca per rinominare)"
-        projectHeaderBtn.target = self
-        projectHeaderBtn.action = #selector(onProjectHeaderClicked)
-        sidebarContainer.addSubview(projectHeaderBtn)
-
         sidebarScrollView.translatesAutoresizingMaskIntoConstraints = false
         sidebarScrollView.documentView = sidebarTableView
+        sidebarScrollView.borderType = .noBorder
         sidebarScrollView.hasVerticalScroller = true
+        sidebarScrollView.hasHorizontalScroller = false
+        sidebarScrollView.scrollerStyle = .overlay
+        sidebarScrollView.autohidesScrollers = true
         sidebarScrollView.drawsBackground = false
         sidebarContainer.addSubview(sidebarScrollView)
 
@@ -312,6 +371,8 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         col.title = "Cartelle"
         sidebarTableView.addTableColumn(col)
         sidebarTableView.headerView = nil
+        sidebarTableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        sidebarTableView.sizeLastColumnToFit()
         sidebarTableView.dataSource = self
         sidebarTableView.delegate = self
         sidebarTableView.doubleAction = #selector(onSidebarDoubleClicked)
@@ -329,12 +390,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         }
 
         NSLayoutConstraint.activate([
-            projectHeaderBtn.topAnchor.constraint(equalTo: sidebarContainer.topAnchor, constant: 4),
-            projectHeaderBtn.leadingAnchor.constraint(equalTo: sidebarContainer.leadingAnchor, constant: 6),
-            projectHeaderBtn.trailingAnchor.constraint(equalTo: sidebarContainer.trailingAnchor, constant: -6),
-            projectHeaderBtn.heightAnchor.constraint(equalToConstant: 28),
-
-            sidebarScrollView.topAnchor.constraint(equalTo: projectHeaderBtn.bottomAnchor, constant: 4),
+            sidebarScrollView.topAnchor.constraint(equalTo: sidebarContainer.topAnchor, constant: 4),
             sidebarScrollView.leadingAnchor.constraint(equalTo: sidebarContainer.leadingAnchor),
             sidebarScrollView.trailingAnchor.constraint(equalTo: sidebarContainer.trailingAnchor),
             sidebarScrollView.bottomAnchor.constraint(equalTo: sidebarContainer.bottomAnchor)
@@ -347,7 +403,11 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
 
         contentTableScrollView.translatesAutoresizingMaskIntoConstraints = false
         contentTableScrollView.documentView = contentTableView
+        contentTableScrollView.borderType = .noBorder
         contentTableScrollView.hasVerticalScroller = true
+        contentTableScrollView.hasHorizontalScroller = false
+        contentTableScrollView.scrollerStyle = .overlay
+        contentTableScrollView.autohidesScrollers = true
         contentTableScrollView.drawsBackground = false
         contentContainer.addSubview(contentTableScrollView)
 
@@ -386,7 +446,12 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         // Grid View Setup
         gridScrollView.translatesAutoresizingMaskIntoConstraints = false
         gridScrollView.documentView = gridView
+        gridScrollView.borderType = .noBorder
         gridScrollView.hasVerticalScroller = true
+        gridScrollView.hasHorizontalScroller = false
+        gridScrollView.scrollerStyle = .overlay
+        gridScrollView.autohidesScrollers = true
+        gridScrollView.drawsBackground = false
         gridScrollView.isHidden = true
         contentContainer.addSubview(gridScrollView)
 
@@ -431,6 +496,9 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         gridView.onDeleteFromPool = { [weak self] item in
             self?.deleteMediaItem(item)
         }
+        gridView.onURLsDropped = { [weak self] urls in
+            self?.processDroppedURLs(urls)
+        }
         gridView.onContextMenuRequested = { [weak self] event in
             self?.buildGeneralContextMenu()
         }
@@ -443,8 +511,24 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         gridView.onRenameTimeline = { [weak self] idx in
             self?.showRenameTimelineDialog(timelineIndex: idx)
         }
+        gridView.onTimelineSettings = { [weak self] tl, _ in
+            self?.showTimelineSettingsDialog(for: tl)
+        }
         gridView.onDeleteTimeline = { [weak self] idx in
             self?.deleteTimeline(index: idx)
+        }
+        gridView.onOpenSelection = { [weak self] sel, _ in
+            self?.delegate?.didActivateSection(.mediaPool)
+            self?.onOpenSelectionInSelectionMode?(sel)
+        }
+        gridView.onRenameSelection = { [weak self] sel in
+            self?.showRenameSelectionDialog(for: sel)
+        }
+        gridView.onDuplicateSelection = { [weak self] sel in
+            self?.duplicateSelection(sel)
+        }
+        gridView.onDeleteSelection = { [weak self] sel in
+            self?.deleteSelection(sel)
         }
         gridView.onOpenFolder = { [weak self] f in
             self?.delegate?.didActivateSection(.mediaPool)
@@ -577,20 +661,11 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         ])
     }
 
-    private func updateProjectHeader() {
-        projectHeaderBtn.title = "  \(EditorProject.shared.projectName)"
-    }
-
-    @objc private func onProjectHeaderClicked() {
-        delegate?.didActivateSection(.mediaPool)
-        showRenameProjectDialog()
-    }
-
     // MARK: - Tab & View Mode Actions
     @objc private func onMediaPoolTabClicked() {
         delegate?.didActivateSection(.mediaPool)
-        mediaPoolTabBtn.isAccentActive = true
-        timelineGridTabBtn.isAccentActive = false
+        mediaPoolTabBtn.isToggleActive = true
+        timelineGridTabBtn.isToggleActive = false
         listModeBtn.isHidden = false
         gridModeBtn.isHidden = false
         mediaPoolContainer.isHidden = false
@@ -599,8 +674,8 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
 
     @objc private func onTimelineGridTabClicked() {
         delegate?.didActivateSection(.mediaPool)
-        mediaPoolTabBtn.isAccentActive = false
-        timelineGridTabBtn.isAccentActive = true
+        mediaPoolTabBtn.isToggleActive = false
+        timelineGridTabBtn.isToggleActive = true
         listModeBtn.isHidden = true
         gridModeBtn.isHidden = true
         mediaPoolContainer.isHidden = true
@@ -612,16 +687,16 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     @objc private func onListModeClicked() {
         delegate?.didActivateSection(.mediaPool)
         currentViewMode = .list
-        listModeBtn.isAccentActive = true
-        gridModeBtn.isAccentActive = false
+        listModeBtn.isToggleActive = true
+        gridModeBtn.isToggleActive = false
         updateContentModeVisibility()
     }
 
     @objc private func onGridModeClicked() {
         delegate?.didActivateSection(.mediaPool)
         currentViewMode = .grid
-        listModeBtn.isAccentActive = false
-        gridModeBtn.isAccentActive = true
+        listModeBtn.isToggleActive = false
+        gridModeBtn.isToggleActive = true
         updateContentModeVisibility()
     }
 
@@ -642,6 +717,9 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 for (idx, tl) in EditorProject.shared.timelines.enumerated() {
                     items.append(.timeline(tl, index: idx))
                 }
+                for (idx, sel) in EditorProject.shared.selections.enumerated() {
+                    items.append(.selection(sel, index: idx))
+                }
             }
             for m in displayedMediaItems {
                 items.append(.media(m))
@@ -659,6 +737,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                     switch currentListItems[idx] {
                     case .media(let m): return m.id
                     case .timeline(let tl, _): return tl.id
+                    case .selection(let sel, _): return sel.id
                     case .folder(let f): return f.id
                     }
                 }
@@ -669,7 +748,6 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     }
 
     public func refreshMediaPoolDisplay() {
-        updateProjectHeader()
         sidebarTableView.reloadData()
         updateSidebarSelection()
         contentTableView.reloadData()
@@ -771,6 +849,10 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             openItem.representedObject = index
             menu.addItem(openItem)
 
+            let settingsItem = NSMenuItem(title: "⚙️ Impostazioni timeline...", action: #selector(contextTimelineSettings(_:)), keyEquivalent: "")
+            settingsItem.representedObject = timeline
+            menu.addItem(settingsItem)
+
             let renameItem = NSMenuItem(title: "✏️ Rinomina timeline...", action: #selector(contextRenameTimeline(_:)), keyEquivalent: "")
             renameItem.representedObject = index
             menu.addItem(renameItem)
@@ -781,6 +863,26 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 delItem.representedObject = index
                 menu.addItem(delItem)
             }
+            return menu
+
+        case .selection(let sel, _):
+            let menu = NSMenu(title: sel.name)
+            let openItem = NSMenuItem(title: "✨ Apri in Modalità Selezione", action: #selector(contextOpenSelection(_:)), keyEquivalent: "")
+            openItem.representedObject = sel
+            menu.addItem(openItem)
+
+            let renameItem = NSMenuItem(title: "✏️ Rinomina selezione...", action: #selector(contextRenameSelection(_:)), keyEquivalent: "")
+            renameItem.representedObject = sel
+            menu.addItem(renameItem)
+
+            let dupItem = NSMenuItem(title: "📄 Duplica selezione", action: #selector(contextDuplicateSelection(_:)), keyEquivalent: "")
+            dupItem.representedObject = sel
+            menu.addItem(dupItem)
+
+            menu.addItem(NSMenuItem.separator())
+            let delItem = NSMenuItem(title: "🗑️ Elimina selezione", action: #selector(contextDeleteSelection(_:)), keyEquivalent: "")
+            delItem.representedObject = sel
+            menu.addItem(delItem)
             return menu
 
         case .folder(let folder):
@@ -821,6 +923,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 menu.addItem(orientParent)
             }
 
+            let parentFolderItem = NSMenuItem(title: "📁 Sposta in cartella", action: nil, keyEquivalent: "")
             let folderMenu = NSMenu(title: "Cartella")
             let rootItem = NSMenuItem(title: "Principale (Nessuna)", action: #selector(contextMoveMediaToFolder(_:)), keyEquivalent: "")
             rootItem.representedObject = (media, nil as UUID?)
@@ -830,9 +933,17 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 fItem.representedObject = (media, f.id as UUID?)
                 folderMenu.addItem(fItem)
             }
-            let parentFolderItem = NSMenuItem(title: "📁 Sposta in cartella", action: nil, keyEquivalent: "")
             parentFolderItem.submenu = folderMenu
             menu.addItem(parentFolderItem)
+
+            menu.addItem(NSMenuItem.separator())
+            let selItem = NSMenuItem(title: "🎯 Crea Nuova Selezione...", action: #selector(contextCreateSelectionFromSelected), keyEquivalent: "")
+            selItem.representedObject = media
+            menu.addItem(selItem)
+
+            let proxyItem = NSMenuItem(title: "⚡ Crea Proxy Video...", action: #selector(contextGenerateProxyForSelected), keyEquivalent: "")
+            proxyItem.representedObject = media
+            menu.addItem(proxyItem)
 
             menu.addItem(NSMenuItem.separator())
             let deleteItem = NSMenuItem(title: "🗑️ Elimina dal Media Pool", action: #selector(contextDeleteMediaFromPool(_:)), keyEquivalent: "")
@@ -874,9 +985,39 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         }
     }
 
+    @objc private func contextTimelineSettings(_ sender: NSMenuItem) {
+        if let tl = sender.representedObject as? TimelineModel {
+            showTimelineSettingsDialog(for: tl)
+        }
+    }
+
     @objc private func contextDeleteTimeline(_ sender: NSMenuItem) {
         if let idx = sender.representedObject as? Int {
             deleteTimeline(index: idx)
+        }
+    }
+
+    @objc private func contextOpenSelection(_ sender: NSMenuItem) {
+        if let sel = sender.representedObject as? SelectionModel {
+            openSelection(sel)
+        }
+    }
+
+    @objc private func contextRenameSelection(_ sender: NSMenuItem) {
+        if let sel = sender.representedObject as? SelectionModel {
+            showRenameSelectionDialog(for: sel)
+        }
+    }
+
+    @objc private func contextDuplicateSelection(_ sender: NSMenuItem) {
+        if let sel = sender.representedObject as? SelectionModel {
+            duplicateSelection(sel)
+        }
+    }
+
+    @objc private func contextDeleteSelection(_ sender: NSMenuItem) {
+        if let sel = sender.representedObject as? SelectionModel {
+            deleteSelection(sel)
         }
     }
 
@@ -927,14 +1068,59 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         }
     }
 
+    @objc private func contextCreateSelectionFromSelected(_ sender: NSMenuItem) {
+        var chosen = selectedMediaItems
+        if chosen.isEmpty, let m = sender.representedObject as? MediaItem {
+            chosen = [m]
+        }
+        let clipsToUse = chosen.isEmpty ? mediaItems : chosen
+        guard !clipsToUse.isEmpty else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Nuova Selezione"
+        alert.informativeText = "Inserisci un nome per la selezione di \(clipsToUse.count) clip:"
+        alert.alertStyle = .informational
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        input.stringValue = "Selezione \(EditorProject.shared.selections.count + 1)"
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Crea")
+        alert.addButton(withTitle: "Annulla")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let newSel = EditorProject.shared.createSelection(name: name.isEmpty ? "Selezione" : name, clips: clipsToUse)
+            refreshMediaPoolDisplay()
+            onOpenSelectionInSelectionMode?(newSel)
+            DebugLogger.shared.log("Creata selezione '\(newSel.name)' con \(clipsToUse.count) clip dal Media Pool.", level: .info)
+        }
+    }
+
+    @objc private func contextGenerateProxyForSelected(_ sender: NSMenuItem) {
+        var chosen = selectedMediaItems
+        if chosen.isEmpty, let m = sender.representedObject as? MediaItem {
+            chosen = [m]
+        }
+        let clipsToUse = chosen.isEmpty ? mediaItems : chosen
+        guard !clipsToUse.isEmpty else { return }
+
+        let dialog = ProxyGenerationDialog(mediaItems: clipsToUse) { [weak self] in
+            DispatchQueue.main.async {
+                self?.contentTableView.reloadData()
+                self?.timelineGridView.reloadData()
+            }
+        }
+        dialog.showWindow(nil)
+    }
+
     @objc private func onSidebarDoubleClicked() {
         delegate?.didActivateSection(.mediaPool)
         let row = sidebarTableView.clickedRow
-        if row > 0 && row - 1 < EditorProject.shared.folders.count {
-            let folder = EditorProject.shared.folders[row - 1]
-            showRenameFolderDialog(folder: folder)
-        } else if row == 0 {
+        guard row >= 0 && row < sidebarRows.count else { return }
+        switch sidebarRows[row] {
+        case .allFiles:
             showRenameProjectDialog()
+        case .folder(let folder, _):
+            showRenameFolderDialog(folder: folder)
         }
     }
 
@@ -1038,6 +1224,54 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         delegate?.didSwitchActiveTimeline(to: EditorProject.shared.activeTimeline)
     }
 
+    private func showTimelineSettingsDialog(for timeline: TimelineModel) {
+        delegate?.didActivateSection(.mediaPool)
+        if let updatedFormat = TimelineSettingsDialog.runModal(for: timeline, on: view.window) {
+            timeline.format = updatedFormat
+            delegate?.didUpdateTimelineFormat(timeline)
+            refreshMediaPoolDisplay()
+            DebugLogger.shared.log("Impostazioni timeline '\(timeline.name)' aggiornate: \(updatedFormat.name) (\(updatedFormat.fps) fps)", level: .info)
+        }
+    }
+
+    private func openSelection(_ selection: SelectionModel) {
+        delegate?.didActivateSection(.mediaPool)
+        if let idx = EditorProject.shared.selections.firstIndex(where: { $0.id == selection.id }) {
+            EditorProject.shared.activeSelectionIndex = idx
+        }
+        onOpenSelectionInSelectionMode?(selection)
+    }
+
+    private func showRenameSelectionDialog(for selection: SelectionModel) {
+        let alert = NSAlert()
+        alert.messageText = "Rinomina Selezione"
+        alert.informativeText = "Inserisci il nuovo nome per la selezione:"
+        alert.alertStyle = .informational
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        input.stringValue = selection.name
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Rinomina")
+        alert.addButton(withTitle: "Annulla")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty {
+                selection.name = name
+                refreshMediaPoolDisplay()
+            }
+        }
+    }
+
+    private func duplicateSelection(_ selection: SelectionModel) {
+        _ = EditorProject.shared.duplicateSelection(id: selection.id)
+        refreshMediaPoolDisplay()
+    }
+
+    private func deleteSelection(_ selection: SelectionModel) {
+        EditorProject.shared.removeSelection(id: selection.id)
+        refreshMediaPoolDisplay()
+    }
+
     private func showRenameProjectDialog() {
         let alert = NSAlert()
         alert.messageText = "Rinomina Progetto"
@@ -1053,7 +1287,6 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if !name.isEmpty {
                 EditorProject.shared.projectName = name
-                updateProjectHeader()
             }
         }
     }
@@ -1217,7 +1450,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     // MARK: - Table View Data Source & Delegate
     public func numberOfRows(in tableView: NSTableView) -> Int {
         if tableView == sidebarTableView {
-            return 1 + EditorProject.shared.folders.count
+            return sidebarRows.count
         } else {
             return currentListItems.count
         }
@@ -1229,12 +1462,15 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
 
         if tv == sidebarTableView {
             let row = tv.selectedRow
-            if row == 0 {
+            guard row >= 0 && row < sidebarRows.count else { return }
+            switch sidebarRows[row] {
+            case .allFiles:
                 EditorProject.shared.activeFolderId = nil
-            } else if row > 0 && row - 1 < EditorProject.shared.folders.count {
-                EditorProject.shared.activeFolderId = EditorProject.shared.folders[row - 1].id
+            case .folder(let f, _):
+                EditorProject.shared.activeFolderId = f.id
             }
             contentTableView.reloadData()
+            timelineGridView.reloadData()
             updateContentModeVisibility()
         } else if tv == contentTableView {
             let selectedRows = contentTableView.selectedRowIndexes
@@ -1243,6 +1479,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                     switch currentListItems[idx] {
                     case .media(let m): return m.id
                     case .timeline(let tl, _): return tl.id
+                    case .selection(let sel, _): return sel.id
                     case .folder(let f): return f.id
                     }
                 }
@@ -1255,29 +1492,43 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     public func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
         guard tableView == contentTableView, row < currentListItems.count else { return nil }
         let item = currentListItems[row]
-        if case .media(let m) = item {
+        switch item {
+        case .media(let m):
             let pbItem = NSPasteboardItem()
             pbItem.setString(m.id.uuidString, forType: kMediaItemPasteboardType)
             pbItem.setString(m.url.absoluteString, forType: .fileURL)
             pbItem.setString(m.url.path, forType: .string)
             return pbItem
+        case .selection(let sel, _):
+            let pbItem = NSPasteboardItem()
+            pbItem.setString(sel.id.uuidString, forType: kSelectionPasteboardType)
+            return pbItem
+        default:
+            return nil
         }
-        return nil
     }
 
     // MARK: - Drag and Drop into Folders (Sidebar & Content Table)
     public func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
+        let (_, fileURLs) = extractDroppedResources(from: info)
+        let isFinderFiles = !fileURLs.isEmpty || info.draggingPasteboard.types?.contains(.fileURL) == true
+
         if tableView == sidebarTableView {
-            if row >= 0 && row <= EditorProject.shared.folders.count {
-                tableView.setDropRow(row, dropOperation: .on)
-                return .move
-            }
-        } else if tableView == contentTableView {
-            if row >= 0 && row < currentListItems.count {
-                if case .folder = currentListItems[row] {
+            if row >= 0 && row < sidebarRows.count {
+                if case .folder = sidebarRows[row] {
                     tableView.setDropRow(row, dropOperation: .on)
-                    return .move
+                    return isFinderFiles ? .copy : .move
                 }
+            }
+            tableView.setDropRow(-1, dropOperation: .on)
+            return isFinderFiles ? .copy : []
+        } else if tableView == contentTableView {
+            if row >= 0 && row < currentListItems.count, case .folder = currentListItems[row] {
+                tableView.setDropRow(row, dropOperation: .on)
+                return isFinderFiles ? .copy : .move
+            } else {
+                tableView.setDropRow(-1, dropOperation: .on)
+                return isFinderFiles ? .copy : []
             }
         }
         return []
@@ -1287,8 +1538,10 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         let (clipIds, fileURLs) = extractDroppedResources(from: info)
 
         if tableView == sidebarTableView {
-            let targetFolderId: UUID? = (row > 0 && row - 1 < EditorProject.shared.folders.count) ? EditorProject.shared.folders[row - 1].id : nil
-
+            var targetFolderId: UUID? = nil
+            if row >= 0 && row < sidebarRows.count, case .folder(let f, _) = sidebarRows[row] {
+                targetFolderId = f.id
+            }
             if !clipIds.isEmpty {
                 for id in clipIds {
                     EditorProject.shared.moveItem(id, toFolder: targetFolderId)
@@ -1296,23 +1549,23 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 refreshMediaPoolDisplay()
                 return true
             } else if !fileURLs.isEmpty {
-                importURLs(fileURLs, targetFolderId: targetFolderId)
+                processDroppedURLs(fileURLs)
                 return true
             }
         } else if tableView == contentTableView {
-            if row >= 0 && row < currentListItems.count {
-                if case .folder(let folder) = currentListItems[row] {
-                    if !clipIds.isEmpty {
-                        for id in clipIds {
-                            EditorProject.shared.moveItem(id, toFolder: folder.id)
-                        }
-                        refreshMediaPoolDisplay()
-                        return true
-                    } else if !fileURLs.isEmpty {
-                        importURLs(fileURLs, targetFolderId: folder.id)
-                        return true
-                    }
+            var targetFolderId = EditorProject.shared.activeFolderId
+            if row >= 0 && row < currentListItems.count, case .folder(let folder) = currentListItems[row] {
+                targetFolderId = folder.id
+            }
+            if !clipIds.isEmpty {
+                for id in clipIds {
+                    EditorProject.shared.moveItem(id, toFolder: targetFolderId)
                 }
+                refreshMediaPoolDisplay()
+                return true
+            } else if !fileURLs.isEmpty {
+                processDroppedURLs(fileURLs)
+                return true
             }
         }
         return false
@@ -1327,27 +1580,40 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             for item in pbItems {
                 if let str = item.string(forType: kMediaItemPasteboardType), let uuid = UUID(uuidString: str) {
                     ids.append(uuid)
-                } else if let path = item.string(forType: .fileURL) {
-                    let u = URL(fileURLWithPath: path)
-                    if let m = mediaItems.first(where: { $0.url == u }) {
-                        ids.append(m.id)
+                }
+            }
+        }
+
+        if let fileObjects = pboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+            for u in fileObjects {
+                if let m = mediaItems.first(where: { $0.url.path == u.path }) {
+                    if !ids.contains(m.id) { ids.append(m.id) }
+                } else {
+                    if !urls.contains(u) { urls.append(u) }
+                }
+            }
+        }
+
+        if ids.isEmpty && urls.isEmpty, let pbItems = pboard.pasteboardItems {
+            for item in pbItems {
+                if let path = item.string(forType: .fileURL) {
+                    let u: URL?
+                    if path.hasPrefix("file://") {
+                        u = URL(string: path)
                     } else {
-                        urls.append(u)
+                        u = URL(fileURLWithPath: path)
+                    }
+                    if let u = u {
+                        if let m = mediaItems.first(where: { $0.url.path == u.path }) {
+                            if !ids.contains(m.id) { ids.append(m.id) }
+                        } else {
+                            if !urls.contains(u) { urls.append(u) }
+                        }
                     }
                 }
             }
         }
-        if ids.isEmpty && urls.isEmpty {
-            if let fileList = pboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
-                for u in fileList {
-                    if let m = mediaItems.first(where: { $0.url == u }) {
-                        ids.append(m.id)
-                    } else {
-                        urls.append(u)
-                    }
-                }
-            }
-        }
+
         return (ids, urls)
     }
 
@@ -1362,6 +1628,8 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             EditorProject.shared.activeTimelineIndex = idx
             delegate?.didSwitchActiveTimeline(to: tl)
             refreshMediaPoolDisplay()
+        case .selection(let sel, _):
+            openSelection(sel)
         case .media(let m):
             delegate?.didSelectAddClipToTimeline(m)
         case .folder(let f):
@@ -1372,6 +1640,8 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
 
     public func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         if tableView == sidebarTableView {
+            guard row >= 0 && row < sidebarRows.count else { return nil }
+            let item = sidebarRows[row]
             let cellId = NSUserInterfaceItemIdentifier("SidebarCell")
             var cell = tableView.makeView(withIdentifier: cellId, owner: nil) as? NSTableCellView
             if cell == nil {
@@ -1403,13 +1673,17 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 ])
             }
 
-            if row == 0 {
+            switch item {
+            case .allFiles:
                 cell?.imageView?.image = Lucide.image(.layoutGrid, size: 14, color: .labelColor)
                 cell?.textField?.stringValue = "Tutti i file (\(mediaItems.count))"
-            } else if row - 1 < EditorProject.shared.folders.count {
-                let f = EditorProject.shared.folders[row - 1]
+                cell?.textField?.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+                cell?.textField?.textColor = .labelColor
+            case .folder(let f, _):
                 cell?.imageView?.image = Lucide.image(.folder, size: 14, color: .systemOrange)
                 cell?.textField?.stringValue = "\(f.name) (\(f.itemIds.count))"
+                cell?.textField?.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+                cell?.textField?.textColor = .labelColor
             }
             return cell
         }
@@ -1455,10 +1729,19 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 cell?.imageView?.image = Lucide.image(.clapperboard, size: 14, color: .systemCyan)
                 cell?.textField?.stringValue = tl.name
                 cell?.textField?.textColor = .systemCyan
+            case .selection(let sel, _):
+                cell?.imageView?.image = Lucide.image(.sparkles, size: 14, color: .systemPurple)
+                cell?.textField?.stringValue = sel.name
+                cell?.textField?.textColor = .systemPurple
             case .media(let m):
                 cell?.imageView?.image = Lucide.image(m.hasVideo ? .film : .music, size: 14, color: m.hasVideo ? .systemIndigo : .systemGreen)
-                cell?.textField?.stringValue = m.name
-                cell?.textField?.textColor = .labelColor
+                if m.hasProxy {
+                    cell?.textField?.stringValue = "\(m.name) ⚡[P]"
+                    cell?.textField?.textColor = .systemTeal
+                } else {
+                    cell?.textField?.stringValue = m.name
+                    cell?.textField?.textColor = .labelColor
+                }
             case .folder(let f):
                 cell?.imageView?.image = Lucide.image(.folder, size: 14, color: .systemOrange)
                 cell?.textField?.stringValue = f.name
@@ -1485,6 +1768,12 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                     let secs = Int(dur) % 60
                     textField?.stringValue = dur > 0 ? String(format: "%02d:%02d", mins, secs) : "--:--"
                     textField?.textColor = .secondaryLabelColor
+                case .selection(let sel, _):
+                    let dur = CMTimeGetSeconds(sel.totalSelectedDuration)
+                    let mins = Int(dur) / 60
+                    let secs = Int(dur) % 60
+                    textField?.stringValue = dur > 0 ? String(format: "%02d:%02d", mins, secs) : "--:--"
+                    textField?.textColor = .secondaryLabelColor
                 case .media(let m):
                     textField?.stringValue = m.formattedDuration
                     textField?.textColor = .labelColor
@@ -1496,6 +1785,9 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 switch listItem {
                 case .timeline(let tl, _):
                     textField?.stringValue = "Timeline (\(tl.format.name))"
+                    textField?.textColor = .secondaryLabelColor
+                case .selection(let sel, _):
+                    textField?.stringValue = "Selezione (\(sel.selectedClips.count) clip)"
                     textField?.textColor = .secondaryLabelColor
                 case .media(let m):
                     if m.hasVideo {

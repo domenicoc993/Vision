@@ -61,11 +61,15 @@ public final class PlaybackController: NSObject {
             forName: .AVPlayerItemDidPlayToEndTime,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
             guard let self = self else { return }
-            self.isPlaying = false
-            self.onPlayStateChanged?(false)
-            DebugLogger.shared.log("Fine timeline raggiunta.", level: .playback)
+            // CRITICAL: Only trigger end of timeline if the notification belongs to the ACTIVE player item!
+            // When replacing an item, detached previous items emit this notification, which must NOT jump to end.
+            if let notifItem = notification.object as? AVPlayerItem, notifItem === self.player.currentItem {
+                self.isPlaying = false
+                self.onPlayStateChanged?(false)
+                DebugLogger.shared.log("Fine timeline raggiunta.", level: .playback)
+            }
         }
     }
 
@@ -81,7 +85,7 @@ public final class PlaybackController: NSObject {
         DebugLogger.shared.log("Player azzerato (timeline vuota).", level: .playback)
     }
 
-    public func load(item: AVPlayerItem?, duration: CMTime, targetFPS: Double = 30.0) {
+    public func load(item: AVPlayerItem?, duration: CMTime, targetFPS: Double = 30.0, seekToTime: CMTime? = nil) {
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
 
@@ -90,12 +94,35 @@ public final class PlaybackController: NSObject {
             return
         }
 
+        let targetTime: CMTime
+        if let explicit = seekToTime {
+            targetTime = CMTimeClampToRange(explicit, range: CMTimeRange(start: .zero, duration: duration))
+        } else {
+            let savedTime = currentTime
+            if CMTimeCompare(savedTime, duration) <= 0 && CMTimeCompare(savedTime, .zero) > 0 {
+                targetTime = savedTime
+            } else if CMTimeCompare(savedTime, duration) > 0 {
+                targetTime = duration
+            } else {
+                targetTime = .zero
+            }
+        }
+
+        self.duration = duration
+        self.fps = targetFPS
+        self.currentTime = targetTime
+
         itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, _ in
             guard let self = self else { return }
             switch observedItem.status {
             case .readyToPlay:
                 DebugLogger.shared.log("PlayerItem status: READY TO PLAY (Pronto alla riproduzione)", level: .playback)
                 self.onStatusChanged?("Pronto")
+                // Seek frame-accurately now that decoders are active, avoiding black screens!
+                self.player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+                    self.currentTime = targetTime
+                    self.onTimeChanged?(targetTime)
+                }
             case .failed:
                 let errMsg = observedItem.error?.localizedDescription ?? "Errore sconosciuto"
                 DebugLogger.shared.log("PlayerItem status: FAILED - \(errMsg)", level: .error)
@@ -108,22 +135,8 @@ public final class PlaybackController: NSObject {
             }
         }
 
-        let savedTime = currentTime
         player.replaceCurrentItem(with: item)
-        self.duration = duration
-        self.fps = targetFPS
-
-        // Preserve playhead across edits / trim / cuts
-        let targetTime: CMTime
-        if CMTimeCompare(savedTime, duration) <= 0 && CMTimeCompare(savedTime, .zero) > 0 {
-            targetTime = savedTime
-        } else if CMTimeCompare(savedTime, duration) > 0 {
-            targetTime = duration
-        } else {
-            targetTime = .zero
-        }
-
-        currentTime = targetTime
+        // Also seek immediately
         seek(to: targetTime, frameAccurate: true)
 
         DebugLogger.shared.log("Player caricato: durata = \(String(format: "%.2f", CMTimeGetSeconds(duration)))s, fps = \(targetFPS), playhead a \(formattedCurrentTime)", level: .playback)

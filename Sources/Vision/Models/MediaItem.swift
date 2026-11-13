@@ -15,6 +15,19 @@ public struct MediaItem: Identifiable, Hashable {
     public let audioTrackCount: Int
     public var orientation: ClipOrientation
     public var thumbnail: NSImage?
+    public var proxyURL: URL?
+
+    public var hasProxy: Bool {
+        guard let p = proxyURL else { return false }
+        return FileManager.default.fileExists(atPath: p.path)
+    }
+
+    public var effectiveURL: URL {
+        if EditorProject.shared.isProxyPlaybackEnabled && hasProxy, let p = proxyURL {
+            return p
+        }
+        return url
+    }
 
     public init(
         id: UUID = UUID(),
@@ -28,7 +41,8 @@ public struct MediaItem: Identifiable, Hashable {
         videoCodec: String = "Sconosciuto",
         audioTrackCount: Int = 0,
         orientation: ClipOrientation = .normal,
-        thumbnail: NSImage? = nil
+        thumbnail: NSImage? = nil,
+        proxyURL: URL? = nil
     ) {
         self.id = id
         self.url = url
@@ -42,6 +56,7 @@ public struct MediaItem: Identifiable, Hashable {
         self.audioTrackCount = audioTrackCount
         self.orientation = orientation
         self.thumbnail = thumbnail
+        self.proxyURL = proxyURL
     }
 
     public static func == (lhs: MediaItem, rhs: MediaItem) -> Bool {

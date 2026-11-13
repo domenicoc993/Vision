@@ -2,6 +2,7 @@ import AppKit
 
 public enum GridCardItem: Equatable {
     case timeline(TimelineModel, index: Int)
+    case selection(SelectionModel, index: Int)
     case folder(MediaFolder)
     case media(MediaItem)
 
@@ -9,6 +10,8 @@ public enum GridCardItem: Equatable {
         switch (lhs, rhs) {
         case (.timeline(let t1, _), .timeline(let t2, _)):
             return t1.id == t2.id
+        case (.selection(let s1, _), .selection(let s2, _)):
+            return s1.id == s2.id
         case (.folder(let f1), .folder(let f2)):
             return f1.id == f2.id
         case (.media(let m1), .media(let m2)):
@@ -21,6 +24,7 @@ public enum GridCardItem: Equatable {
     public var id: UUID {
         switch self {
         case .timeline(let t, _): return t.id
+        case .selection(let s, _): return s.id
         case .folder(let f): return f.id
         case .media(let m): return m.id
         }
@@ -49,7 +53,12 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
     public var onDeleteFromPool: (() -> Void)?
     public var onOpenTimeline: ((TimelineModel, Int) -> Void)?
     public var onRenameTimeline: ((Int) -> Void)?
+    public var onTimelineSettings: ((TimelineModel, Int) -> Void)?
     public var onDeleteTimeline: ((Int) -> Void)?
+    public var onOpenSelection: ((SelectionModel, Int) -> Void)?
+    public var onRenameSelection: ((SelectionModel) -> Void)?
+    public var onDuplicateSelection: ((SelectionModel) -> Void)?
+    public var onDeleteSelection: ((SelectionModel) -> Void)?
     public var onOpenFolder: ((MediaFolder) -> Void)?
     public var onRenameFolder: ((MediaFolder) -> Void)?
     public var onDeleteFolder: ((MediaFolder) -> Void)?
@@ -59,6 +68,8 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
     private let titleLabel = NSTextField(labelWithString: "")
     private let durBadgeLabel = NSTextField(labelWithString: "")
     private let seqBadgeLabel = NSTextField(labelWithString: "#1")
+    private let proxyBadgeBg = NSView()
+    private let proxyBadgeLabel = NSTextField(labelWithString: "⚡ PROXY")
     private var isFolderDropTarget: Bool = false
     private var mouseDownLocation: NSPoint = .zero
     private var didMouseDownOnAlreadySelected: Bool = false
@@ -117,6 +128,19 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
         durBadgeLabel.textColor = .white
         durBadgeBg.addSubview(durBadgeLabel)
 
+        // Proxy Badge bottom-left of image
+        proxyBadgeBg.translatesAutoresizingMaskIntoConstraints = false
+        proxyBadgeBg.wantsLayer = true
+        proxyBadgeBg.layer?.backgroundColor = NSColor.systemTeal.withAlphaComponent(0.85).cgColor
+        proxyBadgeBg.layer?.cornerRadius = 3
+        proxyBadgeBg.isHidden = true
+        addSubview(proxyBadgeBg)
+
+        proxyBadgeLabel.translatesAutoresizingMaskIntoConstraints = false
+        proxyBadgeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .heavy)
+        proxyBadgeLabel.textColor = .black
+        proxyBadgeBg.addSubview(proxyBadgeLabel)
+
         // Title Label
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.font = NSFont.systemFont(ofSize: 10, weight: .medium)
@@ -144,6 +168,14 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
             durBadgeLabel.leadingAnchor.constraint(equalTo: durBadgeBg.leadingAnchor, constant: 4),
             durBadgeLabel.trailingAnchor.constraint(equalTo: durBadgeBg.trailingAnchor, constant: -4),
             durBadgeLabel.centerYAnchor.constraint(equalTo: durBadgeBg.centerYAnchor),
+
+            proxyBadgeBg.leadingAnchor.constraint(equalTo: imageView.leadingAnchor, constant: 4),
+            proxyBadgeBg.bottomAnchor.constraint(equalTo: imageView.bottomAnchor, constant: -4),
+            proxyBadgeBg.heightAnchor.constraint(equalToConstant: 14),
+
+            proxyBadgeLabel.leadingAnchor.constraint(equalTo: proxyBadgeBg.leadingAnchor, constant: 3),
+            proxyBadgeLabel.trailingAnchor.constraint(equalTo: proxyBadgeBg.trailingAnchor, constant: -3),
+            proxyBadgeLabel.centerYAnchor.constraint(equalTo: proxyBadgeBg.centerYAnchor),
 
             titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
             titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
@@ -173,8 +205,17 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
             imageView.image = Lucide.image(.clapperboard, size: 40, color: .systemCyan)
             titleLabel.stringValue = tl.name
             titleLabel.textColor = .systemCyan
-            durBadgeLabel.stringValue = "Timeline"
+            durBadgeLabel.stringValue = "\(Int(tl.format.size.width))×\(Int(tl.format.size.height))"
             seqBadgeLabel.stringValue = "TL"
+            proxyBadgeBg.isHidden = true
+
+        case .selection(let sel, _):
+            imageView.image = Lucide.image(.sparkles, size: 38, color: .systemPurple)
+            titleLabel.stringValue = sel.name
+            titleLabel.textColor = .systemPurple
+            durBadgeLabel.stringValue = "\(sel.selectedClips.count) clip"
+            seqBadgeLabel.stringValue = "SEL"
+            proxyBadgeBg.isHidden = true
 
         case .folder(let f):
             imageView.image = Lucide.image(.folder, size: 40, color: .systemOrange)
@@ -182,12 +223,14 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
             titleLabel.textColor = .systemOrange
             durBadgeLabel.stringValue = "\(f.itemIds.count) el."
             seqBadgeLabel.stringValue = "DIR"
+            proxyBadgeBg.isHidden = true
 
         case .media(let m):
             titleLabel.stringValue = m.name
             titleLabel.textColor = .labelColor
             durBadgeLabel.stringValue = m.formattedDuration
             seqBadgeLabel.stringValue = "#\(sequenceNumber)"
+            proxyBadgeBg.isHidden = !m.hasProxy
 
             if let thumb = m.thumbnail {
                 imageView.image = thumb
@@ -227,12 +270,23 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
 
     public override func mouseDragged(with event: NSEvent) {
         didMouseDownOnAlreadySelected = false
-        // Only media clips can be dragged out onto timeline or folders
-        guard case .media(let item) = gridItem else { return }
 
         let dragPoint = event.locationInWindow
         let dist = hypot(dragPoint.x - mouseDownLocation.x, dragPoint.y - mouseDownLocation.y)
         guard dist > 4.0 else { return }
+
+        if case .selection(let sel, _) = gridItem {
+            let pbItem = NSPasteboardItem()
+            pbItem.setString(sel.id.uuidString, forType: kSelectionPasteboardType)
+            let dragImage = Lucide.image(.sparkles, size: 32, color: .systemPurple)
+            let dragItem = NSDraggingItem(pasteboardWriter: pbItem)
+            dragItem.setDraggingFrame(NSRect(origin: frame.origin, size: NSSize(width: 48, height: 48)), contents: dragImage)
+            beginDraggingSession(with: [dragItem], event: event, source: self)
+            return
+        }
+
+        // Only media clips and selections can be dragged out onto timeline or folders
+        guard case .media(let item) = gridItem else { return }
 
         let itemsToDrag: [MediaItem]
         if let allSelected = getAllSelectedItems?(), !allSelected.isEmpty, allSelected.contains(where: { $0.id == item.id }) {
@@ -320,6 +374,11 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
             openItem.representedObject = (tl, idx)
             menu.addItem(openItem)
 
+            let settingsItem = NSMenuItem(title: "⚙️ Impostazioni timeline...", action: #selector(onSettingsTLClicked), keyEquivalent: "")
+            settingsItem.target = self
+            settingsItem.representedObject = (tl, idx)
+            menu.addItem(settingsItem)
+
             let renameItem = NSMenuItem(title: "✏️ Rinomina timeline...", action: #selector(onRenameTLClicked), keyEquivalent: "")
             renameItem.target = self
             renameItem.representedObject = idx
@@ -332,6 +391,30 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
                 delItem.representedObject = idx
                 menu.addItem(delItem)
             }
+            return menu
+
+        case .selection(let sel, let idx):
+            let menu = NSMenu(title: sel.name)
+            let openItem = NSMenuItem(title: "✨ Apri in Modalità Selezione", action: #selector(onOpenSelClicked), keyEquivalent: "")
+            openItem.target = self
+            openItem.representedObject = (sel, idx)
+            menu.addItem(openItem)
+
+            let renameItem = NSMenuItem(title: "✏️ Rinomina selezione...", action: #selector(onRenameSelClicked), keyEquivalent: "")
+            renameItem.target = self
+            renameItem.representedObject = sel
+            menu.addItem(renameItem)
+
+            let dupItem = NSMenuItem(title: "📄 Duplica selezione", action: #selector(onDuplicateSelClicked), keyEquivalent: "")
+            dupItem.target = self
+            dupItem.representedObject = sel
+            menu.addItem(dupItem)
+
+            menu.addItem(NSMenuItem.separator())
+            let delItem = NSMenuItem(title: "🗑️ Elimina selezione", action: #selector(onDeleteSelClicked), keyEquivalent: "")
+            delItem.target = self
+            delItem.representedObject = sel
+            menu.addItem(delItem)
             return menu
 
         case .folder(let f):
@@ -411,6 +494,12 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
         }
     }
 
+    @objc private func onSettingsTLClicked(_ sender: NSMenuItem) {
+        if let tuple = sender.representedObject as? (TimelineModel, Int) {
+            onTimelineSettings?(tuple.0, tuple.1)
+        }
+    }
+
     @objc private func onRenameTLClicked(_ sender: NSMenuItem) {
         if let idx = sender.representedObject as? Int {
             onRenameTimeline?(idx)
@@ -420,6 +509,30 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
     @objc private func onDeleteTLClicked(_ sender: NSMenuItem) {
         if let idx = sender.representedObject as? Int {
             onDeleteTimeline?(idx)
+        }
+    }
+
+    @objc private func onOpenSelClicked(_ sender: NSMenuItem) {
+        if let tuple = sender.representedObject as? (SelectionModel, Int) {
+            onOpenSelection?(tuple.0, tuple.1)
+        }
+    }
+
+    @objc private func onRenameSelClicked(_ sender: NSMenuItem) {
+        if let sel = sender.representedObject as? SelectionModel {
+            onRenameSelection?(sel)
+        }
+    }
+
+    @objc private func onDuplicateSelClicked(_ sender: NSMenuItem) {
+        if let sel = sender.representedObject as? SelectionModel {
+            onDuplicateSelection?(sel)
+        }
+    }
+
+    @objc private func onDeleteSelClicked(_ sender: NSMenuItem) {
+        if let sel = sender.representedObject as? SelectionModel {
+            onDeleteSelection?(sel)
         }
     }
 
@@ -494,7 +607,12 @@ public final class MediaThumbnailGridView: NSView {
     public var onContextMenuRequested: ((NSEvent) -> NSMenu?)?
     public var onOpenTimeline: ((TimelineModel, Int) -> Void)?
     public var onRenameTimeline: ((Int) -> Void)?
+    public var onTimelineSettings: ((TimelineModel, Int) -> Void)?
     public var onDeleteTimeline: ((Int) -> Void)?
+    public var onOpenSelection: ((SelectionModel, Int) -> Void)?
+    public var onRenameSelection: ((SelectionModel) -> Void)?
+    public var onDuplicateSelection: ((SelectionModel) -> Void)?
+    public var onDeleteSelection: ((SelectionModel) -> Void)?
     public var onOpenFolder: ((MediaFolder) -> Void)?
     public var onRenameFolder: ((MediaFolder) -> Void)?
     public var onDeleteFolder: ((MediaFolder) -> Void)?
@@ -512,13 +630,54 @@ public final class MediaThumbnailGridView: NSView {
 
     public override var isFlipped: Bool { true }
 
+    public var onURLsDropped: (([URL]) -> Void)?
+
     public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        registerForDraggedTypes([.fileURL, kMediaItemPasteboardType])
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let pboard = sender.draggingPasteboard
+        if let types = pboard.types, types.contains(.fileURL) || types.contains(kMediaItemPasteboardType) {
+            return .copy
+        }
+        return []
+    }
+
+    public override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let pboard = sender.draggingPasteboard
+        if let types = pboard.types, types.contains(.fileURL) || types.contains(kMediaItemPasteboardType) {
+            return .copy
+        }
+        return []
+    }
+
+    public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let pboard = sender.draggingPasteboard
+        if let urls = pboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+            onURLsDropped?(urls)
+            return true
+        }
+        if let pbItems = pboard.pasteboardItems {
+            var extracted: [URL] = []
+            for item in pbItems {
+                if let str = item.string(forType: .fileURL) {
+                    let u = URL(string: str) ?? URL(fileURLWithPath: str)
+                    extracted.append(u)
+                }
+            }
+            if !extracted.isEmpty {
+                onURLsDropped?(extracted)
+                return true
+            }
+        }
+        return false
+    }
 
     public override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
@@ -601,6 +760,8 @@ public final class MediaThumbnailGridView: NSView {
                     self.onClipDoubleClicked?(m)
                 case .timeline(let tl, let idx):
                     self.onOpenTimeline?(tl, idx)
+                case .selection(let sel, let idx):
+                    self.onOpenSelection?(sel, idx)
                 case .folder(let f):
                     self.onOpenFolder?(f)
                 }
@@ -640,8 +801,23 @@ public final class MediaThumbnailGridView: NSView {
             card.onRenameTimeline = { [weak self] idx in
                 self?.onRenameTimeline?(idx)
             }
+            card.onTimelineSettings = { [weak self] tl, idx in
+                self?.onTimelineSettings?(tl, idx)
+            }
             card.onDeleteTimeline = { [weak self] idx in
                 self?.onDeleteTimeline?(idx)
+            }
+            card.onOpenSelection = { [weak self] sel, idx in
+                self?.onOpenSelection?(sel, idx)
+            }
+            card.onRenameSelection = { [weak self] sel in
+                self?.onRenameSelection?(sel)
+            }
+            card.onDuplicateSelection = { [weak self] sel in
+                self?.onDuplicateSelection?(sel)
+            }
+            card.onDeleteSelection = { [weak self] sel in
+                self?.onDeleteSelection?(sel)
             }
             card.onOpenFolder = { [weak self] f in
                 self?.onOpenFolder?(f)

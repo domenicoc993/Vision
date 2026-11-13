@@ -4,21 +4,26 @@ import AVFoundation
 
 public final class PlayerViewController: NSViewController {
     public let playerView = AVPlayerView()
-    private let playbackController: PlaybackController
+    public private(set) var playbackController: PlaybackController
 
-    private let playPauseButton = NSButton()
-    private let stepBackButton = NSButton()
-    private let stepForwardButton = NSButton()
+    private let playPauseButton = IconActionButton(toolTip: "Play / Pausa (Spazio)", isToggleMode: false)
+    private let stepBackButton = IconActionButton(toolTip: "Passo indietro 1 frame (←)", isToggleMode: false)
+    private let stepForwardButton = IconActionButton(toolTip: "Passo avanti 1 frame (→)", isToggleMode: false)
     private let timecodeLabel = NSTextField(labelWithString: "00:00:00:00")
     private let durationLabel = NSTextField(labelWithString: "/ 00:00:00:00")
     private let statusLabel = NSTextField(labelWithString: "")
 
     // LUT Hardware Accelerator Controls
-    private let lutToggleButton = NSButton()
-    private let lutPresetPopUp = NSPopUpButton()
+    private let lutToggleButton = IconActionButton(toolTip: "LUT (Click: ON/OFF, Pressione lunga: Scegli LUT)")
+    private var lutPopover: NSPopover?
+
+    // Proxy Playback Controls
+    private let proxyToggleButton = IconActionButton(toolTip: "Riproduzione Proxy")
+    private let proxyBadgeLabel = NSTextField(labelWithString: "⚡ PROXY")
+    public var onProxyToggled: (() -> Void)?
 
     // Full Screen Button
-    private let fullScreenButton = NSButton()
+    private let fullScreenButton = IconActionButton(toolTip: "Schermo Intero (⌃F)", isToggleMode: false)
     private var fullScreenController: FullScreenPlayerWindowController?
 
     // Video Canvas Frame Box (with gray workspace around it)
@@ -29,6 +34,13 @@ public final class PlayerViewController: NSViewController {
     public init(playbackController: PlaybackController) {
         self.playbackController = playbackController
         super.init(nibName: nil, bundle: nil)
+    }
+
+    public func switchPlaybackController(_ newController: PlaybackController) {
+        self.playbackController = newController
+        self.playerView.player = newController.player
+        setupControllerBindings()
+        updateTimeDisplay()
     }
 
     required init?(coder: NSCoder) {
@@ -72,6 +84,17 @@ public final class PlayerViewController: NSViewController {
 
         videoFrameBox.addSubview(playerView)
 
+        // Floating Proxy Active Indicator Badge
+        proxyBadgeLabel.translatesAutoresizingMaskIntoConstraints = false
+        proxyBadgeLabel.wantsLayer = true
+        proxyBadgeLabel.layer?.backgroundColor = NSColor(calibratedRed: 0.0, green: 0.75, blue: 0.45, alpha: 0.9).cgColor
+        proxyBadgeLabel.layer?.cornerRadius = 4
+        proxyBadgeLabel.textColor = .white
+        proxyBadgeLabel.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+        proxyBadgeLabel.alignment = .center
+        proxyBadgeLabel.isHidden = !EditorProject.shared.isProxyPlaybackEnabled
+        videoFrameBox.addSubview(proxyBadgeLabel)
+
         // Transport Bar
         let transportBar = NSView()
         transportBar.translatesAutoresizingMaskIntoConstraints = false
@@ -112,6 +135,11 @@ public final class PlayerViewController: NSViewController {
             playerView.trailingAnchor.constraint(equalTo: videoFrameBox.trailingAnchor),
             playerView.bottomAnchor.constraint(equalTo: videoFrameBox.bottomAnchor),
 
+            proxyBadgeLabel.topAnchor.constraint(equalTo: videoFrameBox.topAnchor, constant: 10),
+            proxyBadgeLabel.leadingAnchor.constraint(equalTo: videoFrameBox.leadingAnchor, constant: 10),
+            proxyBadgeLabel.widthAnchor.constraint(equalToConstant: 72),
+            proxyBadgeLabel.heightAnchor.constraint(equalToConstant: 20),
+
             transportBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             transportBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             transportBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
@@ -146,50 +174,53 @@ public final class PlayerViewController: NSViewController {
         rightStack.alignment = .centerY
         bar.addSubview(rightStack)
 
+        leftStack.spacing = 8
+        centerStack.spacing = 10
+        rightStack.spacing = 12
+
         NSLayoutConstraint.activate([
             leftStack.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 14),
             leftStack.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            leftStack.trailingAnchor.constraint(lessThanOrEqualTo: centerStack.leadingAnchor, constant: -12),
 
             centerStack.centerXAnchor.constraint(equalTo: bar.centerXAnchor),
             centerStack.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
 
             rightStack.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -14),
-            rightStack.centerYAnchor.constraint(equalTo: bar.centerYAnchor)
+            rightStack.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            rightStack.leadingAnchor.constraint(greaterThanOrEqualTo: centerStack.trailingAnchor, constant: 12)
         ])
 
-        // Left Controls: Hardware-accelerated LUT Filter
-        lutToggleButton.title = "🎨 LUT: OFF"
-        lutToggleButton.bezelStyle = .rounded
-        lutToggleButton.target = self
-        lutToggleButton.action = #selector(onLUTToggleClicked)
-        leftStack.addArrangedSubview(lutToggleButton)
-
-        lutPresetPopUp.bezelStyle = .rounded
-        lutPresetPopUp.target = self
-        lutPresetPopUp.action = #selector(onLUTPresetChanged)
-        for preset in LUTPreset.allCases {
-            lutPresetPopUp.addItem(withTitle: preset.rawValue)
-        }
-        lutPresetPopUp.selectItem(withTitle: LUTEngine.shared.currentPreset.rawValue)
-        leftStack.addArrangedSubview(lutPresetPopUp)
+        // Left Controls: Status Indicator
+        statusLabel.font = NSFont.systemFont(ofSize: 11)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        leftStack.addArrangedSubview(statusLabel)
 
         // Center Controls: Step Back, Play/Pause, Step Forward, Timecode
-        stepBackButton.image = NSImage(systemSymbolName: "backward.frame", accessibilityDescription: "Step Back")
-        stepBackButton.bezelStyle = .texturedRounded
+        stepBackButton.image = Lucide.template(.stepBack, size: 16)
+        stepBackButton.activeTintColor = .white
         stepBackButton.target = self
         stepBackButton.action = #selector(onStepBackClicked)
+        stepBackButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        stepBackButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         centerStack.addArrangedSubview(stepBackButton)
 
-        playPauseButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Play")
-        playPauseButton.bezelStyle = .texturedRounded
+        playPauseButton.image = Lucide.template(.play, size: 18)
+        playPauseButton.activeTintColor = .white
         playPauseButton.target = self
         playPauseButton.action = #selector(onPlayPauseClicked)
+        playPauseButton.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        playPauseButton.heightAnchor.constraint(equalToConstant: 26).isActive = true
         centerStack.addArrangedSubview(playPauseButton)
 
-        stepForwardButton.image = NSImage(systemSymbolName: "forward.frame", accessibilityDescription: "Step Forward")
-        stepForwardButton.bezelStyle = .texturedRounded
+        stepForwardButton.image = Lucide.template(.stepForward, size: 16)
+        stepForwardButton.activeTintColor = .white
         stepForwardButton.target = self
         stepForwardButton.action = #selector(onStepForwardClicked)
+        stepForwardButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        stepForwardButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         centerStack.addArrangedSubview(stepForwardButton)
 
         timecodeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .bold)
@@ -199,16 +230,34 @@ public final class PlayerViewController: NSViewController {
         durationLabel.textColor = .secondaryLabelColor
         centerStack.addArrangedSubview(durationLabel)
 
-        // Right Controls: Status & Full-Screen Button (Control + F)
-        statusLabel.font = NSFont.systemFont(ofSize: 11)
-        statusLabel.textColor = .secondaryLabelColor
-        rightStack.addArrangedSubview(statusLabel)
+        // Right Controls: LUT (Palette), Proxy (Feather), Full Screen (Maximize-2)
+        lutToggleButton.image = Lucide.template(.palette, size: 17)
+        lutToggleButton.activeTintColor = .systemCyan
+        lutToggleButton.target = self
+        lutToggleButton.action = #selector(onLUTToggleClicked)
+        lutToggleButton.onLongPress = { [weak self] in
+            self?.presentLUTSelectorModal()
+        }
+        lutToggleButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        lutToggleButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        rightStack.addArrangedSubview(lutToggleButton)
+        updateLUTButtonState()
 
-        fullScreenButton.image = NSImage(systemSymbolName: "arrow.up.left.and.arrow.down.right", accessibilityDescription: "Schermo Intero (⌃F)")
-        fullScreenButton.bezelStyle = .texturedRounded
-        fullScreenButton.toolTip = "Schermo Intero (Control + F)"
+        proxyToggleButton.image = Lucide.template(.feather, size: 17)
+        proxyToggleButton.activeTintColor = .systemGreen
+        proxyToggleButton.target = self
+        proxyToggleButton.action = #selector(onProxyToggleClicked)
+        proxyToggleButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        proxyToggleButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        rightStack.addArrangedSubview(proxyToggleButton)
+        updateProxyUI()
+
+        fullScreenButton.image = Lucide.template(.maximize2, size: 16)
+        fullScreenButton.activeTintColor = .white
         fullScreenButton.target = self
         fullScreenButton.action = #selector(toggleFullScreen)
+        fullScreenButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        fullScreenButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         rightStack.addArrangedSubview(fullScreenButton)
     }
 
@@ -221,8 +270,8 @@ public final class PlayerViewController: NSViewController {
 
         playbackController.onPlayStateChanged = { [weak self] isPlaying in
             DispatchQueue.main.async {
-                let iconName = isPlaying ? "pause.fill" : "play.fill"
-                self?.playPauseButton.image = NSImage(systemSymbolName: iconName, accessibilityDescription: "Play/Pause")
+                let icon: LucideIcon = isPlaying ? .pause : .play
+                self?.playPauseButton.image = Lucide.template(icon, size: 18)
             }
         }
 
@@ -235,16 +284,17 @@ public final class PlayerViewController: NSViewController {
 
     private func setupLUTBindings() {
         updateLUTFilter()
+        updateLUTButtonState()
         LUTEngine.shared.onLUTStateChanged = { [weak self] in
             DispatchQueue.main.async {
                 self?.updateLUTFilter()
-                self?.updateLUTButtonTitle()
+                self?.updateLUTButtonState()
             }
         }
     }
 
-    private func updateLUTButtonTitle() {
-        lutToggleButton.title = LUTEngine.shared.isEnabled ? "🎨 LUT: ON" : "🎨 LUT: OFF"
+    private func updateLUTButtonState() {
+        lutToggleButton.isToggleActive = LUTEngine.shared.isEnabled
     }
 
     private func updateLUTFilter() {
@@ -257,34 +307,61 @@ public final class PlayerViewController: NSViewController {
 
     @objc private func onLUTToggleClicked() {
         LUTEngine.shared.isEnabled.toggle()
-        updateLUTButtonTitle()
+        updateLUTButtonState()
         updateLUTFilter()
         DebugLogger.shared.log("Filtro LUT Hardware: \(LUTEngine.shared.isEnabled ? "ATTIVO (Accelerato Metal)" : "DISATTIVATO")", level: .info)
     }
 
-    @objc private func onLUTPresetChanged() {
-        guard let title = lutPresetPopUp.selectedItem?.title else { return }
-        if title == LUTPreset.custom.rawValue {
-            // Open .cube file panel
-            let panel = NSOpenPanel()
-            panel.allowedContentTypes = []
-            panel.allowsOtherFileTypes = true
-            panel.canChooseFiles = true
-            panel.canChooseDirectories = false
-            panel.message = "Seleziona un file LUT .cube 3D"
-            if panel.runModal() == .OK, let url = panel.url {
-                if LUTEngine.shared.loadCustomCubeFile(from: url) {
-                    LUTEngine.shared.isEnabled = true
-                    DebugLogger.shared.log("LUT .cube caricato con successo: '\(url.lastPathComponent)'", level: .info)
-                } else {
-                    DebugLogger.shared.log("Impossibile caricare LUT .cube: formato non valido.", level: .error)
-                }
-            }
-        } else if let preset = LUTPreset.allCases.first(where: { $0.rawValue == title }) {
-            LUTEngine.shared.currentPreset = preset
-            DebugLogger.shared.log("Preset LUT impostato: \(preset.rawValue)", level: .info)
+    private func presentLUTSelectorModal() {
+        if let existing = lutPopover, existing.isShown {
+            existing.performClose(nil)
+            return
         }
-        updateLUTFilter()
+        let vc = LUTSelectorPopoverController(
+            onPresetSelected: { [weak self] preset in
+                if preset == .custom {
+                    self?.lutPopover?.performClose(nil)
+                    self?.chooseCustomCubeFile()
+                } else {
+                    LUTEngine.shared.currentPreset = preset
+                    LUTEngine.shared.isEnabled = true
+                    self?.updateLUTButtonState()
+                    self?.updateLUTFilter()
+                    DebugLogger.shared.log("Preset LUT impostato: \(preset.rawValue)", level: .info)
+                }
+            },
+            onToggleEnabled: { [weak self] enabled in
+                LUTEngine.shared.isEnabled = enabled
+                self?.updateLUTButtonState()
+                self?.updateLUTFilter()
+            }
+        )
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.appearance = NSAppearance(named: .darkAqua)
+        popover.contentViewController = vc
+        popover.contentSize = NSSize(width: 280, height: 150)
+        popover.show(relativeTo: lutToggleButton.bounds, of: lutToggleButton, preferredEdge: .maxY)
+        self.lutPopover = popover
+    }
+
+    private func chooseCustomCubeFile() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = []
+        panel.allowsOtherFileTypes = true
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.message = "Seleziona un file LUT .cube 3D"
+        if panel.runModal() == .OK, let url = panel.url {
+            if LUTEngine.shared.loadCustomCubeFile(from: url) {
+                LUTEngine.shared.isEnabled = true
+                updateLUTButtonState()
+                updateLUTFilter()
+                DebugLogger.shared.log("LUT .cube caricato con successo: '\(url.lastPathComponent)'", level: .info)
+            } else {
+                DebugLogger.shared.log("Impossibile caricare LUT .cube: formato non valido.", level: .error)
+            }
+        }
     }
 
     @objc public func toggleFullScreen() {
@@ -332,5 +409,111 @@ public final class PlayerViewController: NSViewController {
 
     @objc private func onStepForwardClicked() {
         playbackController.step(by: 1)
+    }
+
+    public func updateProxyUI() {
+        let isEnabled = EditorProject.shared.isProxyPlaybackEnabled
+        proxyToggleButton.isToggleActive = isEnabled
+        proxyBadgeLabel.isHidden = !isEnabled
+    }
+
+    @objc private func onProxyToggleClicked() {
+        EditorProject.shared.isProxyPlaybackEnabled.toggle()
+        updateProxyUI()
+        DebugLogger.shared.log("Riproduzione Proxy: \(EditorProject.shared.isProxyPlaybackEnabled ? "ATTIVA ⚡ (File leggeri conformi)" : "DISATTIVA (File originali alta ris.)")", level: .info)
+        onProxyToggled?()
+    }
+}
+
+private final class LUTSelectorPopoverController: NSViewController {
+    private let onPresetSelected: (LUTPreset) -> Void
+    private let onToggleEnabled: (Bool) -> Void
+    private let enabledSwitch = NSSwitch()
+    private let presetPopUp = NSPopUpButton()
+
+    init(
+        onPresetSelected: @escaping (LUTPreset) -> Void,
+        onToggleEnabled: @escaping (Bool) -> Void
+    ) {
+        self.onPresetSelected = onPresetSelected
+        self.onToggleEnabled = onToggleEnabled
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func loadView() {
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 150))
+        root.wantsLayer = true
+        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1.0).cgColor
+        self.view = root
+
+        let header = NSTextField(labelWithString: "Seleziona LUT")
+        header.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        header.textColor = .white
+        header.translatesAutoresizingMaskIntoConstraints = false
+
+        enabledSwitch.state = LUTEngine.shared.isEnabled ? .on : .off
+        enabledSwitch.target = self
+        enabledSwitch.action = #selector(onSwitchChanged)
+        enabledSwitch.controlSize = .small
+        enabledSwitch.translatesAutoresizingMaskIntoConstraints = false
+
+        let presetLbl = NSTextField(labelWithString: "Profilo colore / 3D .cube")
+        presetLbl.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        presetLbl.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
+        presetLbl.translatesAutoresizingMaskIntoConstraints = false
+
+        for preset in LUTPreset.allCases {
+            presetPopUp.addItem(withTitle: preset.rawValue)
+        }
+        presetPopUp.selectItem(withTitle: LUTEngine.shared.currentPreset.rawValue)
+        presetPopUp.target = self
+        presetPopUp.action = #selector(onPopUpChanged)
+        presetPopUp.translatesAutoresizingMaskIntoConstraints = false
+
+        let loadCubeBtn = FlatButton(title: "Carica file .cube...", target: self, action: #selector(onLoadCubeClicked))
+        loadCubeBtn.translatesAutoresizingMaskIntoConstraints = false
+
+        root.addSubview(header)
+        root.addSubview(enabledSwitch)
+        root.addSubview(presetLbl)
+        root.addSubview(presetPopUp)
+        root.addSubview(loadCubeBtn)
+
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
+            header.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+
+            enabledSwitch.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            enabledSwitch.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+
+            presetLbl.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 14),
+            presetLbl.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+
+            presetPopUp.topAnchor.constraint(equalTo: presetLbl.bottomAnchor, constant: 6),
+            presetPopUp.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            presetPopUp.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+
+            loadCubeBtn.topAnchor.constraint(equalTo: presetPopUp.bottomAnchor, constant: 12),
+            loadCubeBtn.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+            loadCubeBtn.heightAnchor.constraint(equalToConstant: 24),
+            loadCubeBtn.widthAnchor.constraint(equalToConstant: 130)
+        ])
+    }
+
+    @objc private func onSwitchChanged() {
+        onToggleEnabled(enabledSwitch.state == .on)
+    }
+
+    @objc private func onPopUpChanged() {
+        guard let title = presetPopUp.selectedItem?.title,
+              let preset = LUTPreset.allCases.first(where: { $0.rawValue == title }) else { return }
+        onPresetSelected(preset)
+        enabledSwitch.state = LUTEngine.shared.isEnabled ? .on : .off
+    }
+
+    @objc private func onLoadCubeClicked() {
+        onPresetSelected(.custom)
     }
 }

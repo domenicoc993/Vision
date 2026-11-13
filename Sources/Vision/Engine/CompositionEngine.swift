@@ -94,15 +94,28 @@ public final class CompositionEngine {
 
             for clip in track.clips {
                 guard !clip.isOrphan else { continue }
+                guard FileManager.default.fileExists(atPath: clip.mediaItem.effectiveURL.path) else {
+                    DebugLogger.shared.log("Media offline per '\(clip.mediaItem.name)' in A\(track.id + 1)", level: .warning)
+                    continue
+                }
+                guard FileManager.default.fileExists(atPath: clip.mediaItem.effectiveURL.path) else {
+                    DebugLogger.shared.log("Media offline per '\(clip.mediaItem.name)' in V\(track.id + 1)", level: .warning)
+                    continue
+                }
                 totalClipsCount += 1
                 do {
-                    let metadata = try await getMetadata(for: clip.mediaItem.url)
+                    let metadata = try await getMetadata(for: clip.mediaItem.effectiveURL)
                     if let videoTrack = metadata.videoTrack {
                         try compTrack.insertTimeRange(
                             clip.sourceTimeRange,
                             of: videoTrack,
                             at: clip.timelineStart
                         )
+
+                        if clip.speed != 1.0 && clip.speed > 0 {
+                            let insertedRange = CMTimeRange(start: clip.timelineStart, duration: clip.sourceDuration)
+                            compTrack.scaleTimeRange(insertedRange, toDuration: clip.duration)
+                        }
 
                         // Calculate frame transform for orientation and aspect-fit into project resolution
                         let transform = makeTransform(
@@ -126,8 +139,12 @@ public final class CompositionEngine {
 
             for clip in track.clips {
                 guard !clip.isOrphan else { continue }
+                guard FileManager.default.fileExists(atPath: clip.mediaItem.effectiveURL.path) else {
+                    DebugLogger.shared.log("Media offline per '\(clip.mediaItem.name)' in A\(track.id + 1)", level: .warning)
+                    continue
+                }
                 do {
-                    let metadata = try await getMetadata(for: clip.mediaItem.url)
+                    let metadata = try await getMetadata(for: clip.mediaItem.effectiveURL)
                     for srcAudioTrack in metadata.audioTracks {
                         guard let compAudioTrack = composition.addMutableTrack(
                             withMediaType: .audio,
@@ -139,6 +156,11 @@ public final class CompositionEngine {
                             of: srcAudioTrack,
                             at: clip.timelineStart
                         )
+
+                        if clip.speed != 1.0 && clip.speed > 0 {
+                            let insertedRange = CMTimeRange(start: clip.timelineStart, duration: clip.sourceDuration)
+                            compAudioTrack.scaleTimeRange(insertedRange, toDuration: clip.duration)
+                        }
 
                         let inputParam = AVMutableAudioMixInputParameters(track: compAudioTrack)
                         inputParam.setVolume(1.0, at: .zero)

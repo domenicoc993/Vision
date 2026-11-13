@@ -16,14 +16,64 @@ public struct MediaFolder: Identifiable, Hashable, Codable {
 public final class EditorProject {
     public static let shared = EditorProject()
 
+    public var projectId: UUID = UUID()
     public var projectName: String = "Progetto 1"
+    public var createdAt: Date = Date()
+    public var lastSavedAt: Date? = nil
+
     public var folders: [MediaFolder] = []
     public var activeFolderId: UUID? = nil // nil = "Tutti i file"
 
     public var timelines: [TimelineModel] = []
     public var activeTimelineIndex: Int = 0
 
+    public var selections: [SelectionModel] = []
+    public var activeSelectionIndex: Int = 0
+
+    // Proxy Engine state
+    public var isProxyPlaybackEnabled: Bool = false
+    public var proxyOutputFolderURL: URL? = nil
+    public var onProxyToggleChanged: (() -> Void)?
+
     public var onProjectChanged: (() -> Void)?
+
+    public var activeSelection: SelectionModel? {
+        guard !selections.isEmpty else { return nil }
+        if activeSelectionIndex >= selections.count {
+            activeSelectionIndex = 0
+        }
+        return selections[activeSelectionIndex]
+    }
+
+    @discardableResult
+    public func createSelection(name: String, clips: [MediaItem]) -> SelectionModel {
+        let sel = SelectionModel(name: name, clips: clips)
+        selections.append(sel)
+        activeSelectionIndex = selections.count - 1
+        onProjectChanged?()
+        return sel
+    }
+
+    @discardableResult
+    public func duplicateSelection(id: UUID) -> SelectionModel? {
+        guard let orig = selections.first(where: { $0.id == id }) else { return nil }
+        let copy = SelectionModel(name: "\(orig.name) (Copia)", clips: orig.initialClips)
+        copy.analysisClips = orig.analysisClips
+        copy.rejectedClips = orig.rejectedClips
+        copy.selectedClips = orig.selectedClips
+        selections.append(copy)
+        activeSelectionIndex = selections.count - 1
+        onProjectChanged?()
+        return copy
+    }
+
+    public func removeSelection(id: UUID) {
+        selections.removeAll(where: { $0.id == id })
+        if activeSelectionIndex >= selections.count {
+            activeSelectionIndex = max(0, selections.count - 1)
+        }
+        onProjectChanged?()
+    }
 
     public var activeTimeline: TimelineModel {
         if timelines.isEmpty {
@@ -98,5 +148,25 @@ public final class EditorProject {
             }
         }
         onProjectChanged?()
+    }
+
+    public func reset(with document: ProjectDocumentData, restoredMedia: [MediaItem]) {
+        self.projectId = document.id
+        self.projectName = document.name
+        self.createdAt = document.createdAt
+        self.folders = document.folders
+        self.activeFolderId = document.activeFolderId
+
+        let mediaDict = Dictionary(uniqueKeysWithValues: restoredMedia.map { ($0.id, $0) })
+        self.timelines = document.timelines.map { $0.toModel(mediaItems: mediaDict) }
+        self.activeTimelineIndex = min(document.activeTimelineIndex, max(0, self.timelines.count - 1))
+        self.selections = document.selections.map { $0.toModel(mediaItems: mediaDict) }
+        self.activeSelectionIndex = min(document.activeSelectionIndex, max(0, self.selections.count - 1))
+        self.isProxyPlaybackEnabled = document.isProxyPlaybackEnabled
+        if let pPath = document.proxyOutputFolderPath {
+            self.proxyOutputFolderURL = URL(fileURLWithPath: pPath)
+        }
+        self.lastSavedAt = Date()
+        self.onProjectChanged?()
     }
 }

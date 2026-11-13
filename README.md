@@ -34,10 +34,45 @@ Vision è un editor video non-lineare (NLE) nativo per macOS, ottimizzato e acce
 
 ## Compilazione ed Esecuzione
 
+### Creazione del Bundle Eseguibile (.app)
+
+Per generare l'applicazione macOS autonoma e firmata (`Vision.app`):
+
 ```bash
-# Compilazione
+# Tramite make (consigliato)
+make app
+
+# Oppure direttamente tramite script
+./build_app.sh
+```
+
+Al termine troverai l'applicazione pronta all'uso in:
+- `./Vision.app` (nella cartella del progetto)
+- `./build/Vision.app`
+
+#### Altri comandi utili:
+
+```bash
+# Compila e avvia immediatamente Vision.app
+make run
+# oppure: ./build_app.sh --run
+
+# Installa Vision.app nella cartella /Applications del Mac
+make install
+# oppure: ./build_app.sh --install
+
+# Compila in modalità Debug
+make debug
+# oppure: ./build_app.sh --debug
+```
+
+### Compilazione da Riga di Comando (CLI)
+
+```bash
+# Compilazione debug
 swift build
 
-# Avvio
+# Avvio diretto
 swift run Vision
 ```
+

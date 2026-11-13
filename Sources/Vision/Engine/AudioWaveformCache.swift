@@ -66,17 +66,12 @@ public final class AudioWaveformCache {
         let asset = AVURLAsset(url: url)
         var audioTrack: AVAssetTrack? = nil
 
-        if #available(macOS 13.0, *) {
-            let semaphore = DispatchSemaphore(value: 0)
-            asset.loadTracks(withMediaType: .audio) { tracks, _ in
-                audioTrack = tracks?.first
-                semaphore.signal()
-            }
-            _ = semaphore.wait(timeout: .now() + 5.0)
+        let semaphore = DispatchSemaphore(value: 0)
+        asset.loadTracks(withMediaType: .audio) { tracks, _ in
+            audioTrack = tracks?.first
+            semaphore.signal()
         }
-        if audioTrack == nil {
-            audioTrack = asset.tracks(withMediaType: .audio).first
-        }
+        _ = semaphore.wait(timeout: .now() + 5.0)
 
         guard let track = audioTrack else {
             return nil
