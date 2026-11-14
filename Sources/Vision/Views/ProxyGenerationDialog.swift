@@ -42,7 +42,7 @@ public final class ProxyGenerationDialog: NSWindowController {
         guard let window = self.window else { return }
         let contentView = NSView(frame: window.contentView!.bounds)
         contentView.wantsLayer = true
-        contentView.layer?.backgroundColor = NSColor(calibratedWhite: 0.14, alpha: 1.0).cgColor
+        contentView.layer?.backgroundColor = NSColor(calibratedWhite: 0.085, alpha: 1.0).cgColor
         window.contentView = contentView
 
         let infoLabel = NSTextField(labelWithString: "Generazione Proxy conforme per \(mediaItems.count) clip selezionate.\nI proxy conterranno lo stesso timecode, durata, framerate e tracce audio.")

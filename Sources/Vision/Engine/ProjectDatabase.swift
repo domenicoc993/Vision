@@ -87,6 +87,9 @@ public struct TimelineClipData: Codable {
     public var speed: Double?
     public var cageIndex: Int?
     public var span: Int?
+    public var beatMarkers: [Double]?
+    public var beatBPM: Double?
+    public var markers: [Double]?
 
     public init(clip: TimelineClip) {
         self.id = clip.id
@@ -102,6 +105,9 @@ public struct TimelineClipData: Codable {
         self.speed = clip.speed
         self.cageIndex = clip.cageIndex
         self.span = clip.span
+        self.beatMarkers = clip.beatMarkers.isEmpty ? nil : clip.beatMarkers
+        self.beatBPM = clip.beatBPM
+        self.markers = clip.markers.isEmpty ? nil : clip.markers
     }
 
     public func toClip(mediaItems: [UUID: MediaItem]) -> TimelineClip? {
@@ -121,7 +127,10 @@ public struct TimelineClipData: Codable {
             isOrphan: isOrphan,
             speed: speed ?? 1.0,
             cageIndex: cageIndex,
-            span: span ?? 1
+            span: span ?? 1,
+            beatMarkers: beatMarkers ?? [],
+            beatBPM: beatBPM,
+            markers: markers ?? []
         )
     }
 }

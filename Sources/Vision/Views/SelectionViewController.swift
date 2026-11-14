@@ -47,7 +47,7 @@ public final class SelectionViewController: NSViewController {
     private let selectionPopUp = NSPopUpButton()
     private let newSelectionBtn = NSButton()
     private let duplicateBtn = NSButton()
-    private let zoomLabel = NSTextField(labelWithString: "🔍 Zoom:")
+    private let zoomIconView = NSImageView()
     private let zoomSlider = NSSlider()
     private let statusInfoLabel = NSTextField(labelWithString: "")
 
@@ -65,13 +65,13 @@ public final class SelectionViewController: NSViewController {
     public override func loadView() {
         let root = NSView()
         root.wantsLayer = true
-        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1.0).cgColor
+        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0).cgColor
 
         // 1. Header Bar
         let header = NSView()
         header.translatesAutoresizingMaskIntoConstraints = false
         header.wantsLayer = true
-        header.layer?.backgroundColor = NSColor(calibratedWhite: 0.15, alpha: 1.0).cgColor
+        header.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
         root.addSubview(header)
         setupHeader(in: header)
 
@@ -189,6 +189,15 @@ public final class SelectionViewController: NSViewController {
         }
 
         activeStrip = .analysis
+
+        playbackController.addTimeObserver(self) { [weak self] _ in
+            guard let self = self else { return }
+            switch self.activeStrip {
+            case .rejected: self.rejectedStripView?.needsDisplay = true
+            case .analysis: self.analysisStripView?.needsDisplay = true
+            case .selected: self.selectedStripView?.needsDisplay = true
+            }
+        }
     }
 
     private func setupHeader(in header: NSView) {
@@ -216,10 +225,11 @@ public final class SelectionViewController: NSViewController {
         duplicateBtn.action = #selector(onDuplicateClicked)
         header.addSubview(duplicateBtn)
 
-        zoomLabel.translatesAutoresizingMaskIntoConstraints = false
-        zoomLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        zoomLabel.textColor = NSColor(calibratedWhite: 0.75, alpha: 1.0)
-        header.addSubview(zoomLabel)
+        zoomIconView.translatesAutoresizingMaskIntoConstraints = false
+        zoomIconView.image = Lucide.template(.zoomIn, size: 15)
+        zoomIconView.contentTintColor = NSColor(calibratedWhite: 0.75, alpha: 1.0)
+        zoomIconView.toolTip = "Zoom"
+        header.addSubview(zoomIconView)
 
         zoomSlider.translatesAutoresizingMaskIntoConstraints = false
         zoomSlider.minValue = 15.0
@@ -253,10 +263,12 @@ public final class SelectionViewController: NSViewController {
             duplicateBtn.leadingAnchor.constraint(equalTo: newSelectionBtn.trailingAnchor, constant: 6),
             duplicateBtn.centerYAnchor.constraint(equalTo: header.centerYAnchor),
 
-            zoomLabel.leadingAnchor.constraint(equalTo: duplicateBtn.trailingAnchor, constant: 16),
-            zoomLabel.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            zoomIconView.leadingAnchor.constraint(equalTo: duplicateBtn.trailingAnchor, constant: 14),
+            zoomIconView.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            zoomIconView.widthAnchor.constraint(equalToConstant: 16),
+            zoomIconView.heightAnchor.constraint(equalToConstant: 16),
 
-            zoomSlider.leadingAnchor.constraint(equalTo: zoomLabel.trailingAnchor, constant: 6),
+            zoomSlider.leadingAnchor.constraint(equalTo: zoomIconView.trailingAnchor, constant: 6),
             zoomSlider.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             zoomSlider.widthAnchor.constraint(equalToConstant: 100),
 

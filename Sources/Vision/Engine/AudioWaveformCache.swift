@@ -6,24 +6,56 @@ public extension Notification.Name {
     static let waveformReadyNotification = Notification.Name("AudioWaveformCache.waveformReady")
 }
 
+public struct WaveformData {
+    public let peaks: [Float]
+    public let rms: [Float]
+    public let binsPerSecond: Double
+    public let durationSeconds: Double
+
+    /// Restituisce (picco massimo, RMS massimo) nell'intervallo [startTime, endTime] in secondi sorgente.
+    public func envelope(from startTime: Double, to endTime: Double) -> (peak: Float, rms: Float) {
+        guard !peaks.isEmpty, binsPerSecond > 0 else { return (0, 0) }
+        let t0 = max(0.0, min(durationSeconds, startTime))
+        let t1 = max(t0, min(durationSeconds, endTime))
+        let i0 = max(0, min(peaks.count - 1, Int(floor(t0 * binsPerSecond))))
+        let i1 = max(i0, min(peaks.count - 1, Int(floor(t1 * binsPerSecond))))
+
+        var maxPeak: Float = 0
+        var maxRms: Float = 0
+        for i in i0...i1 {
+            let p = peaks[i]
+            let r = rms[i]
+            if p > maxPeak { maxPeak = p }
+            if r > maxRms { maxRms = r }
+        }
+        return (maxPeak, maxRms)
+    }
+}
+
 public final class AudioWaveformCache {
     public static let shared = AudioWaveformCache()
 
+    public static let defaultBinsPerSecond: Double = 200.0
+
     private let lock = NSLock()
-    private var cache: [URL: [Float]] = [:]
+    private var cache: [URL: WaveformData] = [:]
     private var inProgress: Set<URL> = []
     private let queue = DispatchQueue(label: "com.vision.waveform", qos: .utility)
 
     public init() {}
 
-    public func waveform(for url: URL) -> [Float]? {
+    public func waveformData(for url: URL) -> WaveformData? {
         lock.lock()
         defer { lock.unlock() }
         return cache[url]
     }
 
+    public func waveform(for url: URL) -> [Float]? {
+        waveformData(for: url)?.peaks
+    }
+
     public func samples(for url: URL) -> [Float]? {
-        waveform(for: url)
+        waveformData(for: url)?.peaks
     }
 
     public func loadWaveform(for item: MediaItem) {
@@ -44,12 +76,12 @@ public final class AudioWaveformCache {
         queue.async { [weak self] in
             guard let self = self else { return }
 
-            let samples = self.extractWaveformPeaks(from: url, targetSampleCount: 600)
+            let data = self.extractWaveform(from: url, binsPerSecond: Self.defaultBinsPerSecond)
 
             self.lock.lock()
             self.inProgress.remove(url)
-            if let samples = samples, !samples.isEmpty {
-                self.cache[url] = samples
+            if let data = data, !data.peaks.isEmpty {
+                self.cache[url] = data
             }
             self.lock.unlock()
 
@@ -62,45 +94,68 @@ public final class AudioWaveformCache {
         }
     }
 
-    private func extractWaveformPeaks(from url: URL, targetSampleCount: Int) -> [Float]? {
-        let asset = AVURLAsset(url: url)
+    private func extractWaveform(from url: URL, binsPerSecond: Double) -> WaveformData? {
+        let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         var audioTrack: AVAssetTrack? = nil
+        var durationSeconds: Double = 0
 
         let semaphore = DispatchSemaphore(value: 0)
-        asset.loadTracks(withMediaType: .audio) { tracks, _ in
+        Task {
+            let tracks = try? await asset.loadTracks(withMediaType: .audio)
             audioTrack = tracks?.first
+            if let dur = try? await asset.load(.duration) {
+                durationSeconds = max(0, CMTimeGetSeconds(dur))
+            }
             semaphore.signal()
         }
-        _ = semaphore.wait(timeout: .now() + 5.0)
+        _ = semaphore.wait(timeout: .now() + 8.0)
 
-        guard let track = audioTrack else {
-            return nil
-        }
+        guard let track = audioTrack else { return nil }
 
         let outputSettings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
-            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMBitDepthKey: 32,
             AVLinearPCMIsBigEndianKey: false,
-            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsFloatKey: true,
             AVLinearPCMIsNonInterleaved: false
         ]
 
-        guard let reader = try? AVAssetReader(asset: asset) else {
-            return nil
-        }
+        guard let reader = try? AVAssetReader(asset: asset) else { return nil }
         let trackOutput = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
         trackOutput.alwaysCopiesSampleData = false
         reader.add(trackOutput)
 
-        guard reader.startReading() else {
-            return nil
-        }
+        guard reader.startReading() else { return nil }
 
-        var rawPeaks: [Float] = []
-        var maxPeak: Float = 0.0001
+        let initialBins = max(1, Int(ceil(durationSeconds * binsPerSecond)))
+        var binPeaks = [Float](repeating: 0, count: initialBins)
+        var binSumSq = [Double](repeating: 0, count: initialBins)
+        var binCounts = [Int](repeating: 0, count: initialBins)
+        var maxGlobalPeak: Float = 0.0001
+        var maxObservedEndSec: Double = durationSeconds
+
+        var fallbackSampleRate: Double = 44100.0
+        var fallbackChannels: Int = 2
+        var cumulativeFrames: Int64 = 0
 
         while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
-            guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
+            if let fmt = CMSampleBufferGetFormatDescription(sampleBuffer),
+               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt)?.pointee {
+                if asbd.mSampleRate > 0 { fallbackSampleRate = asbd.mSampleRate }
+                if asbd.mChannelsPerFrame > 0 { fallbackChannels = Int(asbd.mChannelsPerFrame) }
+            }
+
+            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            let ptsSec = pts.isValid && !CMTimeGetSeconds(pts).isNaN
+                ? max(0.0, CMTimeGetSeconds(pts))
+                : Double(cumulativeFrames) / fallbackSampleRate
+
+            let numFrames = CMSampleBufferGetNumSamples(sampleBuffer)
+            guard numFrames > 0, let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
+                cumulativeFrames += Int64(numFrames)
+                continue
+            }
+
             var length = 0
             var dataPointer: UnsafeMutablePointer<Int8>?
             let status = CMBlockBufferGetDataPointer(
@@ -110,51 +165,85 @@ public final class AudioWaveformCache {
                 totalLengthOut: &length,
                 dataPointerOut: &dataPointer
             )
-            guard status == noErr, let rawData = dataPointer, length >= 2 else { continue }
+            guard status == noErr, let rawData = dataPointer, length >= 4 else {
+                cumulativeFrames += Int64(numFrames)
+                continue
+            }
 
-            let sampleCount = length / 2
-            rawData.withMemoryRebound(to: Int16.self, capacity: sampleCount) { int16Buffer in
-                var blockMax: Float = 0
-                let step = max(1, sampleCount / 24)
-                for i in stride(from: 0, to: sampleCount, by: step) {
-                    let val = abs(Float(int16Buffer[i])) / 32768.0
-                    if val > blockMax { blockMax = val }
+            let floatCount = length / MemoryLayout<Float>.size
+            let channels = max(1, fallbackChannels)
+            let framesAvailable = min(numFrames, floatCount / channels)
+            let endSec = ptsSec + Double(framesAvailable) / fallbackSampleRate
+            if endSec > maxObservedEndSec { maxObservedEndSec = endSec }
+
+            let neededBins = Int(ceil(maxObservedEndSec * binsPerSecond)) + 1
+            if neededBins > binPeaks.count {
+                let extra = neededBins - binPeaks.count
+                binPeaks.append(contentsOf: repeatElement(0, count: extra))
+                binSumSq.append(contentsOf: repeatElement(0, count: extra))
+                binCounts.append(contentsOf: repeatElement(0, count: extra))
+            }
+
+            let framesPerBin = fallbackSampleRate / binsPerSecond
+
+            rawData.withMemoryRebound(to: Float.self, capacity: framesAvailable * channels) { ptr in
+                var f = 0
+                while f < framesAvailable {
+                    let exactTime = ptsSec + Double(f) / fallbackSampleRate
+                    let binIdx = max(0, min(binPeaks.count - 1, Int(exactTime * binsPerSecond)))
+                    // Advance within the same time bin tightly in a tight inner loop
+                    let binEndSec = Double(binIdx + 1) / binsPerSecond
+                    let framesInThisBin = max(1, min(framesAvailable - f, Int(ceil((binEndSec - exactTime) * fallbackSampleRate))))
+                    let endF = min(framesAvailable, f + framesInThisBin)
+
+                    var localMax: Float = binPeaks[binIdx]
+                    var localSumSq: Double = 0
+                    var localCount = 0
+
+                    for fi in f..<endF {
+                        let base = fi * channels
+                        var framePeak: Float = 0
+                        for ch in 0..<channels {
+                            let s = abs(ptr[base + ch])
+                            if s > framePeak { framePeak = s }
+                        }
+                        if framePeak > localMax { localMax = framePeak }
+                        localSumSq += Double(framePeak) * Double(framePeak)
+                        localCount += 1
+                    }
+
+                    binPeaks[binIdx] = localMax
+                    if localMax > maxGlobalPeak { maxGlobalPeak = localMax }
+                    binSumSq[binIdx] += localSumSq
+                    binCounts[binIdx] += localCount
+                    _ = framesPerBin
+                    f = endF
                 }
-                rawPeaks.append(blockMax)
-                if blockMax > maxPeak { maxPeak = blockMax }
             }
 
-            // Cap at 3000 blocks to prevent excessive memory usage on long tracks
-            if rawPeaks.count >= 3000 {
-                reader.cancelReading()
-                break
+            cumulativeFrames += Int64(framesAvailable)
+        }
+
+        let finalCount = max(1, min(binPeaks.count, Int(ceil(maxObservedEndSec * binsPerSecond))))
+        guard finalCount > 0 else { return nil }
+
+        let norm = max(0.002, maxGlobalPeak)
+        var normPeaks = [Float](repeating: 0, count: finalCount)
+        var normRms = [Float](repeating: 0, count: finalCount)
+        for i in 0..<finalCount {
+            let p = min(1.0, binPeaks[i] / norm)
+            normPeaks[i] = p
+            if binCounts[i] > 0 {
+                let rawRms = Float(sqrt(binSumSq[i] / Double(binCounts[i])))
+                normRms[i] = min(p, rawRms / norm)
             }
         }
 
-        if !rawPeaks.isEmpty {
-            return resample(peaks: rawPeaks, maxPeak: maxPeak, targetCount: targetSampleCount)
-        }
-        return nil
-    }
-
-    private func resample(peaks: [Float], maxPeak: Float, targetCount: Int) -> [Float] {
-        guard !peaks.isEmpty else { return [] }
-        let normalizer = max(0.005, maxPeak)
-        var result = [Float](repeating: 0, count: targetCount)
-
-        let factor = Double(peaks.count) / Double(targetCount)
-        for i in 0..<targetCount {
-            let startIdx = Int(Double(i) * factor)
-            let endIdx = min(peaks.count, max(startIdx + 1, Int(Double(i + 1) * factor)))
-            var pMax: Float = 0
-            for k in startIdx..<endIdx {
-                if peaks[k] > pMax { pMax = peaks[k] }
-            }
-            // Normalize with logarithmic perception scaling for realistic professional NLE waveform appearance
-            let normalized = min(1.0, pMax / normalizer)
-            let perceptual = sqrt(normalized) // Equal-power perceptual curve
-            result[i] = min(1.0, max(0.02, perceptual))
-        }
-        return result
+        return WaveformData(
+            peaks: normPeaks,
+            rms: normRms,
+            binsPerSecond: binsPerSecond,
+            durationSeconds: maxObservedEndSec
+        )
     }
 }

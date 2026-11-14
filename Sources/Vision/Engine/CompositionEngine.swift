@@ -40,7 +40,7 @@ public final class CompositionEngine {
             return cached
         }
 
-        let asset = AVURLAsset(url: url)
+        let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         let vTracks = try await asset.loadTracks(withMediaType: .video)
         let videoTrack = vTracks.first
 

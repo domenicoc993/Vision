@@ -15,6 +15,9 @@ public struct TimelineClip: Identifiable, Hashable {
     public var speed: Double // 1.0 = normale, 0.5 = slow motion 50%, 2.0 = 200%
     public var cageIndex: Int? // Indice della gabbia ritmata occupata
     public var span: Int // Numero di gabbie occupate (default 1)
+    public var beatMarkers: [Double] // Beat / tagli ritmici legati al brano (secondi sorgente)
+    public var beatBPM: Double? // BPM rilevato sul brano
+    public var markers: [Double] // Marcatori manuali dell'utente (secondi sorgente, audio e video)
 
     public init(
         id: UUID = UUID(),
@@ -29,7 +32,10 @@ public struct TimelineClip: Identifiable, Hashable {
         isOrphan: Bool = false,
         speed: Double = 1.0,
         cageIndex: Int? = nil,
-        span: Int = 1
+        span: Int = 1,
+        beatMarkers: [Double] = [],
+        beatBPM: Double? = nil,
+        markers: [Double] = []
     ) {
         self.id = id
         self.mediaItem = mediaItem
@@ -44,6 +50,31 @@ public struct TimelineClip: Identifiable, Hashable {
         self.speed = speed
         self.cageIndex = cageIndex
         self.span = max(1, span)
+        self.beatMarkers = beatMarkers
+        self.beatBPM = beatBPM
+        self.markers = markers
+    }
+
+    private func mapSourceMarkersToTimeline(_ sourceMarkers: [Double]) -> [Double] {
+        guard !sourceMarkers.isEmpty else { return [] }
+        let tStart = CMTimeGetSeconds(timelineStart)
+        let sIn = CMTimeGetSeconds(sourceIn)
+        let sOut = CMTimeGetSeconds(sourceOut)
+        let spd = speed > 0 ? speed : 1.0
+        return sourceMarkers.compactMap { m in
+            guard m >= sIn - 0.001 && m <= sOut + 0.001 else { return nil }
+            return tStart + (m - sIn) / spd
+        }
+    }
+
+    /// Converte i marker ritmici del brano (espressi in secondi sorgente) in secondi sulla timeline visibile.
+    public func visibleBeatTimelineTimes() -> [Double] {
+        mapSourceMarkersToTimeline(beatMarkers)
+    }
+
+    /// Converte i marcatori manuali (espressi in secondi sorgente) in secondi sulla timeline visibile.
+    public func visibleMarkersTimelineTimes() -> [Double] {
+        mapSourceMarkersToTimeline(markers)
     }
 
     public var duration: CMTime {

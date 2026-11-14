@@ -63,7 +63,7 @@ public final class TimelineSettingsDialog {
         override func loadView() {
             let root = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 270))
             root.wantsLayer = true
-            root.layer?.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1.0).cgColor
+            root.layer?.backgroundColor = NSColor(calibratedWhite: 0.085, alpha: 1.0).cgColor
             self.view = root
 
             let titleLbl = NSTextField(labelWithString: "Formato e Frame Rate")

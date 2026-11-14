@@ -151,7 +151,7 @@ public final class TimelineGridView: NSView {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
         // Dark Studio background
-        ctx.setFillColor(NSColor(calibratedWhite: 0.11, alpha: 1.0).cgColor)
+        ctx.setFillColor(NSColor(calibratedWhite: 0.08, alpha: 1.0).cgColor)
         ctx.fill(bounds)
 
         let clips = currentClips
@@ -205,7 +205,7 @@ public final class TimelineGridView: NSView {
 
         // Card Container rounded rectangle
         let path = NSBezierPath(roundedRect: frame, xRadius: 7, yRadius: 7)
-        NSColor(calibratedWhite: 0.18, alpha: 1.0).setFill()
+        NSColor(calibratedWhite: 0.125, alpha: 1.0).setFill()
         path.fill()
 
         if clip.isOrphan {
@@ -272,7 +272,7 @@ public final class TimelineGridView: NSView {
 
     private func drawPlaceholderCard(frame: NSRect, index: Int, ctx: CGContext) {
         let path = NSBezierPath(roundedRect: frame, xRadius: 7, yRadius: 7)
-        NSColor(calibratedWhite: 0.14, alpha: 0.6).setFill()
+        NSColor(calibratedWhite: 0.10, alpha: 0.6).setFill()
         path.fill()
 
         let strokeColor = NSColor(calibratedWhite: 0.28, alpha: 0.6)

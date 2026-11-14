@@ -102,13 +102,13 @@ public final class FlatButton: NSButton {
             layer?.borderWidth = 1.0
             contentTintColor = .white
         } else if isHovered {
-            layer?.backgroundColor = NSColor(calibratedWhite: 0.24, alpha: 1.0).cgColor
-            layer?.borderColor = NSColor(calibratedWhite: 0.38, alpha: 1.0).cgColor
+            layer?.backgroundColor = NSColor(calibratedWhite: 0.18, alpha: 1.0).cgColor
+            layer?.borderColor = NSColor(calibratedWhite: 0.30, alpha: 1.0).cgColor
             layer?.borderWidth = 1.0
             contentTintColor = .white
         } else {
-            layer?.backgroundColor = NSColor(calibratedWhite: 0.18, alpha: 1.0).cgColor
-            layer?.borderColor = NSColor(calibratedWhite: 0.28, alpha: 1.0).cgColor
+            layer?.backgroundColor = NSColor(calibratedWhite: 0.125, alpha: 1.0).cgColor
+            layer?.borderColor = NSColor(calibratedWhite: 0.22, alpha: 1.0).cgColor
             layer?.borderWidth = 1.0
             contentTintColor = NSColor(calibratedWhite: 0.85, alpha: 1.0)
         }

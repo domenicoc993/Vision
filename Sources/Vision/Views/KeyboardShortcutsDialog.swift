@@ -1,8 +1,11 @@
 import AppKit
 
-/// Floating popover displaying all active Vision keyboard shortcuts grouped by context.
-public final class KeyboardShortcutsDialog: NSViewController {
-    private static var activePopover: NSPopover?
+/// Modal dialog displaying all active Vision keyboard shortcuts grouped by context, with live search.
+public final class KeyboardShortcutsDialog: NSViewController, NSSearchFieldDelegate, NSWindowDelegate {
+    private weak var modalPanel: NSPanel?
+    private let searchField = NSSearchField()
+    private let contentStack = NSStackView()
+    private let emptyLabel = NSTextField(labelWithString: "Nessuna scorciatoia trovata")
 
     public struct ShortcutEntry {
         public let keys: String
@@ -40,6 +43,8 @@ public final class KeyboardShortcutsDialog: NSViewController {
                 ShortcutEntry(keys: "Q", description: "Trim inizio clip alla testina (Ripple)"),
                 ShortcutEntry(keys: "W", description: "Trim fine clip alla testina (Ripple)"),
                 ShortcutEntry(keys: "S / B", description: "Spezza clip alla testina (Blade)"),
+                ShortcutEntry(keys: "M", description: "Aggiungi / rimuovi marcatore su clip audio/video"),
+                ShortcutEntry(keys: "⌥ M", description: "Pulisci tutti i marcatori sulla clip"),
                 ShortcutEntry(keys: "⌥ ⌘ W", description: "Chiudi spazi (Close Gaps) tra clip selezionate"),
                 ShortcutEntry(keys: "N", description: "Attiva / disattiva Magnet (Snapping)"),
                 ShortcutEntry(keys: "⌘ L / ⌥ L", description: "Attiva / disattiva Link Audio/Video"),
@@ -67,32 +72,75 @@ public final class KeyboardShortcutsDialog: NSViewController {
         )
     ]
 
-    public static func toggle(relativeTo anchorView: NSView) {
-        if let existing = activePopover, existing.isShown {
-            existing.performClose(nil)
-            activePopover = nil
-            return
+    public static func showModal(relativeTo parentWindow: NSWindow? = nil) {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 560),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.minSize = NSSize(width: 440, height: 400)
+        panel.title = "Scorciatoie da Tastiera"
+        panel.appearance = NSAppearance(named: .darkAqua)
+        panel.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0)
+        panel.isFloatingPanel = true
+
+        if let parent = parentWindow {
+            let pf = parent.frame
+            panel.setFrameOrigin(NSPoint(
+                x: pf.midX - panel.frame.width / 2,
+                y: pf.midY - panel.frame.height / 2
+            ))
+        } else {
+            panel.center()
         }
-        let popover = NSPopover()
-        popover.behavior = .transient
-        popover.appearance = NSAppearance(named: .darkAqua)
-        popover.contentViewController = KeyboardShortcutsDialog()
-        popover.contentSize = NSSize(width: 470, height: 500)
-        popover.show(relativeTo: anchorView.bounds, of: anchorView, preferredEdge: .maxY)
-        activePopover = popover
+
+        let controller = KeyboardShortcutsDialog(panel: panel)
+        panel.delegate = controller
+        panel.contentViewController = controller
+        panel.makeFirstResponder(controller.searchField)
+        NSApp.runModal(for: panel)
+        panel.orderOut(nil)
+    }
+
+    public init(panel: NSPanel? = nil) {
+        self.modalPanel = panel
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    public required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
     }
 
     public override func loadView() {
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: 470, height: 500))
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 560))
         root.wantsLayer = true
-        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1.0).cgColor
+        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0).cgColor
         self.view = root
+
+        let header = NSView()
+        header.translatesAutoresizingMaskIntoConstraints = false
+        header.wantsLayer = true
+        header.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
+        root.addSubview(header)
+
+        let iconView = NSImageView()
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.image = Lucide.image(.keyboard, size: 18, color: .systemCyan)
+        header.addSubview(iconView)
 
         let headerTitle = NSTextField(labelWithString: "Scorciatoie da Tastiera")
         headerTitle.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
         headerTitle.textColor = .white
         headerTitle.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(headerTitle)
+        header.addSubview(headerTitle)
+
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        searchField.placeholderString = "Cerca comando o tasto (es. trim, ⌘, slip)..."
+        searchField.delegate = self
+        searchField.target = self
+        searchField.action = #selector(onSearchChanged)
+        header.addSubview(searchField)
 
         let divider = NSBox()
         divider.boxType = .separator
@@ -113,14 +161,119 @@ public final class KeyboardShortcutsDialog: NSViewController {
         docView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.documentView = docView
 
-        let contentStack = NSStackView()
         contentStack.orientation = .vertical
         contentStack.alignment = .leading
-        contentStack.spacing = 14
+        contentStack.spacing = 16
         contentStack.translatesAutoresizingMaskIntoConstraints = false
         docView.addSubview(contentStack)
 
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+        emptyLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        emptyLabel.textColor = NSColor(calibratedWhite: 0.52, alpha: 1.0)
+        emptyLabel.isHidden = true
+        root.addSubview(emptyLabel)
+
+        let footer = NSView()
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        footer.wantsLayer = true
+        footer.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
+        root.addSubview(footer)
+
+        let footerDivider = NSBox()
+        footerDivider.boxType = .separator
+        footerDivider.translatesAutoresizingMaskIntoConstraints = false
+        footer.addSubview(footerDivider)
+
+        let closeBtn = FlatButton(title: "Chiudi", target: self, action: #selector(onCloseClicked))
+        closeBtn.keyEquivalent = "\u{1b}"
+        closeBtn.translatesAutoresizingMaskIntoConstraints = false
+        footer.addSubview(closeBtn)
+
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: root.topAnchor),
+            header.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+
+            iconView.topAnchor.constraint(equalTo: header.topAnchor, constant: 14),
+            iconView.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 16),
+            iconView.widthAnchor.constraint(equalToConstant: 18),
+            iconView.heightAnchor.constraint(equalToConstant: 18),
+
+            headerTitle.centerYAnchor.constraint(equalTo: iconView.centerYAnchor),
+            headerTitle.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+
+            searchField.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 10),
+            searchField.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 16),
+            searchField.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -16),
+            searchField.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -12),
+
+            divider.topAnchor.constraint(equalTo: header.bottomAnchor),
+            divider.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            divider.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+
+            scrollView.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: footer.topAnchor),
+
+            docView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            docView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            docView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
+
+            contentStack.topAnchor.constraint(equalTo: docView.topAnchor, constant: 14),
+            contentStack.leadingAnchor.constraint(equalTo: docView.leadingAnchor, constant: 18),
+            contentStack.trailingAnchor.constraint(equalTo: docView.trailingAnchor, constant: -18),
+            contentStack.bottomAnchor.constraint(equalTo: docView.bottomAnchor, constant: -16),
+
+            emptyLabel.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
+            emptyLabel.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
+
+            footer.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            footer.heightAnchor.constraint(equalToConstant: 44),
+
+            footerDivider.topAnchor.constraint(equalTo: footer.topAnchor),
+            footerDivider.leadingAnchor.constraint(equalTo: footer.leadingAnchor),
+            footerDivider.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
+
+            closeBtn.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -16),
+            closeBtn.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            closeBtn.widthAnchor.constraint(equalToConstant: 84),
+            closeBtn.heightAnchor.constraint(equalToConstant: 26)
+        ])
+
+        rebuildContent(query: "")
+    }
+
+    public func controlTextDidChange(_ obj: Notification) {
+        rebuildContent(query: searchField.stringValue)
+    }
+
+    @objc private func onSearchChanged() {
+        rebuildContent(query: searchField.stringValue)
+    }
+
+    private func rebuildContent(query: String) {
+        for view in contentStack.arrangedSubviews {
+            contentStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
         for section in Self.sections {
+            let matchingEntries: [ShortcutEntry]
+            if trimmed.isEmpty || section.title.lowercased().contains(trimmed) {
+                matchingEntries = section.entries
+            } else {
+                matchingEntries = section.entries.filter {
+                    $0.description.lowercased().contains(trimmed) || $0.keys.lowercased().contains(trimmed)
+                }
+            }
+
+            guard !matchingEntries.isEmpty else { continue }
+
             let sectionStack = NSStackView()
             sectionStack.orientation = .vertical
             sectionStack.alignment = .leading
@@ -132,7 +285,7 @@ public final class KeyboardShortcutsDialog: NSViewController {
             secLabel.textColor = .systemCyan
             sectionStack.addArrangedSubview(secLabel)
 
-            for entry in section.entries {
+            for entry in matchingEntries {
                 let row = makeShortcutRow(entry)
                 sectionStack.addArrangedSubview(row)
                 row.widthAnchor.constraint(equalTo: sectionStack.widthAnchor).isActive = true
@@ -142,28 +295,7 @@ public final class KeyboardShortcutsDialog: NSViewController {
             sectionStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor).isActive = true
         }
 
-        NSLayoutConstraint.activate([
-            headerTitle.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
-            headerTitle.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-
-            divider.topAnchor.constraint(equalTo: headerTitle.bottomAnchor, constant: 10),
-            divider.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            divider.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-
-            scrollView.topAnchor.constraint(equalTo: divider.bottomAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-
-            docView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
-            docView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
-            docView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
-
-            contentStack.topAnchor.constraint(equalTo: docView.topAnchor, constant: 12),
-            contentStack.leadingAnchor.constraint(equalTo: docView.leadingAnchor, constant: 16),
-            contentStack.trailingAnchor.constraint(equalTo: docView.trailingAnchor, constant: -16),
-            contentStack.bottomAnchor.constraint(equalTo: docView.bottomAnchor, constant: -14)
-        ])
+        emptyLabel.isHidden = !contentStack.arrangedSubviews.isEmpty
     }
 
     private func makeShortcutRow(_ entry: ShortcutEntry) -> NSView {
@@ -178,8 +310,8 @@ public final class KeyboardShortcutsDialog: NSViewController {
 
         let badgeContainer = NSView()
         badgeContainer.wantsLayer = true
-        badgeContainer.layer?.backgroundColor = NSColor(calibratedWhite: 0.21, alpha: 1.0).cgColor
-        badgeContainer.layer?.borderColor = NSColor(calibratedWhite: 0.34, alpha: 1.0).cgColor
+        badgeContainer.layer?.backgroundColor = NSColor(calibratedWhite: 0.14, alpha: 1.0).cgColor
+        badgeContainer.layer?.borderColor = NSColor(calibratedWhite: 0.24, alpha: 1.0).cgColor
         badgeContainer.layer?.borderWidth = 1.0
         badgeContainer.layer?.cornerRadius = 4
         badgeContainer.translatesAutoresizingMaskIntoConstraints = false
@@ -211,5 +343,13 @@ public final class KeyboardShortcutsDialog: NSViewController {
         ])
 
         return row
+    }
+
+    @objc private func onCloseClicked() {
+        modalPanel?.close()
+    }
+
+    public func windowWillClose(_ notification: Notification) {
+        NSApp.stopModal()
     }
 }

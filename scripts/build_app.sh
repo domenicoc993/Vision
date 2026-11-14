@@ -90,6 +90,12 @@ if [[ -f "$PROJECT_DIR/Resources/AppIcon.icns" ]]; then
     cp "$PROJECT_DIR/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 fi
 
+# Modelli CoreML / risorse ML per Beat Detection
+if [[ -d "$PROJECT_DIR/Resources/Models" ]]; then
+    echo "    Copia modelli ML in Contents/Resources/Models..."
+    cp -R "$PROJECT_DIR/Resources/Models" "$APP_BUNDLE/Contents/Resources/Models"
+fi
+
 # Copia eventuali risorse di bundle prodotte da SwiftPM se presenti
 for bundle in "$BIN_DIR"/*.bundle; do
     if [[ -d "$bundle" ]]; then

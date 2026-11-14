@@ -85,7 +85,7 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
 
     private func setupUI() {
         wantsLayer = true
-        layer?.backgroundColor = NSColor(calibratedWhite: 0.18, alpha: 1.0).cgColor
+        layer?.backgroundColor = NSColor(calibratedWhite: 0.125, alpha: 1.0).cgColor
         layer?.cornerRadius = 6
         updateBorder()
 
@@ -635,7 +635,7 @@ public final class MediaThumbnailGridView: NSView {
     public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0).cgColor
         registerForDraggedTypes([.fileURL, kMediaItemPasteboardType])
     }
 

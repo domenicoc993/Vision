@@ -6,14 +6,16 @@ public enum BeatIntervalMode: String, CaseIterable, Codable {
     case oneBeat = "1 Battito (Veloce / Dinamico)"
     case twoBeats = "2 Battiti (Standard / Pop)"
     case fourBeats = "4 Battiti (1 Battuta / Disteso)"
-    case dynamicTransients = "Accenti Musicali (Dinamico sui Picchi)"
+    case dynamicTransients = "Momenti Forti (Picchi & Esplosioni)"
+    case adaptiveDirector = "Regia Adattiva (Ritmo + Picchi)"
 
     public var shortTitle: String {
         switch self {
         case .oneBeat: return "1 Beat"
         case .twoBeats: return "2 Beat"
         case .fourBeats: return "4 Beat"
-        case .dynamicTransients: return "Dinamico"
+        case .dynamicTransients: return "Momenti Forti"
+        case .adaptiveDirector: return "Regia Adattiva"
         }
     }
 }

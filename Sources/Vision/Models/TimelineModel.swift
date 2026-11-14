@@ -61,7 +61,8 @@ public final class TimelineModel {
     // MARK: - Rhythmic Cages & Beat Grid (Montaggio a Gabbie)
     public var rhythmicCages: [RhythmicCage] = []
     public var detectedBPM: Double? = nil
-    public var beatIntervalMode: BeatIntervalMode = .twoBeats
+    public var beatIntervalMode: BeatIntervalMode = .dynamicTransients
+    public var peakSensitivity: Double = 0.45
     public var isRhythmicGridVisible: Bool = true
 
     public var onModelChanged: (() -> Void)?
@@ -318,7 +319,11 @@ public final class TimelineModel {
                         mediaType: clip.mediaType,
                         orientation: clip.orientation,
                         linkGroupId: clip.linkGroupId,
-                        isOrphan: clip.isOrphan
+                        isOrphan: clip.isOrphan,
+                        speed: clip.speed,
+                        beatMarkers: clip.beatMarkers,
+                        beatBPM: clip.beatBPM,
+                        markers: clip.markers
                     )
                     result.append(leftClip)
                 }
@@ -338,7 +343,11 @@ public final class TimelineModel {
                         mediaType: clip.mediaType,
                         orientation: clip.orientation,
                         linkGroupId: clip.linkGroupId != nil ? UUID() : nil,
-                        isOrphan: clip.isOrphan
+                        isOrphan: clip.isOrphan,
+                        speed: clip.speed,
+                        beatMarkers: clip.beatMarkers,
+                        beatBPM: clip.beatBPM,
+                        markers: clip.markers
                     )
                     result.append(rightClip)
                 }
@@ -635,6 +644,22 @@ public final class TimelineModel {
             for cage in rhythmicCages {
                 snapPoints.append(cage.startSeconds)
                 snapPoints.append(cage.endSeconds)
+            }
+            for track in audioTracks {
+                for clip in track.clips where !clip.beatMarkers.isEmpty {
+                    snapPoints.append(contentsOf: clip.visibleBeatTimelineTimes())
+                }
+            }
+        }
+
+        for track in videoTracks {
+            for clip in track.clips where !clip.markers.isEmpty {
+                snapPoints.append(contentsOf: clip.visibleMarkersTimelineTimes())
+            }
+        }
+        for track in audioTracks {
+            for clip in track.clips where !clip.markers.isEmpty {
+                snapPoints.append(contentsOf: clip.visibleMarkersTimelineTimes())
             }
         }
 
@@ -934,7 +959,8 @@ public final class TimelineModel {
         return nil
     }
 
-    public func trimClipEnd(at time: CMTime) {
+    @discardableResult
+    public func trimClipEnd(at time: CMTime) -> Bool {
         var didTrim = false
         var targetVideoClipIds: Set<UUID> = []
         var targetAudioClipIds: Set<UUID> = []
@@ -1027,31 +1053,56 @@ public final class TimelineModel {
             onModelChanged?()
             DebugLogger.shared.log("Trim Fine Senza Scarto (W) eseguito a \(String(format: "%.2f", CMTimeGetSeconds(time)))s (Ripple: \(String(format: "%.2f", totalDeltaSec))s)", level: .info)
         }
+        return didTrim
     }
 
-    public func splitClip(at time: CMTime) {
+    @discardableResult
+    public func splitClip(at time: CMTime) -> Bool {
         var didSplit = false
-        func split(in tracks: inout [TimelineTrack], isVideoTracks: Bool) {
+        var selectedLinkGroupIds: Set<UUID> = []
+        if isLinkActive && !selectedClipIds.isEmpty {
+            for track in videoTracks {
+                for clip in track.clips where selectedClipIds.contains(clip.id) {
+                    if let lid = clip.linkGroupId { selectedLinkGroupIds.insert(lid) }
+                }
+            }
+            for track in audioTracks {
+                for clip in track.clips where selectedClipIds.contains(clip.id) {
+                    if let lid = clip.linkGroupId { selectedLinkGroupIds.insert(lid) }
+                }
+            }
+        }
+
+        var splitRightLinkMap: [UUID: UUID] = [:]
+        let linkActive = isLinkActive
+        let selectedIds = selectedClipIds
+
+        func split(in tracks: inout [TimelineTrack]) {
             for trackIdx in 0..<tracks.count where !tracks[trackIdx].isLocked {
                 var newClips: [TimelineClip] = []
                 for clip in tracks[trackIdx].clips {
                     let shouldSplit: Bool
-                    if selectedClipIds.isEmpty {
+                    if selectedIds.isEmpty {
                         shouldSplit = true
-                    } else if selectedClipIds.contains(clip.id) {
+                    } else if selectedIds.contains(clip.id) {
                         shouldSplit = true
-                    } else if isLinkActive, let lId = clip.linkGroupId {
-                        let partnerSelected = videoTracks.contains(where: { $0.clips.contains(where: { $0.linkGroupId == lId && selectedClipIds.contains($0.id) }) }) ||
-                                              audioTracks.contains(where: { $0.clips.contains(where: { $0.linkGroupId == lId && selectedClipIds.contains($0.id) }) })
-                        shouldSplit = partnerSelected
+                    } else if linkActive, let lId = clip.linkGroupId {
+                        shouldSplit = selectedLinkGroupIds.contains(lId)
                     } else {
                         shouldSplit = false
                     }
 
                     if shouldSplit && CMTimeCompare(clip.timelineStart, time) < 0 && CMTimeCompare(clip.timelineEnd, time) > 0 {
                         didSplit = true
-                        let offsetFromStart = CMTimeSubtract(time, clip.timelineStart)
-                        let sourceCutPoint = CMTimeAdd(clip.sourceIn, offsetFromStart)
+                        let spd = clip.speed > 0 ? clip.speed : 1.0
+                        let offsetSec = CMTimeGetSeconds(CMTimeSubtract(time, clip.timelineStart)) * spd
+                        let sourceCutPoint = CMTimeAdd(clip.sourceIn, CMTime(seconds: offsetSec, preferredTimescale: 600))
+                        let newLinkId: UUID? = clip.linkGroupId.map { lId in
+                            if let existing = splitRightLinkMap[lId] { return existing }
+                            let created = UUID()
+                            splitRightLinkMap[lId] = created
+                            return created
+                        }
 
                         let leftClip = TimelineClip(
                             id: UUID(),
@@ -1063,7 +1114,11 @@ public final class TimelineModel {
                             mediaType: clip.mediaType,
                             orientation: clip.orientation,
                             linkGroupId: clip.linkGroupId,
-                            isOrphan: clip.isOrphan
+                            isOrphan: clip.isOrphan,
+                            speed: clip.speed,
+                            beatMarkers: clip.beatMarkers,
+                            beatBPM: clip.beatBPM,
+                            markers: clip.markers
                         )
 
                         let rightClip = TimelineClip(
@@ -1075,8 +1130,12 @@ public final class TimelineModel {
                             trackIndex: clip.trackIndex,
                             mediaType: clip.mediaType,
                             orientation: clip.orientation,
-                            linkGroupId: clip.linkGroupId != nil ? UUID() : nil,
-                            isOrphan: clip.isOrphan
+                            linkGroupId: newLinkId,
+                            isOrphan: clip.isOrphan,
+                            speed: clip.speed,
+                            beatMarkers: clip.beatMarkers,
+                            beatBPM: clip.beatBPM,
+                            markers: clip.markers
                         )
 
                         newClips.append(leftClip)
@@ -1089,17 +1148,19 @@ public final class TimelineModel {
             }
         }
 
-        split(in: &videoTracks, isVideoTracks: true)
-        split(in: &audioTracks, isVideoTracks: false)
+        split(in: &videoTracks)
+        split(in: &audioTracks)
         if didSplit {
             onModelChanged?()
             DebugLogger.shared.log("Spezza (S) eseguito a \(String(format: "%.2f", CMTimeGetSeconds(time)))s", level: .info)
         }
+        return didSplit
     }
 
     // MARK: - Close Gaps Between Selected Clips (Cmd + Option + W)
-    public func closeGapsBetweenSelectedClips() {
-        guard !selectedClipIds.isEmpty else { return }
+    @discardableResult
+    public func closeGapsBetweenSelectedClips() -> Bool {
+        guard !selectedClipIds.isEmpty else { return false }
 
         var didClose = false
 
@@ -1173,6 +1234,7 @@ public final class TimelineModel {
             onModelChanged?()
             DebugLogger.shared.log("Svuotamento spazi tra le clip completato (⌥⌘W)", level: .info)
         }
+        return didClose
     }
 
     private func shiftLinkedAudioClips(linkGroupId: UUID, bySeconds deltaSec: Double) {
@@ -1324,6 +1386,196 @@ public final class TimelineModel {
 
     // MARK: - Rhythmic Cage & Beat Grid Operations (Montaggio a Gabbie Ritmate)
 
+    public func audioClip(withId clipId: UUID) -> TimelineClip? {
+        for track in audioTracks {
+            if let clip = track.clips.first(where: { $0.id == clipId }) {
+                return clip
+            }
+        }
+        return nil
+    }
+
+    public func setAudioClipBeatMarkers(clipId: UUID, markers: [Double], bpm: Double?) {
+        for tIdx in 0..<audioTracks.count {
+            if let cIdx = audioTracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) {
+                audioTracks[tIdx].clips[cIdx].beatMarkers = markers.sorted()
+                audioTracks[tIdx].clips[cIdx].beatBPM = bpm
+                onModelChanged?()
+                return
+            }
+        }
+    }
+
+    // MARK: - Manual Clip Markers (M) on Audio & Video Clips
+
+    /// Aggiunge o rimuove (se entro ±0.08s) un marcatore sulle clip audio/video sotto la testina.
+    @discardableResult
+    public func toggleClipMarker(at time: CMTime) -> (added: Int, removed: Int, summary: [String]) {
+        let timeSec = CMTimeGetSeconds(time)
+        let selectedIds = selectedClipIds
+
+        // Se almeno una clip selezionata si trova sotto la testina, agisci solo su quelle selezionate
+        var hasSelectedUnderPlayhead = false
+        if !selectedIds.isEmpty {
+            for track in videoTracks where !track.isLocked {
+                if track.clips.contains(where: { selectedIds.contains($0.id) && timeSec >= CMTimeGetSeconds($0.timelineStart) - 0.001 && timeSec <= CMTimeGetSeconds($0.timelineEnd) + 0.001 }) {
+                    hasSelectedUnderPlayhead = true
+                    break
+                }
+            }
+            if !hasSelectedUnderPlayhead {
+                for track in audioTracks where !track.isLocked {
+                    if track.clips.contains(where: { selectedIds.contains($0.id) && timeSec >= CMTimeGetSeconds($0.timelineStart) - 0.001 && timeSec <= CMTimeGetSeconds($0.timelineEnd) + 0.001 }) {
+                        hasSelectedUnderPlayhead = true
+                        break
+                    }
+                }
+            }
+        }
+
+        var added = 0
+        var removed = 0
+        var summary: [String] = []
+
+        func process(_ tracks: inout [TimelineTrack]) {
+            for tIdx in 0..<tracks.count where !tracks[tIdx].isLocked {
+                for cIdx in 0..<tracks[tIdx].clips.count {
+                    var clip = tracks[tIdx].clips[cIdx]
+                    if hasSelectedUnderPlayhead && !selectedIds.contains(clip.id) { continue }
+                    let cStart = CMTimeGetSeconds(clip.timelineStart)
+                    let cEnd = CMTimeGetSeconds(clip.timelineEnd)
+                    guard timeSec >= cStart - 0.001 && timeSec <= cEnd + 0.001 else { continue }
+
+                    let spd = clip.speed > 0 ? clip.speed : 1.0
+                    let sourceSec = max(CMTimeGetSeconds(clip.sourceIn), min(CMTimeGetSeconds(clip.sourceOut), CMTimeGetSeconds(clip.sourceIn) + (timeSec - cStart) * spd))
+                    let tolSource = 0.08 * spd
+
+                    if let existingIdx = clip.markers.firstIndex(where: { abs($0 - sourceSec) <= tolSource }) {
+                        clip.markers.remove(at: existingIdx)
+                        removed += 1
+                        summary.append("\(clip.mediaItem.name): rimosso a \(formatMarkerTime(timeSec))")
+                    } else {
+                        clip.markers.append(sourceSec)
+                        clip.markers.sort()
+                        added += 1
+                        summary.append("\(clip.mediaItem.name): segnato a \(formatMarkerTime(timeSec)) (\(clip.markers.count))")
+                    }
+                    tracks[tIdx].clips[cIdx] = clip
+                }
+            }
+        }
+
+        process(&videoTracks)
+        process(&audioTracks)
+
+        if added > 0 || removed > 0 {
+            onModelChanged?()
+        }
+        return (added, removed, summary)
+    }
+
+    @discardableResult
+    public func toggleMarker(clipId: UUID, at timelineSec: Double) -> Bool {
+        func apply(_ tracks: inout [TimelineTrack]) -> Bool {
+            for tIdx in 0..<tracks.count where !tracks[tIdx].isLocked {
+                if let cIdx = tracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) {
+                    var clip = tracks[tIdx].clips[cIdx]
+                    let cStart = CMTimeGetSeconds(clip.timelineStart)
+                    let spd = clip.speed > 0 ? clip.speed : 1.0
+                    let sourceSec = max(CMTimeGetSeconds(clip.sourceIn), min(CMTimeGetSeconds(clip.sourceOut), CMTimeGetSeconds(clip.sourceIn) + (timelineSec - cStart) * spd))
+                    let tolSource = 0.12 * spd
+                    if let existingIdx = clip.markers.firstIndex(where: { abs($0 - sourceSec) <= tolSource }) {
+                        clip.markers.remove(at: existingIdx)
+                    } else {
+                        clip.markers.append(sourceSec)
+                        clip.markers.sort()
+                    }
+                    tracks[tIdx].clips[cIdx] = clip
+                    return true
+                }
+            }
+            return false
+        }
+        if apply(&videoTracks) || apply(&audioTracks) {
+            onModelChanged?()
+            return true
+        }
+        return false
+    }
+
+    @discardableResult
+    public func clearMarkers(clipId: UUID) -> Bool {
+        func clear(_ tracks: inout [TimelineTrack]) -> Bool {
+            for tIdx in 0..<tracks.count where !tracks[tIdx].isLocked {
+                if let cIdx = tracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) {
+                    tracks[tIdx].clips[cIdx].markers.removeAll()
+                    return true
+                }
+            }
+            return false
+        }
+        if clear(&videoTracks) || clear(&audioTracks) {
+            onModelChanged?()
+            return true
+        }
+        return false
+    }
+
+    @discardableResult
+    public func clearAllClipMarkers(at time: CMTime?) -> Int {
+        let selectedIds = selectedClipIds
+        let timeSec = time.map { CMTimeGetSeconds($0) }
+        var clearedCount = 0
+
+        func clearMatching(_ tracks: inout [TimelineTrack]) {
+            for tIdx in 0..<tracks.count where !tracks[tIdx].isLocked {
+                for cIdx in 0..<tracks[tIdx].clips.count {
+                    let clip = tracks[tIdx].clips[cIdx]
+                    guard !clip.markers.isEmpty else { continue }
+                    let matchesSelected = !selectedIds.isEmpty && selectedIds.contains(clip.id)
+                    let matchesPlayhead = selectedIds.isEmpty && (timeSec.map { $0 >= CMTimeGetSeconds(clip.timelineStart) - 0.001 && $0 <= CMTimeGetSeconds(clip.timelineEnd) + 0.001 } ?? false)
+                    if matchesSelected || matchesPlayhead {
+                        clearedCount += clip.markers.count
+                        tracks[tIdx].clips[cIdx].markers.removeAll()
+                    }
+                }
+            }
+        }
+
+        clearMatching(&videoTracks)
+        clearMatching(&audioTracks)
+        if clearedCount > 0 {
+            onModelChanged?()
+        }
+        return clearedCount
+    }
+
+    private func formatMarkerTime(_ sec: Double) -> String {
+        let m = Int(sec) / 60
+        let s = sec - Double(m * 60)
+        return String(format: "%d:%05.2f", m, s)
+    }
+
+    public func clearTimelineCages() {
+        rhythmicCages = []
+        detectedBPM = nil
+        onModelChanged?()
+    }
+
+    public func cagesFromAudioClip(_ clip: TimelineClip) -> [RhythmicCage] {
+        let times = clip.visibleBeatTimelineTimes().sorted()
+        guard times.count >= 2 else { return [] }
+        var cages: [RhythmicCage] = []
+        cages.reserveCapacity(times.count - 1)
+        for i in 0..<(times.count - 1) {
+            let dur = times[i + 1] - times[i]
+            if dur >= 0.12 {
+                cages.append(RhythmicCage(index: cages.count, startSeconds: times[i], durationSeconds: dur))
+            }
+        }
+        return cages
+    }
+
     public func cage(at time: CMTime) -> RhythmicCage? {
         let sec = CMTimeGetSeconds(time)
         return rhythmicCages.first { sec >= $0.startSeconds && sec < $0.endSeconds }
@@ -1345,10 +1597,15 @@ public final class TimelineModel {
         return nil
     }
 
-    /// Riempie le gabbie ritmate correnti usando le clip approvate dalla Selezione (Striscia Verde)
+    /// Riempie le gabbie ritmate correnti (o un elenco esplicito di gabbie, es. da un brano) usando le clip approvate dalla Selezione
     @discardableResult
-    public func autoFillCages(with selectionClips: [SelectionClip], targetTrackIndex: Int = 0) -> Int {
-        guard !rhythmicCages.isEmpty else {
+    public func autoFillCages(
+        with selectionClips: [SelectionClip],
+        targetTrackIndex: Int = 0,
+        overrideCages: [RhythmicCage]? = nil
+    ) -> Int {
+        let activeCages = overrideCages ?? rhythmicCages
+        guard !activeCages.isEmpty else {
             DebugLogger.shared.log("Nessuna gabbia ritmata presente. Esegui prima l'analisi audio della traccia musicale.", level: .warning)
             return 0
         }
@@ -1364,7 +1621,7 @@ public final class TimelineModel {
         var filledCount = 0
         var selIdx = 0
 
-        for cage in rhythmicCages {
+        for cage in activeCages {
             let sClip = selectionClips[selIdx % selectionClips.count]
             selIdx += 1
 

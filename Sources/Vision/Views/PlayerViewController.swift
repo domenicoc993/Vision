@@ -11,7 +11,6 @@ public final class PlayerViewController: NSViewController {
     private let stepForwardButton = IconActionButton(toolTip: "Passo avanti 1 frame (→)", isToggleMode: false)
     private let timecodeLabel = NSTextField(labelWithString: "00:00:00:00")
     private let durationLabel = NSTextField(labelWithString: "/ 00:00:00:00")
-    private let statusLabel = NSTextField(labelWithString: "")
 
     // LUT Hardware Accelerator Controls
     private let lutToggleButton = IconActionButton(toolTip: "LUT (Click: ON/OFF, Pressione lunga: Scegli LUT)")
@@ -50,12 +49,12 @@ public final class PlayerViewController: NSViewController {
     public override func loadView() {
         let root = NSView()
         root.wantsLayer = true
-        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.17, alpha: 1.0).cgColor
+        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0).cgColor
 
         // Workspace View
         workspaceView.translatesAutoresizingMaskIntoConstraints = false
         workspaceView.wantsLayer = true
-        workspaceView.layer?.backgroundColor = NSColor(calibratedWhite: 0.16, alpha: 1.0).cgColor
+        workspaceView.layer?.backgroundColor = NSColor(calibratedWhite: 0.075, alpha: 1.0).cgColor
         root.addSubview(workspaceView)
 
         // Video Frame Box
@@ -99,7 +98,7 @@ public final class PlayerViewController: NSViewController {
         let transportBar = NSView()
         transportBar.translatesAutoresizingMaskIntoConstraints = false
         transportBar.wantsLayer = true
-        transportBar.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        transportBar.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
         root.addSubview(transportBar)
 
         setupTransportBar(transportBar)
@@ -174,7 +173,7 @@ public final class PlayerViewController: NSViewController {
         rightStack.alignment = .centerY
         bar.addSubview(rightStack)
 
-        leftStack.spacing = 8
+        leftStack.spacing = 4
         centerStack.spacing = 10
         rightStack.spacing = 12
 
@@ -191,14 +190,15 @@ public final class PlayerViewController: NSViewController {
             rightStack.leadingAnchor.constraint(greaterThanOrEqualTo: centerStack.trailingAnchor, constant: 12)
         ])
 
-        // Left Controls: Status Indicator
-        statusLabel.font = NSFont.systemFont(ofSize: 11)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.lineBreakMode = .byTruncatingTail
-        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        leftStack.addArrangedSubview(statusLabel)
+        // Left Controls: Timecode & Duration
+        timecodeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .bold)
+        leftStack.addArrangedSubview(timecodeLabel)
 
-        // Center Controls: Step Back, Play/Pause, Step Forward, Timecode
+        durationLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        durationLabel.textColor = .secondaryLabelColor
+        leftStack.addArrangedSubview(durationLabel)
+
+        // Center Controls: Step Back, Play/Pause, Step Forward
         stepBackButton.image = Lucide.template(.stepBack, size: 16)
         stepBackButton.activeTintColor = .white
         stepBackButton.target = self
@@ -222,13 +222,6 @@ public final class PlayerViewController: NSViewController {
         stepForwardButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
         stepForwardButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         centerStack.addArrangedSubview(stepForwardButton)
-
-        timecodeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .bold)
-        centerStack.addArrangedSubview(timecodeLabel)
-
-        durationLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        durationLabel.textColor = .secondaryLabelColor
-        centerStack.addArrangedSubview(durationLabel)
 
         // Right Controls: LUT (Palette), Proxy (Feather), Full Screen (Maximize-2)
         lutToggleButton.image = Lucide.template(.palette, size: 17)
@@ -262,24 +255,18 @@ public final class PlayerViewController: NSViewController {
     }
 
     private func setupControllerBindings() {
-        playbackController.onTimeChanged = { [weak self] time in
-            DispatchQueue.main.async {
-                self?.timecodeLabel.stringValue = self?.playbackController.formattedCurrentTime ?? "00:00:00:00"
-            }
+        playbackController.addTimeObserver(self) { [weak self] _ in
+            guard let self = self else { return }
+            self.timecodeLabel.stringValue = self.playbackController.formattedCurrentTime
         }
 
-        playbackController.onPlayStateChanged = { [weak self] isPlaying in
-            DispatchQueue.main.async {
-                let icon: LucideIcon = isPlaying ? .pause : .play
-                self?.playPauseButton.image = Lucide.template(icon, size: 18)
-            }
+        playbackController.addPlayStateObserver(self) { [weak self] isPlaying in
+            let icon: LucideIcon = isPlaying ? .pause : .play
+            self?.playPauseButton.image = Lucide.template(icon, size: 18)
         }
 
-        playbackController.onStatusChanged = { [weak self] status in
-            DispatchQueue.main.async {
-                self?.statusLabel.stringValue = status
-            }
-        }
+        let icon: LucideIcon = playbackController.isPlaying ? .pause : .play
+        playPauseButton.image = Lucide.template(icon, size: 18)
     }
 
     private func setupLUTBindings() {
@@ -445,7 +432,7 @@ private final class LUTSelectorPopoverController: NSViewController {
     override func loadView() {
         let root = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 150))
         root.wantsLayer = true
-        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1.0).cgColor
+        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.09, alpha: 1.0).cgColor
         self.view = root
 
         let header = NSTextField(labelWithString: "Seleziona LUT")

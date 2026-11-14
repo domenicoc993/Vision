@@ -27,11 +27,11 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
     private var historyPopover: NSPopover?
     private var historyVC: HistoryPanelViewController?
 
-    private let projectManagerBtn = NSButton()
+    private let projectManagerBtn = IconActionButton(toolTip: "Project Manager (⌘O)", isToggleMode: false)
     private let autosaveStatusLabel = NSTextField(labelWithString: "● Salvato")
-    private let historyBtn = NSButton()
-    private let navUndoBtn = NSButton()
-    private let navRedoBtn = NSButton()
+    private let historyBtn = IconActionButton(toolTip: "Cronologia Azioni (⌘Y)", isToggleMode: false)
+    private let navUndoBtn = IconActionButton(toolTip: "Annulla (⌘Z)", isToggleMode: false)
+    private let navRedoBtn = IconActionButton(toolTip: "Ripeti (⇧⌘Z)", isToggleMode: false)
 
     private var activeSection: FocusedSection = .timeline
     private var rebuildTask: Task<Void, Never>?
@@ -50,7 +50,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         let root = NSView(frame: NSRect(x: 0, y: 0, width: 1200, height: 800))
         root.autoresizingMask = [.width, .height]
         root.wantsLayer = true
-        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1.0).cgColor
+        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.075, alpha: 1.0).cgColor
 
         timelineModel = EditorProject.shared.activeTimeline
 
@@ -69,11 +69,16 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         }
 
         timelineVC = TimelineViewController(model: timelineModel, playbackController: playbackController)
-        timelineVC.onTimelineModified = { [weak self] in
+        timelineVC.onTimelineAction = { [weak self] title in
             guard let self = self else { return }
             self.mediaPoolVC.refreshTimelineGrid()
-            self.rebuildComposition()
-            HistoryManager.shared.record(title: "Modifica Timeline", project: EditorProject.shared, mediaItems: self.mediaPoolVC.mediaItems)
+            if title != "Marcatore Clip" && title != "Rimuovi Marcatori Clip" {
+                self.rebuildComposition()
+            }
+            HistoryManager.shared.record(title: title, project: EditorProject.shared, mediaItems: self.mediaPoolVC.mediaItems)
+        }
+        timelineVC.onTimelineModified = { [weak self] in
+            self?.timelineVC.onTimelineAction?("Modifica Timeline")
         }
         timelineVC.onFormatChangedCallback = { [weak self] format in
             self?.playerVC.updateAspectRatio(formatSize: format.size)
@@ -361,26 +366,22 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                     }
 
                 case 12: // 'Q' key -> Trim start to playhead with playhead alignment
-                    if let targetTime = self.timelineModel.trimClipStart(at: self.playbackController.currentTime) {
+                    if let targetTime = self.timelineModel.trimClipStart(at: self.playbackController.accurateCurrentTime) {
                         self.playbackController.seek(to: targetTime, frameAccurate: true)
+                        self.commitTimelineEdit(title: "Trim Inizio Clip (Q)")
                     }
-                    self.timelineVC.reloadTimelineUI()
-                    self.mediaPoolVC.refreshTimelineGrid()
-                    self.rebuildComposition()
                     return nil
 
                 case 13: // 'W' key -> Cmd+Option+W: Svuotamento spazi, oppure W: Trim fine senza scarto
                     if isCommand && isOption {
-                        self.timelineModel.closeGapsBetweenSelectedClips()
-                        self.timelineVC.reloadTimelineUI()
-                        self.mediaPoolVC.refreshTimelineGrid()
-                        self.rebuildComposition()
+                        if self.timelineModel.closeGapsBetweenSelectedClips() {
+                            self.commitTimelineEdit(title: "Chiudi Spazi (⌥⌘W)")
+                        }
                         return nil
                     }
-                    self.timelineModel.trimClipEnd(at: self.playbackController.currentTime)
-                    self.timelineVC.reloadTimelineUI()
-                    self.mediaPoolVC.refreshTimelineGrid()
-                    self.rebuildComposition()
+                    if self.timelineModel.trimClipEnd(at: self.playbackController.accurateCurrentTime) {
+                        self.commitTimelineEdit(title: "Trim Fine Clip (W)")
+                    }
                     return nil
 
                 case 1, 11: // 'S' or 'B' key
@@ -390,10 +391,9 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                         return nil
                     }
                     // S / B -> Spezza clip alla testina
-                    self.timelineModel.splitClip(at: self.playbackController.currentTime)
-                    self.timelineVC.reloadTimelineUI()
-                    self.mediaPoolVC.refreshTimelineGrid()
-                    self.rebuildComposition()
+                    if self.timelineModel.splitClip(at: self.playbackController.accurateCurrentTime) {
+                        self.commitTimelineEdit(title: "Spezza Clip (S)")
+                    }
                     return nil
 
                 case 24: // '+' or '=' key
@@ -408,9 +408,9 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                         // Option + (-) -> Riduci Span gabbia
                         for track in self.timelineModel.videoTracks {
                             if let clip = track.clips.first(where: { $0.id == selId }), clip.span > 1 {
-                                self.timelineModel.setClipSpan(clipId: selId, newSpan: clip.span - 1)
-                                self.timelineVC.reloadTimelineUI()
-                                self.rebuildComposition()
+                                if self.timelineModel.setClipSpan(clipId: selId, newSpan: clip.span - 1) {
+                                    self.commitTimelineEdit(title: "Riduci Span Gabbia (⌥-)")
+                                }
                                 break
                             }
                         }
@@ -419,6 +419,26 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
 
                 case 45: // 'N' key -> Toggle Magnet Snapping (Resolve convention)
                     self.timelineVC.onMagnetToggleClicked()
+                    return nil
+
+                case 46: // 'M' key -> Segna / rimuovi marcatore su clip audio/video (⌥M pulisce)
+                    let markTime = self.playbackController.accurateCurrentTime
+                    if isOption {
+                        let cleared = self.timelineModel.clearAllClipMarkers(at: markTime)
+                        if cleared > 0 {
+                            self.commitTimelineEdit(title: "Rimuovi Marcatori Clip (⌥M)", rebuild: false)
+                            DebugLogger.shared.log("Rimossi \(cleared) marcatori dalla clip.", level: .info)
+                        }
+                        return nil
+                    }
+                    let res = self.timelineModel.toggleClipMarker(at: markTime)
+                    if res.added > 0 || res.removed > 0 {
+                        let title = res.added > 0 ? "Aggiungi Marcatore (M)" : "Rimuovi Marcatore (M)"
+                        self.commitTimelineEdit(title: title, rebuild: false)
+                        DebugLogger.shared.log("Marcatori (M): \(res.summary.joined(separator: " | "))", level: .info)
+                    } else {
+                        DebugLogger.shared.log("Nessuna clip sotto la testina su cui segnare il marcatore (M).", level: .warning)
+                    }
                     return nil
 
                 case 37: // 'L' key -> Toggle Link / Unlink if Cmd or Option pressed
@@ -441,9 +461,9 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                     }
                     if isCommand, let selId = self.timelineModel.selectedClipId {
                         // Command + Left -> Scambia con la gabbia precedente
-                        self.timelineModel.swapAdjacentCages(clipId: selId, direction: -1)
-                        self.timelineVC.reloadTimelineUI()
-                        self.rebuildComposition()
+                        if self.timelineModel.swapAdjacentCages(clipId: selId, direction: -1) {
+                            self.commitTimelineEdit(title: "Scambia Gabbia Ritmica (←)")
+                        }
                         return nil
                     }
                     self.playbackController.step(by: -1)
@@ -457,9 +477,9 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                     }
                     if isCommand, let selId = self.timelineModel.selectedClipId {
                         // Command + Right -> Scambia con la gabbia successiva
-                        self.timelineModel.swapAdjacentCages(clipId: selId, direction: +1)
-                        self.timelineVC.reloadTimelineUI()
-                        self.rebuildComposition()
+                        if self.timelineModel.swapAdjacentCages(clipId: selId, direction: +1) {
+                            self.commitTimelineEdit(title: "Scambia Gabbia Ritmica (→)")
+                        }
                         return nil
                     }
                     self.playbackController.step(by: 1)
@@ -484,17 +504,13 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                     // Se ci sono gabbie ritmate e una clip selezionata, usa Slot Ripple Delete!
                     if let selId = self.timelineModel.selectedClipId, !self.timelineModel.rhythmicCages.isEmpty {
                         if self.timelineModel.slotRippleDelete(clipId: selId) {
-                            self.timelineVC.reloadTimelineUI()
-                            self.mediaPoolVC.refreshTimelineGrid()
-                            self.rebuildComposition()
+                            self.commitTimelineEdit(title: "Elimina Clip Ritmica")
                             return nil
                         }
                     }
                     if !self.timelineModel.selectedClipIds.isEmpty {
                         self.timelineModel.removeSelectedClips()
-                        self.timelineVC.reloadTimelineUI()
-                        self.mediaPoolVC.refreshTimelineGrid()
-                        self.rebuildComposition()
+                        self.commitTimelineEdit(title: "Elimina Clip")
                         return nil
                     }
 
@@ -509,13 +525,13 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
     private func setupBottomNavBar() {
         bottomNavBar.translatesAutoresizingMaskIntoConstraints = false
         bottomNavBar.wantsLayer = true
-        bottomNavBar.layer?.backgroundColor = NSColor(calibratedWhite: 0.11, alpha: 1.0).cgColor
+        bottomNavBar.layer?.backgroundColor = NSColor(calibratedWhite: 0.095, alpha: 1.0).cgColor
 
         // Top subtle divider line
         let divider = NSView()
         divider.translatesAutoresizingMaskIntoConstraints = false
         divider.wantsLayer = true
-        divider.layer?.backgroundColor = NSColor(calibratedWhite: 0.22, alpha: 1.0).cgColor
+        divider.layer?.backgroundColor = NSColor(calibratedWhite: 0.18, alpha: 1.0).cgColor
         bottomNavBar.addSubview(divider)
 
         // Center Mode Tabs
@@ -544,12 +560,13 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         bottomNavBar.addSubview(centerStack)
 
         // Left: Project Manager & Autosave Status
-        projectManagerBtn.title = "📁 Progetti"
-        projectManagerBtn.bezelStyle = .rounded
-        projectManagerBtn.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        projectManagerBtn.image = Lucide.template(.database, size: 16)
+        projectManagerBtn.activeTintColor = .systemCyan
         projectManagerBtn.target = self
         projectManagerBtn.action = #selector(openProjectManager)
         projectManagerBtn.translatesAutoresizingMaskIntoConstraints = false
+        projectManagerBtn.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        projectManagerBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
 
         autosaveStatusLabel.font = NSFont.systemFont(ofSize: 10, weight: .medium)
         autosaveStatusLabel.textColor = NSColor.systemGreen.withAlphaComponent(0.85)
@@ -557,35 +574,38 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
 
         let leftStack = NSStackView(views: [projectManagerBtn, autosaveStatusLabel])
         leftStack.orientation = .horizontal
-        leftStack.spacing = 8
+        leftStack.spacing = 10
         leftStack.alignment = .centerY
         leftStack.translatesAutoresizingMaskIntoConstraints = false
         bottomNavBar.addSubview(leftStack)
 
         // Right: Undo, Redo, History Panel
-        navUndoBtn.title = "↩"
-        navUndoBtn.toolTip = "Annulla (⌘Z)"
-        navUndoBtn.bezelStyle = .rounded
+        navUndoBtn.image = Lucide.template(.undo2, size: 16)
+        navUndoBtn.activeTintColor = .white
         navUndoBtn.target = self
         navUndoBtn.action = #selector(performUndoAction)
         navUndoBtn.isEnabled = false
+        navUndoBtn.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        navUndoBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
 
-        navRedoBtn.title = "↪"
-        navRedoBtn.toolTip = "Ripeti (⇧⌘Z)"
-        navRedoBtn.bezelStyle = .rounded
+        navRedoBtn.image = Lucide.template(.redo2, size: 16)
+        navRedoBtn.activeTintColor = .white
         navRedoBtn.target = self
         navRedoBtn.action = #selector(performRedoAction)
         navRedoBtn.isEnabled = false
+        navRedoBtn.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        navRedoBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
 
-        historyBtn.title = "🕒 Cronologia"
-        historyBtn.bezelStyle = .rounded
-        historyBtn.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        historyBtn.image = Lucide.template(.history, size: 16)
+        historyBtn.activeTintColor = .systemCyan
         historyBtn.target = self
         historyBtn.action = #selector(toggleHistoryPopover)
+        historyBtn.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        historyBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
 
         let rightStack = NSStackView(views: [navUndoBtn, navRedoBtn, historyBtn])
         rightStack.orientation = .horizontal
-        rightStack.spacing = 6
+        rightStack.spacing = 10
         rightStack.alignment = .centerY
         rightStack.translatesAutoresizingMaskIntoConstraints = false
         bottomNavBar.addSubview(rightStack)
@@ -616,7 +636,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
 
     private func updateNavBarStyles() {
         let activeBg = NSColor(calibratedRed: 0.16, green: 0.44, blue: 0.88, alpha: 1.0).cgColor
-        let inactiveBg = NSColor(calibratedWhite: 0.16, alpha: 1.0).cgColor
+        let inactiveBg = NSColor(calibratedWhite: 0.125, alpha: 1.0).cgColor
 
         if currentMode == .selezione {
             btnSelezione.layer?.backgroundColor = activeBg
@@ -674,9 +694,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                         return
                     }
                     timelineModel.commitMoveClip(id: id, toTrack: targetTrack, isVideo: true)
-                    timelineVC.reloadTimelineUI()
-                    mediaPoolVC.refreshTimelineGrid()
-                    rebuildComposition()
+                    commitTimelineEdit(title: "Sposta Clip su V\(targetTrack + 1)")
                 }
                 return
             }
@@ -696,12 +714,20 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                         return
                     }
                     timelineModel.commitMoveClip(id: id, toTrack: targetTrack, isVideo: false)
-                    timelineVC.reloadTimelineUI()
-                    rebuildComposition()
+                    commitTimelineEdit(title: "Sposta Clip su A\(targetTrack + 1)")
                 }
                 return
             }
         }
+    }
+
+    private func commitTimelineEdit(title: String, rebuild: Bool = true) {
+        timelineVC.reloadTimelineUI()
+        mediaPoolVC.refreshTimelineGrid()
+        if rebuild {
+            rebuildComposition()
+        }
+        HistoryManager.shared.record(title: title, project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
     }
 
     public func didActivateSection(_ section: FocusedSection) {
@@ -719,9 +745,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
 
     public func didSelectAddClipToTimeline(_ item: MediaItem) {
         timelineModel.appendClip(mediaItem: item)
-        timelineVC.reloadTimelineUI()
-        mediaPoolVC.refreshTimelineGrid()
-        rebuildComposition()
+        commitTimelineEdit(title: "Aggiungi Clip in Timeline")
     }
 
     public func didChangeMediaOrientation(_ item: MediaItem) {
@@ -732,9 +756,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                 }
             }
         }
-        timelineVC.reloadTimelineUI()
-        mediaPoolVC.refreshTimelineGrid()
-        rebuildComposition()
+        commitTimelineEdit(title: "Orientamento Media")
     }
 
     public func didSelectSeekToClip(_ clip: TimelineClip) {
@@ -743,13 +765,11 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
     }
 
     public func didReorderTimelineFromGrid() {
-        timelineVC.reloadTimelineUI()
-        rebuildComposition()
+        commitTimelineEdit(title: "Riordina Timeline da Griglia")
     }
 
     public func didDeleteMediaItemFromPool(_ item: MediaItem) {
-        timelineVC.reloadTimelineUI()
-        rebuildComposition()
+        commitTimelineEdit(title: "Elimina Media dal Pool")
     }
 
     public func didUpdateTimelineFormat(_ timeline: TimelineModel) {
@@ -856,6 +876,9 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
             hvc.onRestoreSnapshot = { [weak self] snapshot in
                 self?.restoreProjectFromSnapshot(snapshot)
             }
+            hvc.onJumpToHistory = { [weak self] pastIndex in
+                self?.performJumpToHistory(pastIndex: pastIndex)
+            }
             hvc.onPerformUndo = { [weak self] in
                 self?.performUndo()
             }
@@ -897,14 +920,24 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         }
     }
 
+    public func performJumpToHistory(pastIndex: Int) {
+        if let snapshot = HistoryManager.shared.jumpTo(pastIndex: pastIndex, currentProject: EditorProject.shared, currentMediaItems: mediaPoolVC.mediaItems) {
+            restoreProjectFromSnapshot(snapshot)
+            DebugLogger.shared.log("Cronologia ripristinata a: \(HistoryManager.shared.currentTitle)", level: .info)
+        }
+    }
+
     public func restoreProjectFromSnapshot(_ snapshot: ProjectDocumentData) {
         let restoredMedia = snapshot.mediaItems.map { $0.toMediaItem() }
         EditorProject.shared.reset(with: snapshot, restoredMedia: restoredMedia)
         mediaPoolVC.setMediaItems(restoredMedia)
-        mediaPoolVC.updateTimelinePopUp()
-        mediaPoolVC.updateFolderPopUp()
         self.timelineModel = EditorProject.shared.activeTimeline
         self.timelineVC.switchModel(self.timelineModel)
+        self.mediaPoolVC.timelineModel = self.timelineModel
+        self.mediaPoolVC.updateTimelinePopUp()
+        self.mediaPoolVC.updateFolderPopUp()
+        self.mediaPoolVC.refreshTimelineGrid()
+        self.playerVC.updateAspectRatio(formatSize: self.timelineModel.format.size)
         self.selectionVC.currentSelection = EditorProject.shared.activeSelection
         self.selectionVC.updateHeaderUI()
         self.rebuildComposition()
@@ -913,12 +946,13 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         }
         self.view.window?.title = "Vision — \(EditorProject.shared.projectName)"
         updateHistoryNavButtons()
+        ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
     }
 
     private func updateHistoryNavButtons() {
         navUndoBtn.isEnabled = HistoryManager.shared.canUndo
         navRedoBtn.isEnabled = HistoryManager.shared.canRedo
         let count = HistoryManager.shared.pastEntries.count
-        historyBtn.title = "🕒 Cronologia (\(count))"
+        historyBtn.toolTip = "Cronologia Azioni (\(count)) (⌘Y)"
     }
 }

@@ -29,7 +29,7 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
         win.minSize = NSSize(width: 720, height: 420)
         win.title = "Project Manager — Vision"
         win.titlebarAppearsTransparent = true
-        win.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1.0)
+        win.backgroundColor = NSColor(calibratedWhite: 0.085, alpha: 1.0)
         win.isReleasedWhenClosed = false
         win.center()
         super.init(window: win)
@@ -54,13 +54,13 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
     private func setupUI() {
         guard let contentView = window?.contentView else { return }
         contentView.wantsLayer = true
-        contentView.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1.0).cgColor
+        contentView.layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0).cgColor
 
         // 1. Top Header Bar
         let headerView = NSView()
         headerView.translatesAutoresizingMaskIntoConstraints = false
         headerView.wantsLayer = true
-        headerView.layer?.backgroundColor = NSColor(calibratedWhite: 0.16, alpha: 1.0).cgColor
+        headerView.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
         contentView.addSubview(headerView)
 
         let titleIcon = NSImageView()
@@ -119,7 +119,7 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
         let bottomBar = NSView()
         bottomBar.translatesAutoresizingMaskIntoConstraints = false
         bottomBar.wantsLayer = true
-        bottomBar.layer?.backgroundColor = NSColor(calibratedWhite: 0.15, alpha: 1.0).cgColor
+        bottomBar.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
         contentView.addSubview(bottomBar)
 
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -216,9 +216,9 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
     private func setupTableView() {
         tableView.delegate = self
         tableView.dataSource = self
-        tableView.usesAlternatingRowBackgroundColors = true
+        tableView.usesAlternatingRowBackgroundColors = false
         tableView.rowHeight = 38
-        tableView.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1.0)
+        tableView.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0)
         tableView.selectionHighlightStyle = .regular
         tableView.doubleAction = #selector(onOpenClicked)
         tableView.target = self

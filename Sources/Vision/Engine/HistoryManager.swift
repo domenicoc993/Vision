@@ -31,6 +31,7 @@ public final class HistoryManager {
     public var maxEntries: Int = 60
     public var onHistoryChanged: (() -> Void)?
 
+    private var currentSnapshot: ProjectDocumentData?
     private var isPerformingUndoRedo: Bool = false
 
     private init() {}
@@ -47,15 +48,17 @@ public final class HistoryManager {
         pastEntries.removeAll()
         futureEntries.removeAll()
         currentTitle = title
+        currentSnapshot = ProjectDocumentData(project: project, mediaItems: mediaItems)
         onHistoryChanged?()
     }
 
-    /// Registra un'azione nel cronologico salvando lo snapshot precedente nello stack di Undo
+    /// Registra un'azione completata nel cronologico: spinge lo stato PRE-azione nello stack Undo e aggiorna lo snapshot corrente
     public func record(title: String, project: EditorProject, mediaItems: [MediaItem]) {
         guard !isPerformingUndoRedo else { return }
 
-        let snapshot = ProjectDocumentData(project: project, mediaItems: mediaItems)
-        let entry = HistoryEntry(title: currentTitle, snapshot: snapshot)
+        let newSnapshot = ProjectDocumentData(project: project, mediaItems: mediaItems)
+        let preActionSnapshot = currentSnapshot ?? newSnapshot
+        let entry = HistoryEntry(title: currentTitle, snapshot: preActionSnapshot)
 
         pastEntries.append(entry)
         if pastEntries.count > maxEntries {
@@ -64,6 +67,7 @@ public final class HistoryManager {
 
         futureEntries.removeAll()
         currentTitle = title
+        currentSnapshot = newSnapshot
         onHistoryChanged?()
 
         // Schedula contemporaneamente il salvataggio in tempo reale su SQLite
@@ -77,17 +81,16 @@ public final class HistoryManager {
         defer { isPerformingUndoRedo = false }
 
         // Salva lo stato corrente nello stack di redo
-        let currentSnapshot = ProjectDocumentData(project: currentProject, mediaItems: currentMediaItems)
-        let redoEntry = HistoryEntry(title: currentTitle, snapshot: currentSnapshot)
+        let currentStateSnapshot = ProjectDocumentData(project: currentProject, mediaItems: currentMediaItems)
+        let redoEntry = HistoryEntry(title: currentTitle, snapshot: currentStateSnapshot)
         futureEntries.append(redoEntry)
 
         // Estrai lo stato precedente
         let previous = pastEntries.removeLast()
         currentTitle = previous.title
+        currentSnapshot = previous.snapshot
         onHistoryChanged?()
 
-        // Sincronizza anche con il database SQLite
-        ProjectDatabase.shared.scheduleRealtimeAutosave(project: currentProject, mediaItems: currentMediaItems)
         return previous.snapshot
     }
 
@@ -98,17 +101,16 @@ public final class HistoryManager {
         defer { isPerformingUndoRedo = false }
 
         // Salva lo stato corrente nello stack di undo
-        let currentSnapshot = ProjectDocumentData(project: currentProject, mediaItems: currentMediaItems)
-        let undoEntry = HistoryEntry(title: currentTitle, snapshot: currentSnapshot)
+        let currentStateSnapshot = ProjectDocumentData(project: currentProject, mediaItems: currentMediaItems)
+        let undoEntry = HistoryEntry(title: currentTitle, snapshot: currentStateSnapshot)
         pastEntries.append(undoEntry)
 
         // Estrai lo stato futuro
         let next = futureEntries.removeLast()
         currentTitle = next.title
+        currentSnapshot = next.snapshot
         onHistoryChanged?()
 
-        // Sincronizza anche con il database SQLite
-        ProjectDatabase.shared.scheduleRealtimeAutosave(project: currentProject, mediaItems: currentMediaItems)
         return next.snapshot
     }
 
@@ -119,8 +121,8 @@ public final class HistoryManager {
         defer { isPerformingUndoRedo = false }
 
         // Salva lo stato corrente in cima a futureEntries
-        let currentSnapshot = ProjectDocumentData(project: currentProject, mediaItems: currentMediaItems)
-        futureEntries.append(HistoryEntry(title: currentTitle, snapshot: currentSnapshot))
+        let currentStateSnapshot = ProjectDocumentData(project: currentProject, mediaItems: currentMediaItems)
+        futureEntries.append(HistoryEntry(title: currentTitle, snapshot: currentStateSnapshot))
 
         // Sposta tutti gli elementi tra pastIndex + 1 e la fine in futureEntries in ordine inverso
         while pastEntries.count > pastIndex + 1 {
@@ -130,9 +132,9 @@ public final class HistoryManager {
 
         let target = pastEntries.removeLast()
         currentTitle = target.title
+        currentSnapshot = target.snapshot
         onHistoryChanged?()
 
-        ProjectDatabase.shared.scheduleRealtimeAutosave(project: currentProject, mediaItems: currentMediaItems)
         return target.snapshot
     }
 }

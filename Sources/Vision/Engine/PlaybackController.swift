@@ -6,7 +6,7 @@ public final class PlaybackController: NSObject {
     public var currentTime: CMTime = .zero
     public var isPlaying: Bool = false {
         didSet {
-            onPlayStateChanged?(isPlaying)
+            notifyPlayStateChanged(isPlaying)
         }
     }
     public var duration: CMTime = .zero
@@ -16,6 +16,19 @@ public final class PlaybackController: NSObject {
     public var onPlayStateChanged: ((Bool) -> Void)?
     public var onStatusChanged: ((String) -> Void)?
 
+    private struct TimeObserver {
+        let ownerId: ObjectIdentifier
+        weak var owner: AnyObject?
+        let handler: (CMTime) -> Void
+    }
+    private struct PlayStateObserver {
+        let ownerId: ObjectIdentifier
+        weak var owner: AnyObject?
+        let handler: (Bool) -> Void
+    }
+    private var timeObservers: [TimeObserver] = []
+    private var playStateObservers: [PlayStateObserver] = []
+
     private var timeObserverToken: Any?
     private var itemStatusObservation: NSKeyValueObservation?
     private var itemDidPlayToEndObserver: Any?
@@ -23,6 +36,51 @@ public final class PlaybackController: NSObject {
     // Smooth Scrubbing: Seek-Chase Engine (Resolve style)
     private var isSeekInProgress = false
     private var chaseTime: CMTime = .invalid
+    private var seekGeneration: UInt64 = 0
+
+    public func addTimeObserver(_ owner: AnyObject, handler: @escaping (CMTime) -> Void) {
+        let oid = ObjectIdentifier(owner)
+        timeObservers.removeAll { $0.owner == nil || $0.ownerId == oid }
+        timeObservers.append(TimeObserver(ownerId: oid, owner: owner, handler: handler))
+    }
+
+    public func addPlayStateObserver(_ owner: AnyObject, handler: @escaping (Bool) -> Void) {
+        let oid = ObjectIdentifier(owner)
+        playStateObservers.removeAll { $0.owner == nil || $0.ownerId == oid }
+        playStateObservers.append(PlayStateObserver(ownerId: oid, owner: owner, handler: handler))
+    }
+
+    private func notifyTimeChanged(_ time: CMTime) {
+        let dispatch = { [weak self] in
+            guard let self = self else { return }
+            self.onTimeChanged?(time)
+            self.timeObservers.removeAll { $0.owner == nil }
+            for obs in self.timeObservers {
+                obs.handler(time)
+            }
+        }
+        if Thread.isMainThread {
+            dispatch()
+        } else {
+            DispatchQueue.main.async(execute: dispatch)
+        }
+    }
+
+    private func notifyPlayStateChanged(_ playing: Bool) {
+        let dispatch = { [weak self] in
+            guard let self = self else { return }
+            self.onPlayStateChanged?(playing)
+            self.playStateObservers.removeAll { $0.owner == nil }
+            for obs in self.playStateObservers {
+                obs.handler(playing)
+            }
+        }
+        if Thread.isMainThread {
+            dispatch()
+        } else {
+            DispatchQueue.main.async(execute: dispatch)
+        }
+    }
 
     public override init() {
         super.init()
@@ -46,13 +104,15 @@ public final class PlaybackController: NSObject {
     private func setupTimeObserver() {
         let interval = CMTime(value: 1, timescale: 60) // 60Hz UI updates
         timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
-            guard let self = self, !self.isSeekInProgress else { return }
-            self.currentTime = time
+            guard let self = self else { return }
             let playing = (self.player.rate != 0)
             if self.isPlaying != playing {
                 self.isPlaying = playing
             }
-            self.onTimeChanged?(time)
+            // While actively playing, always publish periodic time unless a seek is actively chasing
+            if self.isSeekInProgress && !playing { return }
+            self.currentTime = time
+            self.notifyTimeChanged(time)
         }
     }
 
@@ -67,7 +127,6 @@ public final class PlaybackController: NSObject {
             // When replacing an item, detached previous items emit this notification, which must NOT jump to end.
             if let notifItem = notification.object as? AVPlayerItem, notifItem === self.player.currentItem {
                 self.isPlaying = false
-                self.onPlayStateChanged?(false)
                 DebugLogger.shared.log("Fine timeline raggiunta.", level: .playback)
             }
         }
@@ -76,12 +135,15 @@ public final class PlaybackController: NSObject {
     public func clear() {
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
+        seekGeneration &+= 1
+        isSeekInProgress = false
+        chaseTime = .invalid
         player.replaceCurrentItem(with: nil)
         self.duration = .zero
         self.currentTime = .zero
         self.isPlaying = false
         self.onStatusChanged?("Pronto")
-        self.onTimeChanged?(.zero)
+        self.notifyTimeChanged(.zero)
         DebugLogger.shared.log("Player azzerato (timeline vuota).", level: .playback)
     }
 
@@ -111,6 +173,9 @@ public final class PlaybackController: NSObject {
         self.duration = duration
         self.fps = targetFPS
         self.currentTime = targetTime
+        self.seekGeneration &+= 1
+        self.isSeekInProgress = false
+        self.chaseTime = .invalid
 
         itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, _ in
             guard let self = self else { return }
@@ -119,9 +184,12 @@ public final class PlaybackController: NSObject {
                 DebugLogger.shared.log("PlayerItem status: READY TO PLAY (Pronto alla riproduzione)", level: .playback)
                 self.onStatusChanged?("Pronto")
                 // Seek frame-accurately now that decoders are active, avoiding black screens!
-                self.player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
-                    self.currentTime = targetTime
-                    self.onTimeChanged?(targetTime)
+                self.player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                    DispatchQueue.main.async {
+                        guard let self = self else { return }
+                        self.currentTime = targetTime
+                        self.notifyTimeChanged(targetTime)
+                    }
                 }
             case .failed:
                 let errMsg = observedItem.error?.localizedDescription ?? "Errore sconosciuto"
@@ -150,11 +218,62 @@ public final class PlaybackController: NSObject {
         }
     }
 
+    /// Restituisce l'istante più accurato corrente (usando il clock hardware live durante la riproduzione)
+    public var accurateCurrentTime: CMTime {
+        if isPlaying && !isSeekInProgress && player.rate != 0 {
+            let live = player.currentTime()
+            if live.isValid && !CMTimeGetSeconds(live).isNaN {
+                let dur = max(duration, CMTime(value: 1, timescale: 600))
+                return CMTimeClampToRange(live, range: CMTimeRange(start: .zero, duration: dur))
+            }
+        }
+        return currentTime
+    }
+
     public func play() {
         // If at the end of the timeline, automatically rewind to start
         if CMTimeCompare(currentTime, duration) >= 0 {
             DebugLogger.shared.log("Play alla fine della timeline: riavvolgimento automatico a 00:00:00:00", level: .playback)
-            seek(to: .zero, frameAccurate: true)
+            isPlaying = true
+            seekGeneration &+= 1
+            let gen = seekGeneration
+            isSeekInProgress = true
+            chaseTime = .invalid
+            currentTime = .zero
+            notifyTimeChanged(.zero)
+            player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self = self, self.seekGeneration == gen else { return }
+                    self.isSeekInProgress = false
+                    if self.isPlaying {
+                        self.player.play()
+                    }
+                }
+            }
+            DebugLogger.shared.log("Riproduzione avviata da \(formattedCurrentTime)", level: .playback)
+            return
+        }
+
+        // Completa eventuale seek/scrub ancora in corso prima di far partire l'audio
+        if isSeekInProgress || chaseTime.isValid {
+            let target = chaseTime.isValid ? chaseTime : currentTime
+            chaseTime = .invalid
+            currentTime = target
+            isPlaying = true
+            seekGeneration &+= 1
+            let gen = seekGeneration
+            isSeekInProgress = true
+            player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self = self, self.seekGeneration == gen else { return }
+                    self.isSeekInProgress = false
+                    if self.isPlaying {
+                        self.player.play()
+                    }
+                }
+            }
+            DebugLogger.shared.log("Riproduzione avviata da \(formattedCurrentTime)", level: .playback)
+            return
         }
 
         player.play()
@@ -165,6 +284,15 @@ public final class PlaybackController: NSObject {
     public func pause() {
         player.pause()
         isPlaying = false
+        if !isSeekInProgress {
+            let exact = player.currentTime()
+            if exact.isValid && !CMTimeGetSeconds(exact).isNaN {
+                let dur = max(duration, CMTime(value: 1, timescale: 600))
+                let clamped = CMTimeClampToRange(exact, range: CMTimeRange(start: .zero, duration: dur))
+                currentTime = clamped
+                notifyTimeChanged(clamped)
+            }
+        }
         DebugLogger.shared.log("Pausa a \(formattedCurrentTime)", level: .playback)
     }
 
@@ -172,7 +300,7 @@ public final class PlaybackController: NSObject {
     public func scrub(to time: CMTime) {
         let clampedTime = CMTimeClampToRange(time, range: CMTimeRange(start: .zero, duration: max(duration, CMTime(value: 1, timescale: 600))))
         currentTime = clampedTime
-        onTimeChanged?(clampedTime) // Instant 0ms latency UI update!
+        notifyTimeChanged(clampedTime) // Instant 0ms latency UI update!
 
         if !isSeekInProgress {
             executeActualSeek(to: clampedTime, frameAccurate: false)
@@ -184,7 +312,7 @@ public final class PlaybackController: NSObject {
     public func seek(to time: CMTime, frameAccurate: Bool = true) {
         let clampedTime = CMTimeClampToRange(time, range: CMTimeRange(start: .zero, duration: max(duration, CMTime(value: 1, timescale: 600))))
         currentTime = clampedTime
-        onTimeChanged?(clampedTime)
+        notifyTimeChanged(clampedTime)
 
         if !isSeekInProgress {
             executeActualSeek(to: clampedTime, frameAccurate: frameAccurate)
@@ -195,18 +323,22 @@ public final class PlaybackController: NSObject {
 
     private func executeActualSeek(to time: CMTime, frameAccurate: Bool) {
         isSeekInProgress = true
+        seekGeneration &+= 1
+        let gen = seekGeneration
         let seekTarget = time
 
         let tolerance: CMTime = frameAccurate ? .zero : CMTime(value: 1, timescale: 30)
 
         player.seek(to: seekTarget, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self] _ in
-            guard let self = self else { return }
-            if self.chaseTime.isValid && CMTimeCompare(self.chaseTime, seekTarget) != 0 {
-                let next = self.chaseTime
-                self.chaseTime = .invalid
-                self.executeActualSeek(to: next, frameAccurate: frameAccurate)
-            } else {
-                self.isSeekInProgress = false
+            DispatchQueue.main.async {
+                guard let self = self, self.seekGeneration == gen else { return }
+                if self.chaseTime.isValid && CMTimeCompare(self.chaseTime, seekTarget) != 0 {
+                    let next = self.chaseTime
+                    self.chaseTime = .invalid
+                    self.executeActualSeek(to: next, frameAccurate: frameAccurate)
+                } else {
+                    self.isSeekInProgress = false
+                }
             }
         }
     }

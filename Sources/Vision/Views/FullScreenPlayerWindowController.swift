@@ -6,11 +6,11 @@ public final class FullScreenPlayerWindowController: NSWindowController {
     private let playbackController: PlaybackController
     private let playerView = AVPlayerView()
 
-    private let playPauseButton = NSButton()
-    private let stopButton = NSButton()
-    private let lutButton = NSButton()
-    private let muteButton = NSButton()
-    private let exitButton = NSButton()
+    private let playPauseButton = IconActionButton(toolTip: "Play / Pausa (Spazio)", isToggleMode: false)
+    private let stopButton = IconActionButton(toolTip: "Stop (Torna all'inizio)", isToggleMode: false)
+    private let lutButton = IconActionButton(toolTip: "LUT (ON/OFF)")
+    private let muteButton = IconActionButton(toolTip: "Audio / Muto")
+    private let exitButton = IconActionButton(toolTip: "Esci da Schermo Intero (Esc / ⌃F)", isToggleMode: false)
     private let timeSlider = NSSlider()
     private let timecodeLabel = NSTextField(labelWithString: "00:00:00:00")
     private let durationLabel = NSTextField(labelWithString: "00:00:00:00")
@@ -99,17 +99,22 @@ public final class FullScreenPlayerWindowController: NSWindowController {
         ])
 
         // Play/Pause icon
-        playPauseButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Play")
-        playPauseButton.bezelStyle = .texturedRounded
+        let initialPlayIcon: LucideIcon = playbackController.isPlaying ? .pause : .play
+        playPauseButton.image = Lucide.template(initialPlayIcon, size: 18)
+        playPauseButton.activeTintColor = .white
         playPauseButton.target = self
         playPauseButton.action = #selector(onPlayPauseClicked)
+        playPauseButton.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        playPauseButton.heightAnchor.constraint(equalToConstant: 26).isActive = true
         stack.addArrangedSubview(playPauseButton)
 
         // Stop icon
-        stopButton.image = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: "Stop")
-        stopButton.bezelStyle = .texturedRounded
+        stopButton.image = Lucide.template(.square, size: 15)
+        stopButton.activeTintColor = .white
         stopButton.target = self
         stopButton.action = #selector(onStopClicked)
+        stopButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        stopButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         stack.addArrangedSubview(stopButton)
 
         // Current Timecode
@@ -133,45 +138,47 @@ public final class FullScreenPlayerWindowController: NSWindowController {
         stack.addArrangedSubview(durationLabel)
 
         // Hardware Metal LUT Toggle
-        lutButton.title = LUTEngine.shared.isEnabled ? "🎨 LUT: ON" : "🎨 LUT: OFF"
-        lutButton.bezelStyle = .rounded
+        lutButton.image = Lucide.template(.palette, size: 17)
+        lutButton.activeTintColor = .systemCyan
+        lutButton.isToggleActive = LUTEngine.shared.isEnabled
         lutButton.target = self
         lutButton.action = #selector(onLUTToggleClicked)
+        lutButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        lutButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         stack.addArrangedSubview(lutButton)
 
         // Mute / Unmute audio icon
-        muteButton.image = NSImage(systemSymbolName: "speaker.wave.2.fill", accessibilityDescription: "Mute")
-        muteButton.bezelStyle = .texturedRounded
+        isMuted = playbackController.player.isMuted
+        muteButton.image = Lucide.template(isMuted ? .volumeX : .volume2, size: 17)
+        muteButton.activeTintColor = .systemRed
+        muteButton.inactiveTintColor = NSColor(calibratedWhite: 0.85, alpha: 1.0)
+        muteButton.isToggleActive = isMuted
         muteButton.target = self
         muteButton.action = #selector(onMuteClicked)
+        muteButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        muteButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         stack.addArrangedSubview(muteButton)
 
         // Exit Fullscreen icon
-        exitButton.image = NSImage(systemSymbolName: "arrow.down.right.and.arrow.up.left", accessibilityDescription: "Esci")
-        exitButton.bezelStyle = .texturedRounded
+        exitButton.image = Lucide.template(.minimize2, size: 16)
+        exitButton.activeTintColor = .white
         exitButton.target = self
         exitButton.action = #selector(onExitClicked)
+        exitButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        exitButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         stack.addArrangedSubview(exitButton)
     }
 
     private func setupBindings() {
-        let oldCallback = playbackController.onTimeChanged
-        playbackController.onTimeChanged = { [weak self] time in
-            oldCallback?(time)
-            DispatchQueue.main.async {
-                guard let self = self, !self.isScrubbing else { return }
-                self.timecodeLabel.stringValue = self.playbackController.formattedCurrentTime
-                self.timeSlider.doubleValue = CMTimeGetSeconds(time)
-            }
+        playbackController.addTimeObserver(self) { [weak self] time in
+            guard let self = self, !self.isScrubbing else { return }
+            self.timecodeLabel.stringValue = self.playbackController.formattedCurrentTime
+            self.timeSlider.doubleValue = CMTimeGetSeconds(time)
         }
 
-        let oldPlayState = playbackController.onPlayStateChanged
-        playbackController.onPlayStateChanged = { [weak self] isPlaying in
-            oldPlayState?(isPlaying)
-            DispatchQueue.main.async {
-                let icon = isPlaying ? "pause.fill" : "play.fill"
-                self?.playPauseButton.image = NSImage(systemSymbolName: icon, accessibilityDescription: "Play/Pause")
-            }
+        playbackController.addPlayStateObserver(self) { [weak self] isPlaying in
+            let icon: LucideIcon = isPlaying ? .pause : .play
+            self?.playPauseButton.image = Lucide.template(icon, size: 18)
         }
 
         updateLUTFilter()
@@ -188,7 +195,7 @@ public final class FullScreenPlayerWindowController: NSWindowController {
         } else {
             playerView.layer?.filters = []
         }
-        lutButton.title = LUTEngine.shared.isEnabled ? "🎨 LUT: ON" : "🎨 LUT: OFF"
+        lutButton.isToggleActive = LUTEngine.shared.isEnabled
     }
 
     @objc private func onLUTToggleClicked() {
@@ -243,8 +250,8 @@ public final class FullScreenPlayerWindowController: NSWindowController {
     @objc private func onMuteClicked() {
         isMuted.toggle()
         playbackController.player.isMuted = isMuted
-        let icon = isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill"
-        muteButton.image = NSImage(systemSymbolName: icon, accessibilityDescription: "Mute")
+        muteButton.image = Lucide.template(isMuted ? .volumeX : .volume2, size: 17)
+        muteButton.isToggleActive = isMuted
     }
 
     @objc private func onExitClicked() {

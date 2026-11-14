@@ -2,6 +2,7 @@ import AppKit
 
 public final class HistoryPanelViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     public var onRestoreSnapshot: ((ProjectDocumentData) -> Void)?
+    public var onJumpToHistory: ((Int) -> Void)?
     public var onPerformUndo: (() -> Void)?
     public var onPerformRedo: (() -> Void)?
 
@@ -15,13 +16,13 @@ public final class HistoryPanelViewController: NSViewController, NSTableViewData
     public override func loadView() {
         let root = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 420))
         root.wantsLayer = true
-        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.14, alpha: 1.0).cgColor
+        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0).cgColor
 
         // 1. Header
         let header = NSView()
         header.translatesAutoresizingMaskIntoConstraints = false
         header.wantsLayer = true
-        header.layer?.backgroundColor = NSColor(calibratedWhite: 0.17, alpha: 1.0).cgColor
+        header.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
         root.addSubview(header)
 
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -46,7 +47,7 @@ public final class HistoryPanelViewController: NSViewController, NSTableViewData
         let bottomBar = NSView()
         bottomBar.translatesAutoresizingMaskIntoConstraints = false
         bottomBar.wantsLayer = true
-        bottomBar.layer?.backgroundColor = NSColor(calibratedWhite: 0.16, alpha: 1.0).cgColor
+        bottomBar.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
         root.addSubview(bottomBar)
 
         undoBtn.translatesAutoresizingMaskIntoConstraints = false
@@ -142,9 +143,13 @@ public final class HistoryPanelViewController: NSViewController, NSTableViewData
 
         let pastCount = HistoryManager.shared.pastEntries.count
         if row < pastCount {
-            // Salta a uno stato passato
-            let targetSnapshot = HistoryManager.shared.pastEntries[row].snapshot
-            onRestoreSnapshot?(targetSnapshot)
+            // Salta a uno stato passato aggiornando gli stack Undo/Redo
+            if let onJump = onJumpToHistory {
+                onJump(row)
+            } else {
+                let targetSnapshot = HistoryManager.shared.pastEntries[row].snapshot
+                onRestoreSnapshot?(targetSnapshot)
+            }
             reloadHistoryUI()
         } else if row == pastCount {
             // Già sullo stato corrente
@@ -210,8 +215,9 @@ public final class HistoryPanelViewController: NSViewController, NSTableViewData
             cell?.textField?.textColor = .systemCyan
             cell?.textField?.font = NSFont.systemFont(ofSize: 11, weight: .bold)
         } else {
-            let futureIndex = row - pastCount - 1
-            if futureIndex < HistoryManager.shared.futureEntries.count {
+            let futureOffset = row - pastCount - 1
+            let futureIndex = HistoryManager.shared.futureEntries.count - 1 - futureOffset
+            if futureIndex >= 0 && futureIndex < HistoryManager.shared.futureEntries.count {
                 let entry = HistoryManager.shared.futureEntries[futureIndex]
                 cell?.imageView?.image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: nil)
                 cell?.imageView?.contentTintColor = NSColor(calibratedWhite: 0.35, alpha: 1.0)

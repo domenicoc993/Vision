@@ -68,7 +68,7 @@ public struct MediaItem: Identifiable, Hashable {
     }
 
     public static func load(from url: URL) async throws -> MediaItem {
-        let asset = AVURLAsset(url: url)
+        let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         
         let duration = try await asset.load(.duration)
         let tracks = try await asset.load(.tracks)

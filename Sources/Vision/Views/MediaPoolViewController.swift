@@ -83,7 +83,7 @@ public enum MediaPoolListItem {
     case folder(MediaFolder)
 }
 
-public final class MediaPoolViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
+public final class MediaPoolViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSSplitViewDelegate {
     public weak var delegate: MediaPoolDelegate?
     public var timelineModel: TimelineModel? {
         didSet {
@@ -170,6 +170,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     // Media Pool View Hierarchy
     private let mediaPoolContainer = NSView()
     private let splitView = NSSplitView()
+    private var hasAppliedInitialSidebarWidth = false
 
     // Sidebar: Project & Folders
     private let sidebarContainer = NSView()
@@ -199,7 +200,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     public override func loadView() {
         let dropContainer = DragDropContainerView()
         dropContainer.wantsLayer = true
-        dropContainer.layer?.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1.0).cgColor
+        dropContainer.layer?.backgroundColor = NSColor(calibratedWhite: 0.085, alpha: 1.0).cgColor
         dropContainer.onURLsDropped = { [weak self] urls in
             self?.processDroppedURLs(urls)
         }
@@ -211,7 +212,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         let topHeader = NSView()
         topHeader.translatesAutoresizingMaskIntoConstraints = false
         topHeader.wantsLayer = true
-        topHeader.layer?.backgroundColor = NSColor(calibratedWhite: 0.16, alpha: 1.0).cgColor
+        topHeader.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
         dropContainer.addSubview(topHeader)
         setupTopHeaderUI(topHeader)
 
@@ -261,6 +262,14 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         }
 
         self.view = dropContainer
+    }
+
+    public override func viewDidLayout() {
+        super.viewDidLayout()
+        if !hasAppliedInitialSidebarWidth && splitView.bounds.width > 300 {
+            hasAppliedInitialSidebarWidth = true
+            splitView.setPosition(155, ofDividerAt: 0)
+        }
     }
 
     private func setupTopHeaderUI(_ topHeader: NSView) {
@@ -331,6 +340,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         splitView.translatesAutoresizingMaskIntoConstraints = false
         splitView.isVertical = true
         splitView.dividerStyle = .thin
+        splitView.delegate = self
         container.addSubview(splitView)
 
         NSLayoutConstraint.activate([
@@ -341,21 +351,38 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         ])
 
         setupSidebarUI()
-        splitView.addSubview(sidebarContainer)
+        splitView.addArrangedSubview(sidebarContainer)
 
         setupContentUI()
-        splitView.addSubview(contentContainer)
+        splitView.addArrangedSubview(contentContainer)
+    }
 
-        sidebarContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
-        sidebarContainer.widthAnchor.constraint(lessThanOrEqualToConstant: 280).isActive = true
-        contentContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 200).isActive = true
+    public func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        return 110
+    }
 
-        splitView.setPosition(170, ofDividerAt: 0)
+    public func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        return max(155, min(280, splitView.bounds.width - 180))
+    }
+
+    public func splitView(_ splitView: NSSplitView, resizeSubviewsWithOldSize oldSize: NSSize) {
+        let dividerThickness = splitView.dividerThickness
+        let totalW = splitView.bounds.width
+        let totalH = splitView.bounds.height
+        guard totalW > 0, totalH > 0 else { return }
+
+        let currentSidebarW = sidebarContainer.frame.width > 0 ? sidebarContainer.frame.width : 155
+        let maxSidebarW = max(110, min(280, totalW - 180))
+        let sidebarW = min(maxSidebarW, max(110, currentSidebarW))
+        let contentW = max(0, totalW - sidebarW - dividerThickness)
+
+        sidebarContainer.frame = NSRect(x: 0, y: 0, width: sidebarW, height: totalH)
+        contentContainer.frame = NSRect(x: sidebarW + dividerThickness, y: 0, width: contentW, height: totalH)
     }
 
     private func setupSidebarUI() {
         sidebarContainer.wantsLayer = true
-        sidebarContainer.layer?.backgroundColor = NSColor(calibratedWhite: 0.14, alpha: 1.0).cgColor
+        sidebarContainer.layer?.backgroundColor = NSColor(calibratedWhite: 0.095, alpha: 1.0).cgColor
 
         sidebarScrollView.translatesAutoresizingMaskIntoConstraints = false
         sidebarScrollView.documentView = sidebarTableView
@@ -399,7 +426,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
 
     private func setupContentUI() {
         contentContainer.wantsLayer = true
-        contentContainer.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1.0).cgColor
+        contentContainer.layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0).cgColor
 
         contentTableScrollView.translatesAutoresizingMaskIntoConstraints = false
         contentTableScrollView.documentView = contentTableView
@@ -430,7 +457,8 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         contentTableView.delegate = self
         contentTableView.doubleAction = #selector(onTableRowDoubleClicked)
         contentTableView.target = self
-        contentTableView.usesAlternatingRowBackgroundColors = true
+        contentTableView.usesAlternatingRowBackgroundColors = false
+        contentTableView.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0)
         contentTableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
         contentTableView.registerForDraggedTypes([kMediaItemPasteboardType, .fileURL])
         contentTableView.setDraggingSourceOperationMask([.copy, .move, .generic], forLocal: true)
@@ -568,7 +596,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         let subHeader = NSView()
         subHeader.translatesAutoresizingMaskIntoConstraints = false
         subHeader.wantsLayer = true
-        subHeader.layer?.backgroundColor = NSColor(calibratedWhite: 0.16, alpha: 1.0).cgColor
+        subHeader.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
         container.addSubview(subHeader)
 
         let trackLabel = NSTextField(labelWithString: "Traccia:")
@@ -591,6 +619,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         timelineGridScrollView.documentView = timelineGridView
         timelineGridScrollView.hasVerticalScroller = true
         timelineGridScrollView.hasHorizontalScroller = false
+        timelineGridScrollView.drawsBackground = false
         container.addSubview(timelineGridScrollView)
 
         timelineGridView.onClipSelected = { [weak self] clip in
