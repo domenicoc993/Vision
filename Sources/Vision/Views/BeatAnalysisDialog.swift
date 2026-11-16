@@ -35,7 +35,7 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
     private let statusIndicator = NSProgressIndicator()
     private let statusLabel = NSTextField(labelWithString: "")
     private let bpmResultLabel = NSTextField(labelWithString: "")
-    private let modePopUp = NSPopUpButton()
+    private let modePopUp = VisionDropdownButton()
     private let sensitivityLabel = NSTextField(labelWithString: "Sensibilità picchi:")
     private let sensitivitySlider = NSSlider(value: 0.45, minValue: 0.0, maxValue: 1.0, target: nil, action: nil)
     private let sensitivityValueLabel = NSTextField(labelWithString: "Bilanciato (45%)")
@@ -45,7 +45,8 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
     private let clearClipBtn = FlatButton(title: "Pulisci Brano")
     private let generateBtn = FlatButton(title: "Applica Gabbie")
 
-    private let selectionPopUp = NSPopUpButton()
+    private let selectionPopUp = VisionDropdownButton()
+    private let orderModePopUp = VisionDropdownButton()
     private let autoFillStatusLabel = NSTextField(labelWithString: "")
     private let autoFillBtn = FlatButton(title: "Esegui Auto-Fill su V1")
 
@@ -55,7 +56,7 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
         onModified: (() -> Void)? = nil
     ) {
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 530, height: 575),
+            contentRect: NSRect(x: 0, y: 0, width: 540, height: 615),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -97,17 +98,16 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
 
         var fallbackAudio: TimelineClip? = nil
         if selectedAudio == nil {
-            for track in model.audioTracks {
-                if let first = track.clips.first {
-                    fallbackAudio = first
-                    break
-                }
-            }
+            let allAudio = model.audioTracks.flatMap(\.clips)
+            fallbackAudio =
+                allAudio.first(where: { !$0.beatMarkers.isEmpty || !$0.markers.isEmpty }) ??
+                allAudio.first(where: { !$0.mediaItem.hasVideo || $0.linkGroupId == nil }) ??
+                allAudio.first
         }
 
         self.hasSelectedAudioClip = (selectedAudio != nil)
         self.targetAudioClip = selectedAudio ?? fallbackAudio
-        self.targetMode = (selectedAudio != nil) ? .trackClip : .timeline
+        self.targetMode = (self.targetAudioClip != nil) ? .trackClip : .timeline
 
         super.init(nibName: nil, bundle: nil)
     }
@@ -218,7 +218,6 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
         modeLabel.translatesAutoresizingMaskIntoConstraints = false
         beatCard.addSubview(modeLabel)
 
-        modePopUp.bezelStyle = .rounded
         modePopUp.translatesAutoresizingMaskIntoConstraints = false
         modePopUp.target = self
         modePopUp.action = #selector(onModeChanged)
@@ -295,6 +294,19 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
         selectionPopUp.target = self
         selectionPopUp.action = #selector(onSelectionChanged)
         autoFillCard.addSubview(selectionPopUp)
+
+        let orderLabel = NSTextField(labelWithString: "Ordine:")
+        orderLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        orderLabel.textColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
+        orderLabel.translatesAutoresizingMaskIntoConstraints = false
+        autoFillCard.addSubview(orderLabel)
+
+        orderModePopUp.translatesAutoresizingMaskIntoConstraints = false
+        for mode in AutoFillOrderMode.allCases {
+            orderModePopUp.addItem(withTitle: mode.rawValue)
+        }
+        orderModePopUp.selectItem(at: 0)
+        autoFillCard.addSubview(orderModePopUp)
 
         autoFillStatusLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
         autoFillStatusLabel.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
@@ -441,7 +453,14 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
             selectionPopUp.leadingAnchor.constraint(equalTo: selLabel.trailingAnchor, constant: 10),
             selectionPopUp.trailingAnchor.constraint(equalTo: autoFillCard.trailingAnchor, constant: -14),
 
-            autoFillStatusLabel.topAnchor.constraint(equalTo: selectionPopUp.bottomAnchor, constant: 8),
+            orderLabel.topAnchor.constraint(equalTo: selectionPopUp.bottomAnchor, constant: 10),
+            orderLabel.leadingAnchor.constraint(equalTo: autoFillCard.leadingAnchor, constant: 14),
+
+            orderModePopUp.centerYAnchor.constraint(equalTo: orderLabel.centerYAnchor),
+            orderModePopUp.leadingAnchor.constraint(equalTo: selectionPopUp.leadingAnchor),
+            orderModePopUp.trailingAnchor.constraint(equalTo: autoFillCard.trailingAnchor, constant: -14),
+
+            autoFillStatusLabel.topAnchor.constraint(equalTo: orderModePopUp.bottomAnchor, constant: 8),
             autoFillStatusLabel.leadingAnchor.constraint(equalTo: autoFillCard.leadingAnchor, constant: 14),
             autoFillStatusLabel.trailingAnchor.constraint(equalTo: autoFillCard.trailingAnchor, constant: -14),
 
@@ -554,15 +573,16 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
                 }
 
                 var parts: [String] = []
-                if !model.rhythmicCages.isEmpty {
-                    let bpmStr = model.detectedBPM.map { " (\(Int($0.rounded())) BPM)" } ?? ""
-                    parts.append("Timeline: \(model.rhythmicCages.count) gabbie\(bpmStr)")
+                let liveCages = model.activeCageIntervals()
+                if !liveCages.isEmpty {
+                    let bpmStr = model.effectiveDetectedBPM.map { " (\(Int($0.rounded())) BPM)" } ?? ""
+                    parts.append("Attive in timeline: \(liveCages.count) gabbie\(bpmStr)")
                 }
-                if let clip = clip, !clip.beatMarkers.isEmpty {
-                    let bpmStr = clip.beatBPM.map { " (\(Int($0.rounded())) BPM)" } ?? ""
-                    parts.append("Brano: \(clip.beatMarkers.count) segni\(bpmStr)")
+                if let clip = clip, (!clip.beatMarkers.isEmpty || !clip.markers.isEmpty) {
+                    let customStr = clip.markers.isEmpty ? "" : ", \(clip.markers.count) M"
+                    parts.append("Brano: \(clip.beatMarkers.count) beat\(customStr)")
                 }
-                bpmResultLabel.stringValue = parts.isEmpty ? "Stato attuale: nessuna gabbia o segno salvato" : "Attivo — " + parts.joined(separator: "  •  ")
+                bpmResultLabel.stringValue = parts.isEmpty ? "Stato attuale: nessuna gabbia o sbarra attiva" : parts.joined(separator: "  •  ")
                 modePopUp.isEnabled = false
                 sensitivitySlider.isEnabled = false
                 updateSensitivityUI()
@@ -617,7 +637,7 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
 
     private func populateSelectionPopUp() {
         selectionPopUp.removeAllItems()
-        let selections = EditorProject.shared.selections
+        let selections = EditorProject.shared.selectionTimelines
         if selections.isEmpty {
             selectionPopUp.addItem(withTitle: "Nessuna selezione disponibile")
             selectionPopUp.isEnabled = false
@@ -626,26 +646,26 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
             for sel in selections {
                 selectionPopUp.addItem(withTitle: sel.name)
             }
-            if let active = EditorProject.shared.activeSelection {
+            let active = EditorProject.shared.activeTimeline
+            if active.isSelection {
                 selectionPopUp.selectItem(withTitle: active.name)
             }
         }
     }
 
-    private var selectedSelectionModel: SelectionModel? {
-        guard selectionPopUp.isEnabled, let title = selectionPopUp.selectedItem?.title else {
-            return EditorProject.shared.activeSelection
+    private var selectedSelectionTimeline: TimelineModel? {
+        let selections = EditorProject.shared.selectionTimelines
+        guard selectionPopUp.isEnabled, let title = selectionPopUp.selectedTitle else {
+            return selections.first
         }
-        return EditorProject.shared.selections.first(where: { $0.name == title }) ?? EditorProject.shared.activeSelection
+        return selections.first(where: { $0.name == title }) ?? selections.first
     }
 
     private func effectiveAutoFillCages() -> (cages: [RhythmicCage], description: String) {
-        if targetMode == .trackClip, let clip = currentTargetClip {
-            let clipCages = model.cagesFromAudioClip(clip)
-            if !clipCages.isEmpty {
-                let bpmStr = clip.beatBPM.map { " (\(Int($0.rounded())) BPM)" } ?? ""
-                return (clipCages, "\(clipCages.count) gabbie dal brano '\(clip.mediaItem.name)'\(bpmStr)")
-            }
+        let liveCages = model.activeCageIntervals()
+        if !liveCages.isEmpty {
+            let bpmStr = model.effectiveDetectedBPM.map { " (\(Int($0.rounded())) BPM)" } ?? ""
+            return (liveCages, "\(liveCages.count) gabbie attive sulla timeline\(bpmStr)")
         }
 
         if !model.rhythmicCages.isEmpty {
@@ -653,47 +673,43 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
             return (model.rhythmicCages, "\(model.rhythmicCages.count) gabbie sulla timeline\(bpmStr)")
         }
 
-        if let clip = currentTargetClip {
-            let clipCages = model.cagesFromAudioClip(clip)
-            if !clipCages.isEmpty {
-                let bpmStr = clip.beatBPM.map { " (\(Int($0.rounded())) BPM)" } ?? ""
-                return (clipCages, "\(clipCages.count) gabbie dal brano '\(clip.mediaItem.name)'\(bpmStr)")
-            }
-        }
-
         return ([], "0 gabbie disponibili")
     }
 
     private func updateAutoFillState() {
         let effective = effectiveAutoFillCages()
-        guard let sel = selectedSelectionModel else {
-            autoFillStatusLabel.stringValue = "Crea una Selezione (⌘1) con le clip da montare prima di usare Auto-Fill."
+        guard let sel = selectedSelectionTimeline else {
+            autoFillStatusLabel.stringValue = "Crea una Selezione dal Media Pool (o converti una timeline 1V+1A) prima di usare Auto-Fill."
             autoFillStatusLabel.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
             autoFillBtn.isEnabled = false
             return
         }
 
-        let approved = sel.selectedClips
-        let source = !approved.isEmpty ? approved : sel.analysisClips
-        let sourceKind = !approved.isEmpty ? "approvate (Verde)" : "in analisi (Blu)"
+        let videoClips = sel.videoTracks.first?.clips ?? []
+        let p1Count = videoClips.filter { ($0.priority ?? 1) == 1 }.count
+        let p2Count = videoClips.filter { $0.priority == 2 }.count
+        let p3Count = videoClips.filter { $0.priority == 3 }.count
+        let prioInfo = (p2Count > 0 || p3Count > 0)
+            ? " [P1:\(p1Count) • P2:\(p2Count) • P3:\(p3Count)]"
+            : ""
 
         if effective.cages.isEmpty {
-            autoFillStatusLabel.stringValue = "Nessuna gabbia pronta • \(source.count) clip \(sourceKind) pronte. Analizza e applica le gabbie sopra."
+            autoFillStatusLabel.stringValue = "Nessuna gabbia pronta • \(videoClips.count) clip\(prioInfo) in '\(sel.name)'. Analizza il brano sopra o premi M su una traccia audio per aggiungere sbarre."
             autoFillStatusLabel.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
             autoFillBtn.isEnabled = false
-        } else if source.isEmpty {
-            autoFillStatusLabel.stringValue = "\(effective.description) • nessuna clip nella selezione '\(sel.name)'."
+        } else if videoClips.isEmpty {
+            autoFillStatusLabel.stringValue = "\(effective.description) • nessuna clip video nella selezione '\(sel.name)'."
             autoFillStatusLabel.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
             autoFillBtn.isEnabled = false
         } else {
-            autoFillStatusLabel.stringValue = "\(effective.description) • \(source.count) clip \(sourceKind) da '\(sel.name)'."
+            autoFillStatusLabel.stringValue = "\(effective.description) • \(videoClips.count) clip\(prioInfo) pronte da '\(sel.name)'."
             autoFillStatusLabel.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
             autoFillBtn.isEnabled = true
         }
     }
 
     private var currentSelectedMode: BeatIntervalMode {
-        let idx = max(0, min(modePopUp.indexOfSelectedItem, BeatIntervalMode.allCases.count - 1))
+        let idx = max(0, min(modePopUp.selectedIndex, BeatIntervalMode.allCases.count - 1))
         return BeatIntervalMode.allCases[idx]
     }
 
@@ -870,6 +886,8 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
             if let last = sourceCages.last {
                 markers.append(min(last.endSeconds, sOut))
             }
+            model.rhythmicCages = []
+            model.detectedBPM = nil
             model.setAudioClipBeatMarkers(clipId: clip.id, markers: markers, bpm: res.bpm)
             onModified?()
             lastFeedbackStatus = ("Segnati \(markers.count) punti su '\(clip.mediaItem.name)'.", .systemGreen)
@@ -879,16 +897,31 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
         refreshUIState()
     }
 
+    private var currentOrderMode: AutoFillOrderMode {
+        let idx = max(0, min(orderModePopUp.selectedIndex, AutoFillOrderMode.allCases.count - 1))
+        return AutoFillOrderMode.allCases[idx]
+    }
+
     @objc private func onAutoFillClicked() {
         let effective = effectiveAutoFillCages()
-        guard let sel = selectedSelectionModel, !effective.cages.isEmpty else { return }
-        let sourceClips = !sel.selectedClips.isEmpty ? sel.selectedClips : sel.analysisClips
+        guard let sel = selectedSelectionTimeline, !effective.cages.isEmpty else { return }
+        let sourceClips = sel.videoTracks.first?.clips ?? []
         guard !sourceClips.isEmpty else { return }
 
-        let count = model.autoFillCages(with: sourceClips, targetTrackIndex: 0, overrideCages: effective.cages)
+        let result = model.autoFillCagesDetailed(
+            withSelectionTimeline: sel,
+            targetTrackIndex: 0,
+            overrideCages: effective.cages,
+            orderMode: currentOrderMode
+        )
         onModified?()
-        autoFillStatusLabel.stringValue = "Auto-Fill completato: \(count) clip inserite su V1 (\(effective.description))."
-        autoFillStatusLabel.textColor = .systemGreen
+        var detailParts = ["\(result.primaryUniqueCount) uniche"]
+        if result.subsegmentCount > 0 { detailParts.append("\(result.subsegmentCount) sottospezzoni") }
+        if result.lockedCagesCount > 0 { detailParts.append("\(result.lockedCagesCount) bloccate") }
+        if result.movedAudioToA2 { detailParts.append("traccia audio -> A2") }
+        if result.remainingEmptyCages > 0 { detailParts.append("\(result.remainingEmptyCages) vuote") }
+        autoFillStatusLabel.stringValue = "Auto-Fill: \(result.filledCount)/\(result.totalUnlockedCages) gabbie (\(detailParts.joined(separator: ", ")))."
+        autoFillStatusLabel.textColor = result.filledCount > 0 ? .systemGreen : .systemOrange
     }
 
     @objc private func onCloseClicked() {

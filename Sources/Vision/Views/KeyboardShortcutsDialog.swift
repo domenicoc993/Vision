@@ -22,10 +22,9 @@ public final class KeyboardShortcutsDialog: NSViewController, NSSearchFieldDeleg
             title: "GENERALE",
             entries: [
                 ShortcutEntry(keys: "⌘ O", description: "Apri Project Manager"),
+                ShortcutEntry(keys: "⌘ E", description: "Esporta timeline attiva in Final Cut XML (.fcpxmld)"),
                 ShortcutEntry(keys: "⌘ Z", description: "Annulla (Undo)"),
                 ShortcutEntry(keys: "⇧ ⌘ Z / ⌘ Y", description: "Ripeti (Redo)"),
-                ShortcutEntry(keys: "⌘ 1", description: "Passa a modalità Selezione"),
-                ShortcutEntry(keys: "⌘ 2", description: "Passa a modalità Montaggio"),
                 ShortcutEntry(keys: "⌃ F", description: "Schermo intero Viewer"),
                 ShortcutEntry(keys: "⌘ A", description: "Seleziona tutto nella sezione attiva")
             ]
@@ -38,15 +37,19 @@ public final class KeyboardShortcutsDialog: NSViewController, NSSearchFieldDeleg
             ]
         ),
         ShortcutSection(
-            title: "MODALITÀ MONTAGGIO (TIMELINE)",
+            title: "MONTAGGIO & SELEZIONE (TIMELINE)",
             entries: [
                 ShortcutEntry(keys: "Q", description: "Trim inizio clip alla testina (Ripple)"),
                 ShortcutEntry(keys: "W", description: "Trim fine clip alla testina (Ripple)"),
                 ShortcutEntry(keys: "S / B", description: "Spezza clip alla testina (Blade)"),
-                ShortcutEntry(keys: "M", description: "Aggiungi / rimuovi marcatore su clip audio/video"),
+                ShortcutEntry(keys: "1 / 2 / 3", description: "Assegna priorità clip (1 Hero, 2 Buona, 3 Filler)"),
+                ShortcutEntry(keys: "0", description: "Rimuovi priorità dalla clip"),
+                ShortcutEntry(keys: "M", description: "Aggiungi / rimuovi marcatore (o sbarra su traccia audio)"),
+                ShortcutEntry(keys: "Trascina Pin / ⌫", description: "Sposta o elimina marcatore / beat marker su audio e video"),
                 ShortcutEntry(keys: "⌥ M", description: "Pulisci tutti i marcatori sulla clip"),
                 ShortcutEntry(keys: "⌥ ⌘ W", description: "Chiudi spazi (Close Gaps) tra clip selezionate"),
                 ShortcutEntry(keys: "N", description: "Attiva / disattiva Magnet (Snapping)"),
+                ShortcutEntry(keys: "L", description: "Blocca / sblocca clip (protetta in Auto-Fill)"),
                 ShortcutEntry(keys: "⌘ L / ⌥ L", description: "Attiva / disattiva Link Audio/Video"),
                 ShortcutEntry(keys: "⌥ P", description: "Attiva / disattiva Seleziona sotto testina"),
                 ShortcutEntry(keys: "⌥ ↑ / ⌥ ↓", description: "Sposta clip tra tracce video/audio"),
@@ -60,14 +63,6 @@ public final class KeyboardShortcutsDialog: NSViewController, NSSearchFieldDeleg
                 ShortcutEntry(keys: "⌥ + / ⌥ −", description: "Espandi / riduci span gabbia (1x / 2x / 3x)"),
                 ShortcutEntry(keys: "⌥ ← / ⌥ →", description: "Slip contenuto interno clip (±0.25s)"),
                 ShortcutEntry(keys: "⌘ ← / ⌘ →", description: "Scambia clip tra gabbie adiacenti")
-            ]
-        ),
-        ShortcutSection(
-            title: "MODALITÀ SELEZIONE",
-            entries: [
-                ShortcutEntry(keys: "↑ / ↓", description: "Sposta in Scarti / Ripristina da Scarti"),
-                ShortcutEntry(keys: "Q / W", description: "Trim inizio / fine (scarta parte tagliata)"),
-                ShortcutEntry(keys: "S / B", description: "Spezza segmento nella selezione")
             ]
         )
     ]

@@ -96,6 +96,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc func menuExportFCPXML() {
+        if let editor = window?.contentViewController as? MainEditorViewController {
+            editor.exportActiveTimelineToFCPXML()
+        }
+    }
+
     @objc func menuUndo() {
         if let editor = window?.contentViewController as? MainEditorViewController {
             editor.performUndo()
@@ -137,6 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(fileMenuItem)
         let fileMenu = NSMenu(title: "File")
         fileMenu.addItem(withTitle: "Project Manager...", action: #selector(menuOpenProjectManager), keyEquivalent: "o")
+        fileMenu.addItem(withTitle: "Esporta Final Cut XML (.fcpxmld)...", action: #selector(menuExportFCPXML), keyEquivalent: "e")
         fileMenu.addItem(NSMenuItem.separator())
         fileMenu.addItem(withTitle: "Chiudi Finestra", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         fileMenuItem.submenu = fileMenu

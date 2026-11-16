@@ -1,27 +1,21 @@
 import AppKit
 import AVFoundation
-
-public enum EditorMode {
-    case selezione
-    case montaggio
-}
+import UniformTypeIdentifiers
 
 public final class MainEditorViewController: NSViewController, MediaPoolDelegate {
     private var timelineModel: TimelineModel = EditorProject.shared.activeTimeline
     private let playbackController = PlaybackController()
 
-    public private(set) var currentMode: EditorMode = .montaggio
     private var mediaPoolVC: MediaPoolViewController!
     private var playerVC: PlayerViewController!
     private var timelineVC: TimelineViewController!
-    private var selectionVC: SelectionViewController!
 
     private let mainSplit = NSSplitView()
     private let topSplit = NSSplitView()
-    private let bottomWorkspaceContainer = NSView()
     private let bottomNavBar = NSView()
-    private let btnSelezione = NSButton()
-    private let btnMontaggio = NSButton()
+    private let activeModePill = NSView()
+    private let activeModeIconView = NSImageView()
+    private let activeModeLabel = NSTextField(labelWithString: "")
 
     private var projectManagerWC: ProjectManagerWindowController?
     private var historyPopover: NSPopover?
@@ -60,19 +54,16 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
 
         playerVC = PlayerViewController(playbackController: playbackController)
         playerVC.onProxyToggled = { [weak self] in
-            guard let self = self else { return }
-            if self.currentMode == .selezione {
-                self.selectionVC.rebuildCurrentComposition()
-            } else {
-                self.rebuildComposition()
-            }
+            self?.rebuildComposition()
         }
 
         timelineVC = TimelineViewController(model: timelineModel, playbackController: playbackController)
         timelineVC.onTimelineAction = { [weak self] title in
             guard let self = self else { return }
             self.mediaPoolVC.refreshTimelineGrid()
-            if title != "Marcatore Clip" && title != "Rimuovi Marcatori Clip" {
+            self.mediaPoolVC.refreshMediaPoolDisplay()
+            let skipRebuildPrefixes = ["Marcatore", "Rimuovi Marcatori", "Sposta Marcatore", "Sposta Beat Marker", "Sposta Sbarra", "Elimina Marcatore", "Elimina Sbarra", "Priorità", "Rimuovi Priorità", "Blocca Clip", "Sblocca Clip"]
+            if !skipRebuildPrefixes.contains(where: { title.hasPrefix($0) }) {
                 self.rebuildComposition()
             }
             HistoryManager.shared.record(title: title, project: EditorProject.shared, mediaItems: self.mediaPoolVC.mediaItems)
@@ -99,19 +90,26 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         timelineVC.onSwitchTimeline = { [weak self] targetTL in
             self?.didSwitchActiveTimeline(to: targetTL)
         }
-
-        selectionVC = SelectionViewController()
-        selectionVC.mediaPoolVC = mediaPoolVC
-        selectionVC.playerVC = playerVC
-        selectionVC.onActionRecorded = { [weak self] actionTitle in
+        timelineVC.onExportFCPXML = { [weak self] in
             guard let self = self else { return }
-            HistoryManager.shared.record(title: actionTitle, project: EditorProject.shared, mediaItems: self.mediaPoolVC.mediaItems)
+            self.exportTimelineToFCPXML(self.timelineModel)
         }
-
-        mediaPoolVC.onOpenSelectionInSelectionMode = { [weak self] sel in
+        timelineVC.onImportDroppedURLsToTimeline = { [weak self] urls, atTime, trackIdx, isVideo in
             guard let self = self else { return }
-            self.selectionVC.currentSelection = sel
-            self.switchMode(to: .selezione)
+            self.mediaPoolVC.importURLsForTimelineDrop(urls) { [weak self] loadedItems in
+                guard let self = self, !loadedItems.isEmpty else { return }
+                var currentT = atTime
+                for item in loadedItems {
+                    self.timelineModel.insertClip(
+                        mediaItem: item,
+                        atTime: currentT,
+                        targetTrackIndex: trackIdx,
+                        isTargetVideo: isVideo
+                    )
+                    currentT = CMTimeAdd(currentT, item.duration)
+                }
+                self.commitTimelineEdit(title: "Importa & Inserisci in Timeline")
+            }
         }
 
         print(">>> loadView: setting up splits and views...")
@@ -122,7 +120,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
             DispatchQueue.main.async {
                 self.mediaPoolVC.updateTimelinePopUp()
                 self.mediaPoolVC.updateFolderPopUp()
-                self.selectionVC.updateHeaderUI()
+                self.updateActiveTimelinePill()
                 ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: self.mediaPoolVC.mediaItems)
             }
         }
@@ -156,32 +154,14 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         topSplit.addArrangedSubview(mediaPoolVC.view)
         topSplit.addArrangedSubview(playerVC.view)
 
-        // Bottom Workspace Container hosting Timeline and Selection Dual Strips
-        bottomWorkspaceContainer.translatesAutoresizingMaskIntoConstraints = false
-        bottomWorkspaceContainer.addSubview(timelineVC.view)
-        bottomWorkspaceContainer.addSubview(selectionVC.view)
+        // Vertical Split: Top (Pool + Player) / Bottom (Timeline)
         timelineVC.view.translatesAutoresizingMaskIntoConstraints = false
-        selectionVC.view.translatesAutoresizingMaskIntoConstraints = false
-
-        NSLayoutConstraint.activate([
-            timelineVC.view.topAnchor.constraint(equalTo: bottomWorkspaceContainer.topAnchor),
-            timelineVC.view.leadingAnchor.constraint(equalTo: bottomWorkspaceContainer.leadingAnchor),
-            timelineVC.view.trailingAnchor.constraint(equalTo: bottomWorkspaceContainer.trailingAnchor),
-            timelineVC.view.bottomAnchor.constraint(equalTo: bottomWorkspaceContainer.bottomAnchor),
-
-            selectionVC.view.topAnchor.constraint(equalTo: bottomWorkspaceContainer.topAnchor),
-            selectionVC.view.leadingAnchor.constraint(equalTo: bottomWorkspaceContainer.leadingAnchor),
-            selectionVC.view.trailingAnchor.constraint(equalTo: bottomWorkspaceContainer.trailingAnchor),
-            selectionVC.view.bottomAnchor.constraint(equalTo: bottomWorkspaceContainer.bottomAnchor)
-        ])
-
-        // Vertical Split: Top (Pool + Player) / Bottom (Workspace: Timeline / Selection)
         mainSplit.isVertical = false
         mainSplit.dividerStyle = .paneSplitter
         mainSplit.translatesAutoresizingMaskIntoConstraints = false
 
         mainSplit.addArrangedSubview(topSplit)
-        mainSplit.addArrangedSubview(bottomWorkspaceContainer)
+        mainSplit.addArrangedSubview(timelineVC.view)
 
         setupBottomNavBar()
 
@@ -194,7 +174,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         minPlayerWidth.priority = .defaultHigh
         let minTopHeight = topSplit.heightAnchor.constraint(greaterThanOrEqualToConstant: 220)
         minTopHeight.priority = .defaultHigh
-        let minBottomHeight = bottomWorkspaceContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 180)
+        let minBottomHeight = timelineVC.view.heightAnchor.constraint(greaterThanOrEqualToConstant: 180)
         minBottomHeight.priority = .defaultHigh
 
         NSLayoutConstraint.activate([
@@ -217,16 +197,16 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         addChild(mediaPoolVC)
         addChild(playerVC)
         addChild(timelineVC)
-        addChild(selectionVC)
 
         self.view = root
 
-        switchMode(to: .montaggio)
+        rebuildComposition()
+        timelineVC.reloadTimelineUI()
         playerVC.updateAspectRatio(formatSize: timelineModel.format.size)
         setupInitialProject()
         setupKeyboardMonitor()
 
-        DebugLogger.shared.log("Vision avviato. Modalità: 🎯 Selezione (⌘1) | ✂️ Montaggio (⌘2). Scorciatoie: ⌃F (Schermo Intero), Spazio (Play/Pause), Q (Trim Inizio), W (Trim Fine), S (Spezza), ↑/↓ (Sposta Scarti in Selezione).", level: .info)
+        DebugLogger.shared.log("Vision avviato. Scorciatoie: ⌃F (Schermo Intero), Spazio (Play/Pausa), 1/2/3/0 (Priorità), M/⌥M (Marcatori), Q/W/S (Trim/Spezza).", level: .info)
     }
 
     public override func viewDidAppear() {
@@ -250,6 +230,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         // Keyboard monitor for professional editing shortcuts
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self = self else { return event }
+            guard event.window == self.view.window, NSApp.modalWindow == nil else { return event }
 
             if let firstResponder = self.view.window?.firstResponder, firstResponder is NSTextView {
                 return event
@@ -258,9 +239,10 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
             let isOption = event.modifierFlags.contains(.option)
             let isCommand = event.modifierFlags.contains(.command)
             let isControl = event.modifierFlags.contains(.control)
+            let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
 
             // Control + F -> Fullscreen Viewer from ANYWHERE in the app
-            if isControl && (event.keyCode == 3 || event.charactersIgnoringModifiers?.lowercased() == "f") {
+            if isControl && (event.keyCode == 3 || chars == "f") {
                 self.playerVC.toggleFullScreen()
                 return nil
             }
@@ -287,236 +269,241 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                 return nil
             }
 
-            // Command + 1 -> Switch to Modalità Selezione
-            if isCommand && event.keyCode == 18 {
-                self.switchMode(to: .selezione)
-                return nil
-            }
+            // Priority tagging: 1 = Hero, 2 = Buona, 3 = Filler, 0 = Clear
+            if !isCommand && !isControl && !isOption {
+                var targetPriority: Int? = nil
+                var matchedPriorityKey = false
 
-            // Command + 2 -> Switch to Modalità Montaggio
-            if isCommand && event.keyCode == 19 {
-                self.switchMode(to: .montaggio)
-                return nil
-            }
-
-            // Keyboard shortcuts routed based on active workspace mode
-            if self.currentMode == .selezione {
-                switch event.keyCode {
-                case 49: // Spacebar -> Play / Pause
-                    self.selectionVC.playbackController.togglePlayPause()
-                    return nil
-
-                case 126: // Up Arrow -> Move active clip to Scarti (↑)
-                    self.selectionVC.handleUpArrow()
-                    return nil
-
-                case 125: // Down Arrow -> Restore active clip from Scarti into Selezione sorted by name (↓)
-                    self.selectionVC.handleDownArrow()
-                    return nil
-
-                case 12: // 'Q' key -> Trim start to playhead (scarti portion goes to red strip, playhead aligns)
-                    self.selectionVC.handleTrimStart()
-                    return nil
-
-                case 13: // 'W' key -> Trim end to playhead (scarti portion goes to red strip)
-                    self.selectionVC.handleTrimEnd()
-                    return nil
-
-                case 1, 11: // 'S' or 'B' key -> Split clip into two blocks
-                    self.selectionVC.handleSplit()
-                    return nil
-
-                case 123: // Left Arrow -> Step back 1 frame
-                    self.selectionVC.playbackController.step(by: -1)
-                    return nil
-
-                case 124: // Right Arrow -> Step forward 1 frame
-                    self.selectionVC.playbackController.step(by: 1)
-                    return nil
-
-                default:
-                    break
+                if chars == "1" || event.keyCode == 18 || event.keyCode == 83 {
+                    targetPriority = 1
+                    matchedPriorityKey = true
+                } else if chars == "2" || event.keyCode == 19 || event.keyCode == 84 {
+                    targetPriority = 2
+                    matchedPriorityKey = true
+                } else if chars == "3" || event.keyCode == 20 || event.keyCode == 85 {
+                    targetPriority = 3
+                    matchedPriorityKey = true
+                } else if chars == "0" || event.keyCode == 29 || event.keyCode == 82 {
+                    targetPriority = nil
+                    matchedPriorityKey = true
                 }
-            } else {
-                // Classic Montaggio Mode shortcuts
-                switch event.keyCode {
-                case 49: // Spacebar -> Play / Pause
-                    self.playbackController.togglePlayPause()
-                    return nil
 
-                case 0: // 'A' key -> Select All based on active section
-                    if isCommand || isControl {
-                        if self.activeSection == .timeline {
-                            var allIds: Set<UUID> = []
-                            for track in self.timelineModel.videoTracks {
-                                for clip in track.clips { allIds.insert(clip.id) }
-                            }
-                            for track in self.timelineModel.audioTracks {
-                                for clip in track.clips { allIds.insert(clip.id) }
-                            }
-                            self.timelineModel.selectedClipIds = allIds
-                            self.timelineVC.reloadTimelineUI()
-                            DebugLogger.shared.log("Timeline: selezionate tutte le \(allIds.count) clip.", level: .info)
-                            return nil
-                        } else {
-                            self.mediaPoolVC.selectAllMediaItems()
-                            DebugLogger.shared.log("Media Pool: selezionati tutti gli elementi.", level: .info)
-                            return nil
+                if matchedPriorityKey {
+                    let t = self.playbackController.accurateCurrentTime
+                    let res = self.timelineModel.setClipPriority(targetPriority, at: t)
+                    if res.updatedCount > 0 {
+                        let label: String
+                        switch targetPriority {
+                        case 1: label = "Priorità 1 — Hero"
+                        case 2: label = "Priorità 2 — Buona"
+                        case 3: label = "Priorità 3 — Filler"
+                        default: label = "Rimuovi Priorità"
                         }
-                    }
-
-                case 12: // 'Q' key -> Trim start to playhead with playhead alignment
-                    if let targetTime = self.timelineModel.trimClipStart(at: self.playbackController.accurateCurrentTime) {
-                        self.playbackController.seek(to: targetTime, frameAccurate: true)
-                        self.commitTimelineEdit(title: "Trim Inizio Clip (Q)")
+                        self.commitTimelineEdit(title: label, rebuild: false)
+                        DebugLogger.shared.log(res.summary, level: .info)
+                    } else {
+                        DebugLogger.shared.log("Seleziona una clip o posiziona la testina su una clip per assegnare la priorità (1/2/3/0).", level: .warning)
                     }
                     return nil
+                }
 
-                case 13: // 'W' key -> Cmd+Option+W: Svuotamento spazi, oppure W: Trim fine senza scarto
-                    if isCommand && isOption {
-                        if self.timelineModel.closeGapsBetweenSelectedClips() {
-                            self.commitTimelineEdit(title: "Chiudi Spazi (⌥⌘W)")
-                        }
-                        return nil
-                    }
-                    if self.timelineModel.trimClipEnd(at: self.playbackController.accurateCurrentTime) {
-                        self.commitTimelineEdit(title: "Trim Fine Clip (W)")
-                    }
-                    return nil
-
-                case 1, 11: // 'S' or 'B' key
-                    if isOption, self.timelineModel.selectedClipId != nil {
-                        // Option + S -> Toggle 50% Slow Motion
-                        self.timelineVC.onToggleSpeedClicked()
-                        return nil
-                    }
-                    // S / B -> Spezza clip alla testina
-                    if self.timelineModel.splitClip(at: self.playbackController.accurateCurrentTime) {
-                        self.commitTimelineEdit(title: "Spezza Clip (S)")
-                    }
-                    return nil
-
-                case 24: // '+' or '=' key
-                    if isOption {
-                        // Option + (+) -> Aumenta Span gabbia (1x -> 2x -> 3x)
-                        self.timelineVC.onSpanClicked()
-                        return nil
-                    }
-
-                case 27: // '-' key
-                    if isOption, let selId = self.timelineModel.selectedClipId {
-                        // Option + (-) -> Riduci Span gabbia
-                        for track in self.timelineModel.videoTracks {
-                            if let clip = track.clips.first(where: { $0.id == selId }), clip.span > 1 {
-                                if self.timelineModel.setClipSpan(clipId: selId, newSpan: clip.span - 1) {
-                                    self.commitTimelineEdit(title: "Riduci Span Gabbia (⌥-)")
-                                }
-                                break
-                            }
-                        }
-                        return nil
-                    }
-
-                case 45: // 'N' key -> Toggle Magnet Snapping (Resolve convention)
-                    self.timelineVC.onMagnetToggleClicked()
-                    return nil
-
-                case 46: // 'M' key -> Segna / rimuovi marcatore su clip audio/video (⌥M pulisce)
+                // 'M' -> Segna / rimuovi marcatore su clip audio/video under playhead or selected
+                if chars == "m" || event.keyCode == 46 {
                     let markTime = self.playbackController.accurateCurrentTime
-                    if isOption {
-                        let cleared = self.timelineModel.clearAllClipMarkers(at: markTime)
-                        if cleared > 0 {
-                            self.commitTimelineEdit(title: "Rimuovi Marcatori Clip (⌥M)", rebuild: false)
-                            DebugLogger.shared.log("Rimossi \(cleared) marcatori dalla clip.", level: .info)
-                        }
-                        return nil
-                    }
                     let res = self.timelineModel.toggleClipMarker(at: markTime)
                     if res.added > 0 || res.removed > 0 {
                         let title = res.added > 0 ? "Aggiungi Marcatore (M)" : "Rimuovi Marcatore (M)"
                         self.commitTimelineEdit(title: title, rebuild: false)
                         DebugLogger.shared.log("Marcatori (M): \(res.summary.joined(separator: " | "))", level: .info)
                     } else {
-                        DebugLogger.shared.log("Nessuna clip sotto la testina su cui segnare il marcatore (M).", level: .warning)
+                        DebugLogger.shared.log("Nessuna clip sotto la testina o selezionata su cui segnare il marcatore (M).", level: .warning)
                     }
                     return nil
-
-                case 37: // 'L' key -> Toggle Link / Unlink if Cmd or Option pressed
-                    if isCommand || isOption {
-                        self.timelineVC.onLinkToggleClicked()
-                        return nil
-                    }
-
-                case 35: // 'P' key -> Toggle Selection Follows Playhead if Option pressed
-                    if isOption {
-                        self.timelineVC.onSelectionFollowsPlayheadClicked()
-                        return nil
-                    }
-
-                case 123: // Left Arrow
-                    if isOption, self.timelineModel.selectedClipId != nil {
-                        // Option + Left -> Slip corpo clip indietro (-0.25s)
-                        self.timelineVC.onSlipLeftClicked()
-                        return nil
-                    }
-                    if isCommand, let selId = self.timelineModel.selectedClipId {
-                        // Command + Left -> Scambia con la gabbia precedente
-                        if self.timelineModel.swapAdjacentCages(clipId: selId, direction: -1) {
-                            self.commitTimelineEdit(title: "Scambia Gabbia Ritmica (←)")
-                        }
-                        return nil
-                    }
-                    self.playbackController.step(by: -1)
-                    return nil
-
-                case 124: // Right Arrow
-                    if isOption, self.timelineModel.selectedClipId != nil {
-                        // Option + Right -> Slip corpo clip avanti (+0.25s)
-                        self.timelineVC.onSlipRightClicked()
-                        return nil
-                    }
-                    if isCommand, let selId = self.timelineModel.selectedClipId {
-                        // Command + Right -> Scambia con la gabbia successiva
-                        if self.timelineModel.swapAdjacentCages(clipId: selId, direction: +1) {
-                            self.commitTimelineEdit(title: "Scambia Gabbia Ritmica (→)")
-                        }
-                        return nil
-                    }
-                    self.playbackController.step(by: 1)
-                    return nil
-
-                case 126: // Up Arrow
-                    if isOption, let id = self.timelineModel.selectedClipId {
-                        self.moveSelectedClipVertically(id: id, isMovingUp: true)
-                        return nil
-                    }
-
-                case 125: // Down Arrow
-                    if isOption, let id = self.timelineModel.selectedClipId {
-                        self.moveSelectedClipVertically(id: id, isMovingUp: false)
-                        return nil
-                    }
-
-                case 51, 117: // Backspace / Delete
-                    if self.timelineModel.selectedClipIds.isEmpty && self.timelineModel.isSelectionFollowsPlayhead {
-                        self.timelineModel.updateSelectionAtPlayhead(time: self.playbackController.currentTime)
-                    }
-                    // Se ci sono gabbie ritmate e una clip selezionata, usa Slot Ripple Delete!
-                    if let selId = self.timelineModel.selectedClipId, !self.timelineModel.rhythmicCages.isEmpty {
-                        if self.timelineModel.slotRippleDelete(clipId: selId) {
-                            self.commitTimelineEdit(title: "Elimina Clip Ritmica")
-                            return nil
-                        }
-                    }
-                    if !self.timelineModel.selectedClipIds.isEmpty {
-                        self.timelineModel.removeSelectedClips()
-                        self.commitTimelineEdit(title: "Elimina Clip")
-                        return nil
-                    }
-
-                default:
-                    break
                 }
+            }
+
+            if isOption && !isCommand && !isControl && (chars == "m" || event.keyCode == 46) {
+                let markTime = self.playbackController.accurateCurrentTime
+                let cleared = self.timelineModel.clearAllClipMarkers(at: markTime)
+                if cleared > 0 {
+                    self.commitTimelineEdit(title: "Rimuovi Marcatori Clip (⌥M)", rebuild: false)
+                    DebugLogger.shared.log("Rimossi \(cleared) marcatori dalla clip.", level: .info)
+                }
+                return nil
+            }
+
+            switch event.keyCode {
+            case 49: // Spacebar -> Play / Pause
+                self.playbackController.togglePlayPause()
+                return nil
+
+            case 0: // 'A' key -> Select All based on active section
+                if isCommand || isControl {
+                    if self.activeSection == .timeline {
+                        var allIds: Set<UUID> = []
+                        for track in self.timelineModel.videoTracks {
+                            for clip in track.clips { allIds.insert(clip.id) }
+                        }
+                        for track in self.timelineModel.audioTracks {
+                            for clip in track.clips { allIds.insert(clip.id) }
+                        }
+                        self.timelineModel.selectedClipIds = allIds
+                        self.timelineVC.reloadTimelineUI()
+                        DebugLogger.shared.log("Timeline: selezionate tutte le \(allIds.count) clip.", level: .info)
+                        return nil
+                    } else {
+                        self.mediaPoolVC.selectAllMediaItems()
+                        DebugLogger.shared.log("Media Pool: selezionati tutti gli elementi.", level: .info)
+                        return nil
+                    }
+                }
+
+            case 12: // 'Q' key -> Trim start to playhead with playhead alignment
+                if let targetTime = self.timelineModel.trimClipStart(at: self.playbackController.accurateCurrentTime) {
+                    self.playbackController.seek(to: targetTime, frameAccurate: true)
+                    self.commitTimelineEdit(title: "Trim Inizio Clip (Q)")
+                }
+                return nil
+
+            case 13: // 'W' key -> Cmd+Option+W: Svuotamento spazi, oppure W: Trim fine
+                if isCommand && isOption {
+                    if self.timelineModel.closeGapsBetweenSelectedClips() {
+                        self.commitTimelineEdit(title: "Chiudi Spazi (⌥⌘W)")
+                    }
+                    return nil
+                }
+                if self.timelineModel.trimClipEnd(at: self.playbackController.accurateCurrentTime) {
+                    self.commitTimelineEdit(title: "Trim Fine Clip (W)")
+                }
+                return nil
+
+            case 1, 11: // 'S' or 'B' key
+                if isOption, self.timelineModel.selectedClipId != nil {
+                    // Option + S -> Toggle 50% Slow Motion
+                    self.timelineVC.onToggleSpeedClicked()
+                    return nil
+                }
+                // S / B -> Spezza clip alla testina
+                if self.timelineModel.splitClip(at: self.playbackController.accurateCurrentTime) {
+                    self.commitTimelineEdit(title: "Spezza Clip (S)")
+                }
+                return nil
+
+            case 24: // '+' or '=' key
+                if isOption {
+                    // Option + (+) -> Aumenta Span gabbia (1x -> 2x -> 3x)
+                    self.timelineVC.onSpanClicked()
+                    return nil
+                }
+
+            case 27: // '-' key
+                if isOption, let selId = self.timelineModel.selectedClipId {
+                    // Option + (-) -> Riduci Span gabbia
+                    for track in self.timelineModel.videoTracks {
+                        if let clip = track.clips.first(where: { $0.id == selId }), clip.span > 1 {
+                            if self.timelineModel.setClipSpan(clipId: selId, newSpan: clip.span - 1) {
+                                self.commitTimelineEdit(title: "Riduci Span Gabbia (⌥-)")
+                            }
+                            break
+                        }
+                    }
+                    return nil
+                }
+
+            case 45: // 'N' key -> Toggle Magnet Snapping (Resolve convention)
+                self.timelineVC.onMagnetToggleClicked()
+                return nil
+
+            case 37: // 'L' key -> Toggle Link / Unlink if Cmd/Opt, otherwise Lock/Unlock selected clip
+                if isCommand || isOption {
+                    self.timelineVC.onLinkToggleClicked()
+                    return nil
+                }
+                if !isControl {
+                    let res = self.timelineModel.toggleSelectedClipsLock(at: self.playbackController.accurateCurrentTime)
+                    if res.toggledCount > 0 {
+                        let label = res.isNowLocked ? "Blocca Clip (L)" : "Sblocca Clip (L)"
+                        self.commitTimelineEdit(title: label, rebuild: false)
+                        DebugLogger.shared.log(res.isNowLocked ? "Clip bloccata 🔒 (protetta in Auto-Fill)" : "Clip sbloccata 🔓", level: .info)
+                    } else {
+                        DebugLogger.shared.log("Seleziona una clip o posiziona la testina su una clip per bloccarla/sbloccarla (L).", level: .warning)
+                    }
+                    return nil
+                }
+
+            case 35: // 'P' key -> Toggle Selection Follows Playhead if Option pressed
+                if isOption {
+                    self.timelineVC.onSelectionFollowsPlayheadClicked()
+                    return nil
+                }
+
+            case 123: // Left Arrow
+                if isOption, self.timelineModel.selectedClipId != nil {
+                    // Option + Left -> Slip corpo clip indietro (-0.25s)
+                    self.timelineVC.onSlipLeftClicked()
+                    return nil
+                }
+                if isCommand, let selId = self.timelineModel.selectedClipId {
+                    // Command + Left -> Scambia con la gabbia precedente
+                    if self.timelineModel.swapAdjacentCages(clipId: selId, direction: -1) {
+                        self.commitTimelineEdit(title: "Scambia Gabbia Ritmica (←)")
+                    }
+                    return nil
+                }
+                self.playbackController.step(by: -1)
+                return nil
+
+            case 124: // Right Arrow
+                if isOption, self.timelineModel.selectedClipId != nil {
+                    // Option + Right -> Slip corpo clip avanti (+0.25s)
+                    self.timelineVC.onSlipRightClicked()
+                    return nil
+                }
+                if isCommand, let selId = self.timelineModel.selectedClipId {
+                    // Command + Right -> Scambia con la gabbia successiva
+                    if self.timelineModel.swapAdjacentCages(clipId: selId, direction: +1) {
+                        self.commitTimelineEdit(title: "Scambia Gabbia Ritmica (→)")
+                    }
+                    return nil
+                }
+                self.playbackController.step(by: 1)
+                return nil
+
+            case 126: // Up Arrow
+                if isOption, let id = self.timelineModel.selectedClipId {
+                    self.moveSelectedClipVertically(id: id, isMovingUp: true)
+                    return nil
+                }
+
+            case 125: // Down Arrow
+                if isOption, let id = self.timelineModel.selectedClipId {
+                    self.moveSelectedClipVertically(id: id, isMovingUp: false)
+                    return nil
+                }
+
+            case 51, 117: // Backspace / Delete
+                if self.timelineVC.deleteSelectedMarker() {
+                    self.commitTimelineEdit(title: "Elimina Marcatore", rebuild: false)
+                    return nil
+                }
+                if self.timelineModel.selectedClipIds.isEmpty && self.timelineModel.isSelectionFollowsPlayhead {
+                    self.timelineModel.updateSelectionAtPlayhead(time: self.playbackController.currentTime)
+                }
+                // Se ci sono gabbie ritmate attive e una clip selezionata, usa Slot Ripple Delete!
+                if let selId = self.timelineModel.selectedClipId, !self.timelineModel.activeCageIntervals().isEmpty {
+                    if self.timelineModel.slotRippleDelete(clipId: selId) {
+                        self.commitTimelineEdit(title: "Elimina Clip Ritmica")
+                        return nil
+                    }
+                }
+                if !self.timelineModel.selectedClipIds.isEmpty {
+                    self.timelineModel.removeSelectedClips()
+                    self.commitTimelineEdit(title: "Elimina Clip")
+                    return nil
+                }
+
+            default:
+                break
             }
             return event
         }
@@ -534,30 +521,31 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         divider.layer?.backgroundColor = NSColor(calibratedWhite: 0.18, alpha: 1.0).cgColor
         bottomNavBar.addSubview(divider)
 
-        // Center Mode Tabs
-        btnSelezione.title = "🎯  Selezione  (⌘1)"
-        btnSelezione.bezelStyle = .regularSquare
-        btnSelezione.isBordered = false
-        btnSelezione.wantsLayer = true
-        btnSelezione.layer?.cornerRadius = 6
-        btnSelezione.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        btnSelezione.target = self
-        btnSelezione.action = #selector(onSelezioneTabClicked)
+        // Center Active Timeline / Selection Pill
+        activeModePill.wantsLayer = true
+        activeModePill.layer?.cornerRadius = 6
+        activeModePill.layer?.borderWidth = 1.0
+        activeModePill.translatesAutoresizingMaskIntoConstraints = false
 
-        btnMontaggio.title = "✂️  Montaggio  (⌘2)"
-        btnMontaggio.bezelStyle = .regularSquare
-        btnMontaggio.isBordered = false
-        btnMontaggio.wantsLayer = true
-        btnMontaggio.layer?.cornerRadius = 6
-        btnMontaggio.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        btnMontaggio.target = self
-        btnMontaggio.action = #selector(onMontaggioTabClicked)
+        activeModeIconView.translatesAutoresizingMaskIntoConstraints = false
+        activeModeLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        activeModeLabel.lineBreakMode = .byTruncatingTail
+        activeModeLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let centerStack = NSStackView(views: [btnSelezione, btnMontaggio])
-        centerStack.orientation = .horizontal
-        centerStack.spacing = 12
-        centerStack.translatesAutoresizingMaskIntoConstraints = false
-        bottomNavBar.addSubview(centerStack)
+        activeModePill.addSubview(activeModeIconView)
+        activeModePill.addSubview(activeModeLabel)
+        bottomNavBar.addSubview(activeModePill)
+
+        NSLayoutConstraint.activate([
+            activeModeIconView.leadingAnchor.constraint(equalTo: activeModePill.leadingAnchor, constant: 10),
+            activeModeIconView.centerYAnchor.constraint(equalTo: activeModePill.centerYAnchor),
+            activeModeIconView.widthAnchor.constraint(equalToConstant: 14),
+            activeModeIconView.heightAnchor.constraint(equalToConstant: 14),
+
+            activeModeLabel.leadingAnchor.constraint(equalTo: activeModeIconView.trailingAnchor, constant: 6),
+            activeModeLabel.trailingAnchor.constraint(equalTo: activeModePill.trailingAnchor, constant: -10),
+            activeModeLabel.centerYAnchor.constraint(equalTo: activeModePill.centerYAnchor)
+        ])
 
         // Left: Project Manager & Autosave Status
         projectManagerBtn.image = Lucide.template(.database, size: 16)
@@ -619,64 +607,33 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
             leftStack.leadingAnchor.constraint(equalTo: bottomNavBar.leadingAnchor, constant: 14),
             leftStack.centerYAnchor.constraint(equalTo: bottomNavBar.centerYAnchor),
 
-            centerStack.centerXAnchor.constraint(equalTo: bottomNavBar.centerXAnchor),
-            centerStack.centerYAnchor.constraint(equalTo: bottomNavBar.centerYAnchor),
-            btnSelezione.widthAnchor.constraint(equalToConstant: 150),
-            btnSelezione.heightAnchor.constraint(equalToConstant: 26),
-            btnMontaggio.widthAnchor.constraint(equalToConstant: 150),
-            btnMontaggio.heightAnchor.constraint(equalToConstant: 26),
+            activeModePill.centerXAnchor.constraint(equalTo: bottomNavBar.centerXAnchor),
+            activeModePill.centerYAnchor.constraint(equalTo: bottomNavBar.centerYAnchor),
+            activeModePill.heightAnchor.constraint(equalToConstant: 26),
+            activeModePill.widthAnchor.constraint(lessThanOrEqualToConstant: 440),
 
             rightStack.trailingAnchor.constraint(equalTo: bottomNavBar.trailingAnchor, constant: -14),
             rightStack.centerYAnchor.constraint(equalTo: bottomNavBar.centerYAnchor)
         ])
 
-        updateNavBarStyles()
+        updateActiveTimelinePill()
         updateHistoryNavButtons()
     }
 
-    private func updateNavBarStyles() {
-        let activeBg = NSColor(calibratedRed: 0.16, green: 0.44, blue: 0.88, alpha: 1.0).cgColor
-        let inactiveBg = NSColor(calibratedWhite: 0.125, alpha: 1.0).cgColor
-
-        if currentMode == .selezione {
-            btnSelezione.layer?.backgroundColor = activeBg
-            btnSelezione.contentTintColor = NSColor.white
-            btnMontaggio.layer?.backgroundColor = inactiveBg
-            btnMontaggio.contentTintColor = NSColor(calibratedWhite: 0.65, alpha: 1.0)
+    private func updateActiveTimelinePill() {
+        if timelineModel.isSelection {
+            activeModePill.layer?.backgroundColor = NSColor.systemPurple.withAlphaComponent(0.16).cgColor
+            activeModePill.layer?.borderColor = NSColor.systemPurple.withAlphaComponent(0.45).cgColor
+            activeModeIconView.image = Lucide.image(.sparkles, size: 13, color: .systemPurple)
+            activeModeLabel.textColor = NSColor(calibratedWhite: 0.94, alpha: 1.0)
+            activeModeLabel.stringValue = "Selezione: \(timelineModel.name) (1V+1A) • Tasti 1/2/3 Priorità • M Marcatore"
         } else {
-            btnMontaggio.layer?.backgroundColor = activeBg
-            btnMontaggio.contentTintColor = NSColor.white
-            btnSelezione.layer?.backgroundColor = inactiveBg
-            btnSelezione.contentTintColor = NSColor(calibratedWhite: 0.65, alpha: 1.0)
+            activeModePill.layer?.backgroundColor = NSColor.systemCyan.withAlphaComponent(0.12).cgColor
+            activeModePill.layer?.borderColor = NSColor.systemCyan.withAlphaComponent(0.32).cgColor
+            activeModeIconView.image = Lucide.image(.clapperboard, size: 13, color: .systemCyan)
+            activeModeLabel.textColor = NSColor(calibratedWhite: 0.88, alpha: 1.0)
+            activeModeLabel.stringValue = "Timeline: \(timelineModel.name)"
         }
-    }
-
-    public func switchMode(to mode: EditorMode) {
-        currentMode = mode
-        updateNavBarStyles()
-
-        if mode == .selezione {
-            timelineVC.view.isHidden = true
-            selectionVC.view.isHidden = false
-            playerVC.switchPlaybackController(selectionVC.playbackController)
-            selectionVC.rebuildCurrentComposition()
-            DebugLogger.shared.log("Modalità SELEZIONE attiva (Reportage Dual-Strip).", level: .info)
-        } else {
-            selectionVC.view.isHidden = true
-            timelineVC.view.isHidden = false
-            playerVC.switchPlaybackController(self.playbackController)
-            rebuildComposition()
-            timelineVC.reloadTimelineUI()
-            DebugLogger.shared.log("Modalità MONTAGGIO attiva (Timeline multitraccia).", level: .info)
-        }
-    }
-
-    @objc private func onSelezioneTabClicked() {
-        switchMode(to: .selezione)
-    }
-
-    @objc private func onMontaggioTabClicked() {
-        switchMode(to: .montaggio)
     }
 
     private func moveSelectedClipVertically(id: UUID, isMovingUp: Bool) {
@@ -687,7 +644,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                     return
                 }
                 let targetTrack = isMovingUp ? (clip.trackIndex + 1) : (clip.trackIndex - 1)
-                if targetTrack >= 0 && targetTrack < timelineModel.maxTracks {
+                if targetTrack >= 0 && targetTrack < timelineModel.maxVideoTracks {
                     timelineModel.ensureVideoTrack(id: targetTrack)
                     guard !timelineModel.videoTracks[targetTrack].isLocked else {
                         DebugLogger.shared.log("Traccia di destinazione V\(targetTrack + 1) bloccata 🔒. Spostamento impedito.", level: .warning)
@@ -707,7 +664,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                     return
                 }
                 let targetTrack = isMovingUp ? (clip.trackIndex - 1) : (clip.trackIndex + 1)
-                if targetTrack >= 0 && targetTrack < timelineModel.maxTracks {
+                if targetTrack >= 0 && targetTrack < timelineModel.maxAudioTracks {
                     timelineModel.ensureAudioTrack(id: targetTrack)
                     guard !timelineModel.audioTracks[targetTrack].isLocked else {
                         DebugLogger.shared.log("Traccia di destinazione A\(targetTrack + 1) bloccata 🔒. Spostamento impedito.", level: .warning)
@@ -740,7 +697,20 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         self.mediaPoolVC.timelineModel = timeline
         self.playerVC.updateAspectRatio(formatSize: timeline.format.size)
         self.mediaPoolVC.refreshTimelineGrid()
+        self.updateActiveTimelinePill()
         self.rebuildComposition()
+    }
+
+    public func didImportTimelinesFromXML(_ timelines: [TimelineModel]) {
+        guard !timelines.isEmpty else { return }
+        EditorProject.shared.timelines.append(contentsOf: timelines)
+        let firstIdx = EditorProject.shared.timelines.count - timelines.count
+        EditorProject.shared.activeTimelineIndex = firstIdx
+        let firstTL = EditorProject.shared.timelines[firstIdx]
+        mediaPoolVC.refreshMediaPoolDisplay()
+        didSwitchActiveTimeline(to: firstTL)
+        HistoryManager.shared.record(title: "Importa XML", project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
+        ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
     }
 
     public func didSelectAddClipToTimeline(_ item: MediaItem) {
@@ -780,6 +750,94 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         }
         HistoryManager.shared.record(title: "Impostazioni Timeline", project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
         updateHistoryNavButtons()
+    }
+
+    public func didRequestExportTimelineToFCPXML(_ timeline: TimelineModel) {
+        exportTimelineToFCPXML(timeline)
+    }
+
+    public func exportActiveTimelineToFCPXML() {
+        exportTimelineToFCPXML(timelineModel)
+    }
+
+    public func exportTimelineToFCPXML(_ timeline: TimelineModel) {
+        let savePanel = NSSavePanel()
+        savePanel.title = "Esporta Final Cut Pro XML"
+        savePanel.prompt = "Esporta"
+        savePanel.canCreateDirectories = true
+        savePanel.allowsOtherFileTypes = true
+        let safeBaseName = timeline.name
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        savePanel.nameFieldStringValue = "\(safeBaseName).fcpxmld"
+
+        // Custom minimal format picker accessory using VisionDropdownButton
+        let accView = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 38))
+        let fmtLabel = NSTextField(labelWithString: "Formato:")
+        fmtLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        fmtLabel.translatesAutoresizingMaskIntoConstraints = false
+        let fmtDropdown = VisionDropdownButton()
+        fmtDropdown.translatesAutoresizingMaskIntoConstraints = false
+        fmtDropdown.addItem(withTitle: "Bundle .fcpxmld (Final Cut Pro / Resolve)")
+        fmtDropdown.addItem(withTitle: "File XML singolo (.fcpxml)")
+        fmtDropdown.selectItem(at: 0)
+        fmtDropdown.onSelectionChanged = { [weak savePanel] idx, _ in
+            guard let savePanel = savePanel else { return }
+            let cur = (savePanel.nameFieldStringValue as NSString).deletingPathExtension
+            let cleanBase = cur.isEmpty ? safeBaseName : cur
+            savePanel.nameFieldStringValue = idx == 0 ? "\(cleanBase).fcpxmld" : "\(cleanBase).fcpxml"
+        }
+        accView.addSubview(fmtLabel)
+        accView.addSubview(fmtDropdown)
+        NSLayoutConstraint.activate([
+            fmtLabel.leadingAnchor.constraint(equalTo: accView.leadingAnchor, constant: 12),
+            fmtLabel.centerYAnchor.constraint(equalTo: accView.centerYAnchor),
+            fmtDropdown.leadingAnchor.constraint(equalTo: fmtLabel.trailingAnchor, constant: 10),
+            fmtDropdown.trailingAnchor.constraint(equalTo: accView.trailingAnchor, constant: -12),
+            fmtDropdown.centerYAnchor.constraint(equalTo: accView.centerYAnchor)
+        ])
+        savePanel.accessoryView = accView
+
+        let runSave: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
+            guard resp == .OK, var targetURL = savePanel.url else { return }
+            let isSingleXML = (fmtDropdown.selectedIndex == 1)
+            let ext = targetURL.pathExtension.lowercased()
+            if isSingleXML && ext != "fcpxml" && ext != "xml" {
+                targetURL = targetURL.deletingPathExtension().appendingPathExtension("fcpxml")
+            } else if !isSingleXML && ext != "fcpxmld" {
+                targetURL = targetURL.deletingPathExtension().appendingPathExtension("fcpxmld")
+            }
+
+            do {
+                let exportedURL = try FCPXMLExporter.exportTimeline(
+                    timeline,
+                    to: targetURL,
+                    eventName: EditorProject.shared.projectName
+                )
+                let alert = NSAlert()
+                alert.messageText = "Esportazione completata"
+                alert.informativeText = "Timeline '\(timeline.name)' esportata nel formato Final Cut Pro XML in:\n\(exportedURL.path)"
+                alert.addButton(withTitle: "Mostra nel Finder")
+                alert.addButton(withTitle: "OK")
+                let alertResp = alert.runModal()
+                if alertResp == .alertFirstButtonReturn {
+                    NSWorkspace.shared.activateFileViewerSelecting([exportedURL])
+                }
+            } catch {
+                let errAlert = NSAlert()
+                errAlert.alertStyle = .warning
+                errAlert.messageText = "Errore durante l'esportazione FCPXML"
+                errAlert.informativeText = error.localizedDescription
+                errAlert.runModal()
+                let _ = self
+            }
+        }
+
+        if let win = view.window {
+            savePanel.beginSheetModal(for: win, completionHandler: runSave)
+        } else {
+            runSave(savePanel.runModal())
+        }
     }
 
     private func rebuildComposition() {
@@ -938,12 +996,8 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         self.mediaPoolVC.updateFolderPopUp()
         self.mediaPoolVC.refreshTimelineGrid()
         self.playerVC.updateAspectRatio(formatSize: self.timelineModel.format.size)
-        self.selectionVC.currentSelection = EditorProject.shared.activeSelection
-        self.selectionVC.updateHeaderUI()
+        self.updateActiveTimelinePill()
         self.rebuildComposition()
-        if self.currentMode == .selezione {
-            self.selectionVC.rebuildCurrentComposition()
-        }
         self.view.window?.title = "Vision — \(EditorProject.shared.projectName)"
         updateHistoryNavButtons()
         ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)

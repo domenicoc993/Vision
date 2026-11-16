@@ -17,6 +17,8 @@ public protocol MediaPoolDelegate: AnyObject {
     func didSwitchActiveTimeline(to timeline: TimelineModel)
     func didDeleteMediaItemFromPool(_ item: MediaItem)
     func didUpdateTimelineFormat(_ timeline: TimelineModel)
+    func didImportTimelinesFromXML(_ timelines: [TimelineModel])
+    func didRequestExportTimelineToFCPXML(_ timeline: TimelineModel)
 }
 
 public let kMediaItemPasteboardType = NSPasteboard.PasteboardType("com.vision.mediaitem.id")
@@ -28,7 +30,7 @@ final class DragDropContainerView: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        registerForDraggedTypes([.fileURL])
+        registerForDraggedTypes([.fileURL, .URL, NSPasteboard.PasteboardType("NSFilenamesPboardType")])
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -39,24 +41,23 @@ final class DragDropContainerView: NSView {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        let pboard = sender.draggingPasteboard
-        if let types = pboard.types, types.contains(.fileURL) {
+        let urls = MediaPoolViewController.extractFileURLs(from: sender.draggingPasteboard)
+        if !urls.isEmpty || sender.draggingPasteboard.types?.contains(.fileURL) == true {
             return .copy
         }
         return []
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] else {
-            return false
-        }
+        let urls = MediaPoolViewController.extractFileURLs(from: sender.draggingPasteboard)
+        guard !urls.isEmpty else { return false }
         onURLsDropped?(urls)
         return true
     }
 }
 
 final class ContextMenuTableView: NSTableView {
-    var menuForEvent: ((NSEvent, Int) -> NSMenu?)?
+    var onRightClick: ((NSEvent, Int) -> Void)?
     var onMouseDown: (() -> Void)?
 
     override func mouseDown(with event: NSEvent) {
@@ -64,7 +65,7 @@ final class ContextMenuTableView: NSTableView {
         super.mouseDown(with: event)
     }
 
-    override func menu(for event: NSEvent) -> NSMenu? {
+    override func rightMouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         let row = self.row(at: point)
         if row >= 0 {
@@ -72,13 +73,16 @@ final class ContextMenuTableView: NSTableView {
                 selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             }
         }
-        return menuForEvent?(event, row) ?? super.menu(for: event)
+        onRightClick?(event, row)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        nil
     }
 }
 
 public enum MediaPoolListItem {
     case timeline(TimelineModel, index: Int)
-    case selection(SelectionModel, index: Int)
     case media(MediaItem)
     case folder(MediaFolder)
 }
@@ -114,9 +118,6 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             for (idx, tl) in EditorProject.shared.timelines.enumerated() {
                 items.append(.timeline(tl, index: idx))
             }
-            for (idx, sel) in EditorProject.shared.selections.enumerated() {
-                items.append(.selection(sel, index: idx))
-            }
         }
         for m in displayedMediaItems {
             items.append(.media(m))
@@ -128,8 +129,6 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         }
         return items
     }
-
-    public var onOpenSelectionInSelectionMode: ((SelectionModel) -> Void)?
 
     public var selectedMediaItems: [MediaItem] {
         let selectedRows = contentTableView.selectedRowIndexes
@@ -189,13 +188,76 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     private let timelineGridContainer = NSView()
     public let timelineGridView = TimelineGridView()
     private let timelineGridScrollView = NSScrollView()
-    private let trackPopUp = NSPopUpButton()
+    private let trackPopUp = VisionDropdownButton()
     private let gridInfoLabel = NSTextField(labelWithString: "")
 
-    private let supportedExtensions: Set<String> = [
-        "mov", "mp4", "m4v", "mkv", "avi", "mts", "m2ts", "prores",
-        "wav", "mp3", "m4a", "aac", "flac", "aiff", "aif", "caf"
+    private static let audioExtensions: Set<String> = [
+        "wav", "mp3", "m4a", "m4b", "m4r", "aac", "alac", "flac", "aiff", "aif", "aifc", "caf",
+        "ac3", "eac3", "opus", "ogg", "oga", "mp2", "mpa", "au", "snd", "wma"
     ]
+
+    private static let videoExtensions: Set<String> = [
+        "mov", "mp4", "m4v", "mkv", "avi", "mts", "m2ts", "prores", "webm", "3gp", "3g2", "mpg", "mpeg"
+    ]
+
+    public static let supportedMediaExtensions: Set<String> = audioExtensions.union(videoExtensions)
+
+    public static func isSupportedMediaURL(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        if supportedMediaExtensions.contains(ext) {
+            return true
+        }
+        if !ext.isEmpty, let ut = UTType(filenameExtension: ext) {
+            return ut.conforms(to: .audiovisualContent) || ut.conforms(to: .audio) || ut.conforms(to: .movie) || ut.conforms(to: .video)
+        }
+        return false
+    }
+
+    public static func isAudioOnlyURL(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        if audioExtensions.contains(ext) {
+            return true
+        }
+        if !ext.isEmpty, let ut = UTType(filenameExtension: ext) {
+            return ut.conforms(to: .audio) && !ut.conforms(to: .movie) && !ut.conforms(to: .video)
+        }
+        return false
+    }
+
+    public static func extractFileURLs(from pboard: NSPasteboard) -> [URL] {
+        var urls: [URL] = []
+        var seenPaths: Set<String> = []
+        func appendURL(_ url: URL?) {
+            guard let url = url else { return }
+            let path = url.standardizedFileURL.path
+            guard !path.isEmpty, seenPaths.insert(path).inserted else { return }
+            urls.append(url)
+        }
+
+        if let objs = pboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+            for u in objs { appendURL(u) }
+        }
+        if urls.isEmpty, let objs = pboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
+            for u in objs where u.isFileURL { appendURL(u) }
+        }
+        if let legacyPaths = pboard.propertyList(forType: NSPasteboard.PasteboardType("NSFilenamesPboardType")) as? [String] {
+            for p in legacyPaths { appendURL(URL(fileURLWithPath: p)) }
+        }
+        if let pbItems = pboard.pasteboardItems {
+            for item in pbItems {
+                if let str = item.string(forType: .fileURL) ?? item.string(forType: .URL) {
+                    if str.hasPrefix("file://") {
+                        appendURL(URL(string: str))
+                    } else if str.hasPrefix("/") {
+                        appendURL(URL(fileURLWithPath: str))
+                    }
+                }
+            }
+        }
+        return urls
+    }
+
+    private var supportedExtensions: Set<String> { Self.supportedMediaExtensions }
 
     public override func loadView() {
         let dropContainer = DragDropContainerView()
@@ -406,14 +468,14 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         sidebarTableView.target = self
         sidebarTableView.backgroundColor = .clear
         sidebarTableView.selectionHighlightStyle = .regular
-        sidebarTableView.registerForDraggedTypes([kMediaItemPasteboardType, .fileURL])
+        sidebarTableView.registerForDraggedTypes([kMediaItemPasteboardType, .fileURL, .URL, NSPasteboard.PasteboardType("NSFilenamesPboardType")])
         sidebarTableView.setDraggingSourceOperationMask([.copy, .move, .generic], forLocal: true)
         sidebarTableView.setDraggingSourceOperationMask([.copy, .move, .generic], forLocal: false)
         sidebarTableView.onMouseDown = { [weak self] in
             self?.delegate?.didActivateSection(.mediaPool)
         }
-        sidebarTableView.menuForEvent = { [weak self] event, row in
-            self?.buildSidebarContextMenu(forRow: row)
+        sidebarTableView.onRightClick = { [weak self] event, row in
+            self?.showSidebarContextMenu(forRow: row, event: event)
         }
 
         NSLayoutConstraint.activate([
@@ -460,15 +522,15 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         contentTableView.usesAlternatingRowBackgroundColors = false
         contentTableView.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0)
         contentTableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
-        contentTableView.registerForDraggedTypes([kMediaItemPasteboardType, .fileURL])
+        contentTableView.registerForDraggedTypes([kMediaItemPasteboardType, .fileURL, .URL, NSPasteboard.PasteboardType("NSFilenamesPboardType")])
         contentTableView.setDraggingSourceOperationMask([.copy, .move, .generic], forLocal: true)
         contentTableView.setDraggingSourceOperationMask([.copy, .move, .generic], forLocal: false)
         contentTableView.allowsMultipleSelection = true
         contentTableView.onMouseDown = { [weak self] in
             self?.delegate?.didActivateSection(.mediaPool)
         }
-        contentTableView.menuForEvent = { [weak self] event, row in
-            self?.buildContentContextMenu(forRow: row)
+        contentTableView.onRightClick = { [weak self] event, row in
+            self?.showContentContextMenu(forRow: row, event: event)
         }
 
         // Grid View Setup
@@ -527,8 +589,11 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         gridView.onURLsDropped = { [weak self] urls in
             self?.processDroppedURLs(urls)
         }
+        gridView.onDropURLsIntoFolder = { [weak self] urls, folderId in
+            self?.processDroppedURLs(urls, targetFolderId: folderId)
+        }
         gridView.onContextMenuRequested = { [weak self] event in
-            self?.buildGeneralContextMenu()
+            self?.showGeneralContextMenu(event: event)
         }
         gridView.onOpenTimeline = { [weak self] tl, idx in
             self?.delegate?.didActivateSection(.mediaPool)
@@ -539,24 +604,23 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         gridView.onRenameTimeline = { [weak self] idx in
             self?.showRenameTimelineDialog(timelineIndex: idx)
         }
+        gridView.onDuplicateTimeline = { [weak self] idx in
+            self?.duplicateTimeline(index: idx)
+        }
         gridView.onTimelineSettings = { [weak self] tl, _ in
             self?.showTimelineSettingsDialog(for: tl)
         }
+        gridView.onConvertToSelection = { [weak self] idx in
+            self?.convertTimelineToSelection(index: idx)
+        }
+        gridView.onConvertToTimeline = { [weak self] idx in
+            self?.convertSelectionToTimeline(index: idx)
+        }
+        gridView.onExportTimeline = { [weak self] tl, _ in
+            self?.delegate?.didRequestExportTimelineToFCPXML(tl)
+        }
         gridView.onDeleteTimeline = { [weak self] idx in
             self?.deleteTimeline(index: idx)
-        }
-        gridView.onOpenSelection = { [weak self] sel, _ in
-            self?.delegate?.didActivateSection(.mediaPool)
-            self?.onOpenSelectionInSelectionMode?(sel)
-        }
-        gridView.onRenameSelection = { [weak self] sel in
-            self?.showRenameSelectionDialog(for: sel)
-        }
-        gridView.onDuplicateSelection = { [weak self] sel in
-            self?.duplicateSelection(sel)
-        }
-        gridView.onDeleteSelection = { [weak self] sel in
-            self?.deleteSelection(sel)
         }
         gridView.onOpenFolder = { [weak self] f in
             self?.delegate?.didActivateSection(.mediaPool)
@@ -605,7 +669,6 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         subHeader.addSubview(trackLabel)
 
         trackPopUp.translatesAutoresizingMaskIntoConstraints = false
-        trackPopUp.bezelStyle = .rounded
         trackPopUp.target = self
         trackPopUp.action = #selector(onTrackPopUpChanged)
         subHeader.addSubview(trackPopUp)
@@ -746,9 +809,6 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 for (idx, tl) in EditorProject.shared.timelines.enumerated() {
                     items.append(.timeline(tl, index: idx))
                 }
-                for (idx, sel) in EditorProject.shared.selections.enumerated() {
-                    items.append(.selection(sel, index: idx))
-                }
             }
             for m in displayedMediaItems {
                 items.append(.media(m))
@@ -766,7 +826,6 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                     switch currentListItems[idx] {
                     case .media(let m): return m.id
                     case .timeline(let tl, _): return tl.id
-                    case .selection(let sel, _): return sel.id
                     case .folder(let f): return f.id
                     }
                 }
@@ -827,279 +886,177 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     }
 
     // MARK: - Context Menus (Menu Contestuale)
-    private func buildGeneralContextMenu() -> NSMenu {
-        let menu = NSMenu(title: "Menu Contestuale")
-        menu.addItem(NSMenuItem(title: "📁 Nuova cartella", action: #selector(contextNewFolder), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "🎞️ Nuova timeline", action: #selector(contextNewTimeline), keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "📥 Importa file...", action: #selector(contextImportFiles), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "📂 Importa cartella...", action: #selector(contextImportFolder), keyEquivalent: ""))
-        return menu
+    // MARK: - Context Menus (Custom Rounded VisionMenu + Lucide)
+    private func generalContextMenuItems() -> [VisionMenuItem] {
+        [
+            .action(title: "Nuova cartella", icon: .folder, iconColor: .systemOrange) { [weak self] in
+                self?.showNewFolderDialog()
+            },
+            .action(title: "Nuova timeline", icon: .clapperboard, iconColor: .systemCyan) { [weak self] in
+                self?.showNewTimelineDialog()
+            },
+            .action(title: "Nuova selezione (1V+1A)", icon: .sparkles, iconColor: .systemPurple) { [weak self] in
+                self?.showNewSelectionDialog()
+            },
+            .separator,
+            .action(title: "Importa file / XML...", icon: .download) { [weak self] in
+                self?.importFilesWithPanel()
+            },
+            .action(title: "Importa cartella...", icon: .folderInput) { [weak self] in
+                self?.importFolderWithPanel()
+            }
+        ]
     }
 
-    private func buildSidebarContextMenu(forRow row: Int) -> NSMenu? {
+    private func showGeneralContextMenu(event: NSEvent) {
+        VisionMenu(items: generalContextMenuItems()).show(for: event, in: self.view)
+    }
+
+    private func showSidebarContextMenu(forRow row: Int, event: NSEvent) {
+        var items: [VisionMenuItem]
         if row == 0 {
-            let menu = NSMenu(title: "Tutti i file")
-            menu.addItem(NSMenuItem(title: "📁 Nuova cartella", action: #selector(contextNewFolder), keyEquivalent: ""))
-            menu.addItem(NSMenuItem(title: "🎞️ Nuova timeline", action: #selector(contextNewTimeline), keyEquivalent: ""))
-            menu.addItem(NSMenuItem.separator())
-            menu.addItem(NSMenuItem(title: "📥 Importa file...", action: #selector(contextImportFiles), keyEquivalent: ""))
-            return menu
+            items = generalContextMenuItems()
         } else if row > 0 && row - 1 < EditorProject.shared.folders.count {
             let folder = EditorProject.shared.folders[row - 1]
-            let menu = NSMenu(title: folder.name)
-            let openItem = NSMenuItem(title: "📂 Apri cartella", action: #selector(contextOpenFolder(_:)), keyEquivalent: "")
-            openItem.representedObject = folder
-            menu.addItem(openItem)
-
-            let renameItem = NSMenuItem(title: "✏️ Rinomina cartella...", action: #selector(contextRenameFolder(_:)), keyEquivalent: "")
-            renameItem.representedObject = folder
-            menu.addItem(renameItem)
-
-            menu.addItem(NSMenuItem.separator())
-            let deleteItem = NSMenuItem(title: "🗑️ Elimina cartella", action: #selector(contextDeleteFolder(_:)), keyEquivalent: "")
-            deleteItem.representedObject = folder
-            menu.addItem(deleteItem)
-            return menu
+            items = [
+                .header(folder.name),
+                .action(title: "Apri cartella", icon: .folder, iconColor: .systemOrange) { [weak self] in
+                    EditorProject.shared.activeFolderId = folder.id
+                    self?.refreshMediaPoolDisplay()
+                },
+                .action(title: "Rinomina cartella...", icon: .pencil) { [weak self] in
+                    self?.showRenameFolderDialog(folder: folder)
+                },
+                .separator,
+                .action(title: "Elimina cartella", icon: .trash, isDestructive: true) { [weak self] in
+                    self?.deleteFolder(id: folder.id)
+                }
+            ]
+        } else {
+            items = generalContextMenuItems()
         }
-        return buildGeneralContextMenu()
+        VisionMenu(items: items).show(for: event, in: self.view)
     }
 
-    private func buildContentContextMenu(forRow row: Int) -> NSMenu? {
+    private func showContentContextMenu(forRow row: Int, event: NSEvent) {
         guard row >= 0 && row < currentListItems.count else {
-            return buildGeneralContextMenu()
+            showGeneralContextMenu(event: event)
+            return
         }
 
         let item = currentListItems[row]
+        var items: [VisionMenuItem] = []
+
         switch item {
         case .timeline(let timeline, let index):
-            let menu = NSMenu(title: timeline.name)
-            let openItem = NSMenuItem(title: "▶️ Apri timeline", action: #selector(contextOpenTimeline(_:)), keyEquivalent: "")
-            openItem.representedObject = index
-            menu.addItem(openItem)
-
-            let settingsItem = NSMenuItem(title: "⚙️ Impostazioni timeline...", action: #selector(contextTimelineSettings(_:)), keyEquivalent: "")
-            settingsItem.representedObject = timeline
-            menu.addItem(settingsItem)
-
-            let renameItem = NSMenuItem(title: "✏️ Rinomina timeline...", action: #selector(contextRenameTimeline(_:)), keyEquivalent: "")
-            renameItem.representedObject = index
-            menu.addItem(renameItem)
-
-            if EditorProject.shared.timelines.count > 1 {
-                menu.addItem(NSMenuItem.separator())
-                let delItem = NSMenuItem(title: "🗑️ Elimina timeline", action: #selector(contextDeleteTimeline(_:)), keyEquivalent: "")
-                delItem.representedObject = index
-                menu.addItem(delItem)
+            let kindTitle = timeline.isSelection ? "Selezione" : "Timeline"
+            items.append(.header(timeline.name))
+            items.append(.action(title: "Apri \(kindTitle)", icon: timeline.isSelection ? .sparkles : .play, iconColor: timeline.isSelection ? .systemPurple : .systemCyan) { [weak self] in
+                guard index < EditorProject.shared.timelines.count else { return }
+                EditorProject.shared.activeTimelineIndex = index
+                let tl = EditorProject.shared.timelines[index]
+                self?.delegate?.didSwitchActiveTimeline(to: tl)
+                self?.refreshMediaPoolDisplay()
+            })
+            items.append(.action(title: "Impostazioni timeline...", icon: .settings2) { [weak self] in
+                self?.showTimelineSettingsDialog(for: timeline)
+            })
+            items.append(.action(title: "Rinomina...", icon: .pencil) { [weak self] in
+                self?.showRenameTimelineDialog(timelineIndex: index)
+            })
+            items.append(.action(title: "Duplica", icon: .copy) { [weak self] in
+                self?.duplicateTimeline(index: index)
+            })
+            items.append(.action(title: "Esporta Final Cut XML (.fcpxmld)...", icon: .fileCode2, iconColor: .systemCyan) { [weak self] in
+                self?.delegate?.didRequestExportTimelineToFCPXML(timeline)
+            })
+            items.append(.separator)
+            if timeline.isSelection {
+                items.append(.action(title: "Converti in Timeline normale", icon: .arrowLeftRight, iconColor: .systemCyan) { [weak self] in
+                    self?.convertSelectionToTimeline(index: index)
+                })
+            } else {
+                let canConvert = timeline.canConvertToSelection.allowed
+                items.append(.action(
+                    title: canConvert ? "Converti in Selezione (1V+1A)" : "Converti in Selezione (solo V1/A1)",
+                    icon: .sparkles,
+                    iconColor: .systemPurple,
+                    isEnabled: canConvert
+                ) { [weak self] in
+                    self?.convertTimelineToSelection(index: index)
+                })
             }
-            return menu
-
-        case .selection(let sel, _):
-            let menu = NSMenu(title: sel.name)
-            let openItem = NSMenuItem(title: "✨ Apri in Modalità Selezione", action: #selector(contextOpenSelection(_:)), keyEquivalent: "")
-            openItem.representedObject = sel
-            menu.addItem(openItem)
-
-            let renameItem = NSMenuItem(title: "✏️ Rinomina selezione...", action: #selector(contextRenameSelection(_:)), keyEquivalent: "")
-            renameItem.representedObject = sel
-            menu.addItem(renameItem)
-
-            let dupItem = NSMenuItem(title: "📄 Duplica selezione", action: #selector(contextDuplicateSelection(_:)), keyEquivalent: "")
-            dupItem.representedObject = sel
-            menu.addItem(dupItem)
-
-            menu.addItem(NSMenuItem.separator())
-            let delItem = NSMenuItem(title: "🗑️ Elimina selezione", action: #selector(contextDeleteSelection(_:)), keyEquivalent: "")
-            delItem.representedObject = sel
-            menu.addItem(delItem)
-            return menu
+            if EditorProject.shared.timelines.count > 1 {
+                items.append(.separator)
+                items.append(.action(title: "Elimina", icon: .trash, isDestructive: true) { [weak self] in
+                    self?.deleteTimeline(index: index)
+                })
+            }
 
         case .folder(let folder):
-            let menu = NSMenu(title: folder.name)
-            let openItem = NSMenuItem(title: "📂 Apri cartella", action: #selector(contextOpenFolder(_:)), keyEquivalent: "")
-            openItem.representedObject = folder
-            menu.addItem(openItem)
-
-            let renameItem = NSMenuItem(title: "✏️ Rinomina cartella...", action: #selector(contextRenameFolder(_:)), keyEquivalent: "")
-            renameItem.representedObject = folder
-            menu.addItem(renameItem)
-
-            menu.addItem(NSMenuItem.separator())
-            let deleteItem = NSMenuItem(title: "🗑️ Elimina cartella", action: #selector(contextDeleteFolder(_:)), keyEquivalent: "")
-            deleteItem.representedObject = folder
-            menu.addItem(deleteItem)
-            return menu
+            items.append(.header(folder.name))
+            items.append(.action(title: "Apri cartella", icon: .folder, iconColor: .systemOrange) { [weak self] in
+                EditorProject.shared.activeFolderId = folder.id
+                self?.refreshMediaPoolDisplay()
+            })
+            items.append(.action(title: "Rinomina cartella...", icon: .pencil) { [weak self] in
+                self?.showRenameFolderDialog(folder: folder)
+            })
+            items.append(.separator)
+            items.append(.action(title: "Elimina cartella", icon: .trash, isDestructive: true) { [weak self] in
+                self?.deleteFolder(id: folder.id)
+            })
 
         case .media(let media):
-            let menu = NSMenu(title: media.name)
-            let addItem = NSMenuItem(title: "➕ Inserisci in timeline", action: #selector(contextInsertMediaToTimeline(_:)), keyEquivalent: "")
-            addItem.representedObject = media
-            menu.addItem(addItem)
-            menu.addItem(NSMenuItem.separator())
+            items.append(.header(media.name))
+            items.append(.action(title: "Inserisci in timeline", icon: .plus, iconColor: .systemCyan) { [weak self] in
+                self?.delegate?.didSelectAddClipToTimeline(media)
+            })
 
             if media.hasVideo {
-                let orientMenu = NSMenu(title: "Orientamento")
-                for orient in ClipOrientation.allCases {
-                    let oItem = NSMenuItem(title: orient.rawValue, action: #selector(contextSetClipOrientation(_:)), keyEquivalent: "")
-                    oItem.representedObject = (media, orient)
-                    if media.orientation == orient {
-                        oItem.state = .on
+                let orientChildren: [VisionMenuItem] = ClipOrientation.allCases.map { orient in
+                    .action(title: orient.rawValue, isSelected: media.orientation == orient) { [weak self] in
+                        if let idx = self?.mediaItems.firstIndex(where: { $0.id == media.id }) {
+                            self?.setClipOrientation(at: idx, orientation: orient)
+                        }
                     }
-                    orientMenu.addItem(oItem)
                 }
-                let orientParent = NSMenuItem(title: "🔄 Orientamento clip", action: nil, keyEquivalent: "")
-                orientParent.submenu = orientMenu
-                menu.addItem(orientParent)
+                items.append(.submenu(title: "Orientamento clip", icon: .rotateCw, items: orientChildren))
             }
 
-            let parentFolderItem = NSMenuItem(title: "📁 Sposta in cartella", action: nil, keyEquivalent: "")
-            let folderMenu = NSMenu(title: "Cartella")
-            let rootItem = NSMenuItem(title: "Principale (Nessuna)", action: #selector(contextMoveMediaToFolder(_:)), keyEquivalent: "")
-            rootItem.representedObject = (media, nil as UUID?)
-            folderMenu.addItem(rootItem)
+            var folderChildren: [VisionMenuItem] = [
+                .action(title: "Principale (Nessuna)", icon: .layers) { [weak self] in
+                    EditorProject.shared.moveItem(media.id, toFolder: nil)
+                    self?.refreshMediaPoolDisplay()
+                }
+            ]
             for f in EditorProject.shared.folders {
-                let fItem = NSMenuItem(title: f.name, action: #selector(contextMoveMediaToFolder(_:)), keyEquivalent: "")
-                fItem.representedObject = (media, f.id as UUID?)
-                folderMenu.addItem(fItem)
+                folderChildren.append(.action(title: f.name, icon: .folder, iconColor: .systemOrange) { [weak self] in
+                    EditorProject.shared.moveItem(media.id, toFolder: f.id)
+                    self?.refreshMediaPoolDisplay()
+                })
             }
-            parentFolderItem.submenu = folderMenu
-            menu.addItem(parentFolderItem)
+            items.append(.submenu(title: "Sposta in cartella", icon: .folderInput, items: folderChildren))
 
-            menu.addItem(NSMenuItem.separator())
-            let selItem = NSMenuItem(title: "🎯 Crea Nuova Selezione...", action: #selector(contextCreateSelectionFromSelected), keyEquivalent: "")
-            selItem.representedObject = media
-            menu.addItem(selItem)
-
-            let proxyItem = NSMenuItem(title: "⚡ Crea Proxy Video...", action: #selector(contextGenerateProxyForSelected), keyEquivalent: "")
-            proxyItem.representedObject = media
-            menu.addItem(proxyItem)
-
-            menu.addItem(NSMenuItem.separator())
-            let deleteItem = NSMenuItem(title: "🗑️ Elimina dal Media Pool", action: #selector(contextDeleteMediaFromPool(_:)), keyEquivalent: "")
-            deleteItem.representedObject = media
-            menu.addItem(deleteItem)
-            return menu
+            items.append(.separator)
+            items.append(.action(title: "Crea Nuova Selezione...", icon: .sparkles, iconColor: .systemPurple) { [weak self] in
+                self?.createSelectionFromMedia(fallback: media)
+            })
+            items.append(.action(title: "Crea Proxy Video...", icon: .zap, iconColor: .systemTeal) { [weak self] in
+                self?.generateProxyForMedia(fallback: media)
+            })
+            items.append(.separator)
+            items.append(.action(title: "Elimina dal Media Pool", icon: .trash, isDestructive: true) { [weak self] in
+                self?.deleteMediaItem(media)
+            })
         }
+
+        VisionMenu(items: items).show(for: event, in: self.view)
     }
 
-    // MARK: - Context Menu Action Handlers
-    @objc private func contextNewFolder() {
-        showNewFolderDialog()
-    }
-
-    @objc private func contextNewTimeline() {
-        showNewTimelineDialog()
-    }
-
-    @objc private func contextImportFiles() {
-        importFilesWithPanel()
-    }
-
-    @objc private func contextImportFolder() {
-        importFolderWithPanel()
-    }
-
-    @objc private func contextOpenTimeline(_ sender: NSMenuItem) {
-        if let idx = sender.representedObject as? Int, idx < EditorProject.shared.timelines.count {
-            EditorProject.shared.activeTimelineIndex = idx
-            let tl = EditorProject.shared.timelines[idx]
-            delegate?.didSwitchActiveTimeline(to: tl)
-            refreshMediaPoolDisplay()
-        }
-    }
-
-    @objc private func contextRenameTimeline(_ sender: NSMenuItem) {
-        if let idx = sender.representedObject as? Int {
-            showRenameTimelineDialog(timelineIndex: idx)
-        }
-    }
-
-    @objc private func contextTimelineSettings(_ sender: NSMenuItem) {
-        if let tl = sender.representedObject as? TimelineModel {
-            showTimelineSettingsDialog(for: tl)
-        }
-    }
-
-    @objc private func contextDeleteTimeline(_ sender: NSMenuItem) {
-        if let idx = sender.representedObject as? Int {
-            deleteTimeline(index: idx)
-        }
-    }
-
-    @objc private func contextOpenSelection(_ sender: NSMenuItem) {
-        if let sel = sender.representedObject as? SelectionModel {
-            openSelection(sel)
-        }
-    }
-
-    @objc private func contextRenameSelection(_ sender: NSMenuItem) {
-        if let sel = sender.representedObject as? SelectionModel {
-            showRenameSelectionDialog(for: sel)
-        }
-    }
-
-    @objc private func contextDuplicateSelection(_ sender: NSMenuItem) {
-        if let sel = sender.representedObject as? SelectionModel {
-            duplicateSelection(sel)
-        }
-    }
-
-    @objc private func contextDeleteSelection(_ sender: NSMenuItem) {
-        if let sel = sender.representedObject as? SelectionModel {
-            deleteSelection(sel)
-        }
-    }
-
-    @objc private func contextOpenFolder(_ sender: NSMenuItem) {
-        if let folder = sender.representedObject as? MediaFolder {
-            EditorProject.shared.activeFolderId = folder.id
-            refreshMediaPoolDisplay()
-        }
-    }
-
-    @objc private func contextRenameFolder(_ sender: NSMenuItem) {
-        if let folder = sender.representedObject as? MediaFolder {
-            showRenameFolderDialog(folder: folder)
-        }
-    }
-
-    @objc private func contextDeleteFolder(_ sender: NSMenuItem) {
-        if let folder = sender.representedObject as? MediaFolder {
-            deleteFolder(id: folder.id)
-        }
-    }
-
-    @objc private func contextInsertMediaToTimeline(_ sender: NSMenuItem) {
-        if let media = sender.representedObject as? MediaItem {
-            delegate?.didSelectAddClipToTimeline(media)
-        }
-    }
-
-    @objc private func contextSetClipOrientation(_ sender: NSMenuItem) {
-        if let tuple = sender.representedObject as? (MediaItem, ClipOrientation) {
-            if let idx = mediaItems.firstIndex(where: { $0.id == tuple.0.id }) {
-                setClipOrientation(at: idx, orientation: tuple.1)
-            }
-        }
-    }
-
-    @objc private func contextMoveMediaToFolder(_ sender: NSMenuItem) {
-        if let tuple = sender.representedObject as? (MediaItem, UUID?) {
-            EditorProject.shared.moveItem(tuple.0.id, toFolder: tuple.1)
-            refreshMediaPoolDisplay()
-            DebugLogger.shared.log("Clip spostata nella cartella", level: .info)
-        }
-    }
-
-    @objc private func contextDeleteMediaFromPool(_ sender: NSMenuItem) {
-        if let media = sender.representedObject as? MediaItem {
-            deleteMediaItem(media)
-        }
-    }
-
-    @objc private func contextCreateSelectionFromSelected(_ sender: NSMenuItem) {
+    private func createSelectionFromMedia(fallback: MediaItem? = nil) {
         var chosen = selectedMediaItems
-        if chosen.isEmpty, let m = sender.representedObject as? MediaItem {
+        if chosen.isEmpty, let m = fallback {
             chosen = [m]
         }
         let clipsToUse = chosen.isEmpty ? mediaItems : chosen
@@ -1110,7 +1067,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         alert.informativeText = "Inserisci un nome per la selezione di \(clipsToUse.count) clip:"
         alert.alertStyle = .informational
         let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        input.stringValue = "Selezione \(EditorProject.shared.selections.count + 1)"
+        input.stringValue = "Selezione \(EditorProject.shared.selectionTimelines.count + 1)"
         alert.accessoryView = input
         alert.addButton(withTitle: "Crea")
         alert.addButton(withTitle: "Annulla")
@@ -1119,14 +1076,14 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let newSel = EditorProject.shared.createSelection(name: name.isEmpty ? "Selezione" : name, clips: clipsToUse)
             refreshMediaPoolDisplay()
-            onOpenSelectionInSelectionMode?(newSel)
+            delegate?.didSwitchActiveTimeline(to: newSel)
             DebugLogger.shared.log("Creata selezione '\(newSel.name)' con \(clipsToUse.count) clip dal Media Pool.", level: .info)
         }
     }
 
-    @objc private func contextGenerateProxyForSelected(_ sender: NSMenuItem) {
+    private func generateProxyForMedia(fallback: MediaItem? = nil) {
         var chosen = selectedMediaItems
-        if chosen.isEmpty, let m = sender.representedObject as? MediaItem {
+        if chosen.isEmpty, let m = fallback {
             chosen = [m]
         }
         let clipsToUse = chosen.isEmpty ? mediaItems : chosen
@@ -1246,6 +1203,64 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         }
     }
 
+    private func showNewSelectionDialog() {
+        delegate?.didActivateSection(.mediaPool)
+        let alert = NSAlert()
+        alert.messageText = "Nuova Selezione"
+        alert.informativeText = "Crea una timeline Selezione (max 1 traccia Video V1 e 1 traccia Audio A1):"
+        alert.alertStyle = .informational
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        input.stringValue = "Selezione \(EditorProject.shared.selectionTimelines.count + 1)"
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Crea")
+        alert.addButton(withTitle: "Annulla")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let newSelection = EditorProject.shared.addTimeline(name: name.isEmpty ? nil : name, isSelection: true)
+            refreshMediaPoolDisplay()
+            delegate?.didSwitchActiveTimeline(to: newSelection)
+            DebugLogger.shared.log("Creata nuova selezione: '\(newSelection.name)'", level: .info)
+        }
+    }
+
+    private func duplicateTimeline(index: Int) {
+        guard let copy = EditorProject.shared.duplicateTimeline(index: index) else { return }
+        refreshMediaPoolDisplay()
+        delegate?.didSwitchActiveTimeline(to: copy)
+        DebugLogger.shared.log("Duplicata timeline '\(copy.name)'", level: .info)
+    }
+
+    private func convertTimelineToSelection(index: Int) {
+        guard index >= 0 && index < EditorProject.shared.timelines.count else { return }
+        let tl = EditorProject.shared.timelines[index]
+        guard tl.convertToSelection() else {
+            let alert = NSAlert()
+            alert.messageText = "Conversione non disponibile"
+            alert.informativeText = "La timeline '\(tl.name)' contiene clip su più tracce (V2+, A2+ o tracce secondarie). Per convertirla in Selezione deve avere clip solo su V1 e A1."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+        refreshMediaPoolDisplay()
+        if EditorProject.shared.activeTimeline.id == tl.id {
+            delegate?.didSwitchActiveTimeline(to: tl)
+        }
+        DebugLogger.shared.log("Timeline '\(tl.name)' convertita in Selezione (1V+1A).", level: .info)
+    }
+
+    private func convertSelectionToTimeline(index: Int) {
+        guard index >= 0 && index < EditorProject.shared.timelines.count else { return }
+        let tl = EditorProject.shared.timelines[index]
+        tl.convertToTimeline()
+        refreshMediaPoolDisplay()
+        if EditorProject.shared.activeTimeline.id == tl.id {
+            delegate?.didSwitchActiveTimeline(to: tl)
+        }
+        DebugLogger.shared.log("Selezione '\(tl.name)' convertita in Timeline normale.", level: .info)
+    }
+
     private func deleteTimeline(index: Int) {
         guard EditorProject.shared.timelines.count > 1 else { return }
         EditorProject.shared.removeTimeline(index: index)
@@ -1261,44 +1276,6 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             refreshMediaPoolDisplay()
             DebugLogger.shared.log("Impostazioni timeline '\(timeline.name)' aggiornate: \(updatedFormat.name) (\(updatedFormat.fps) fps)", level: .info)
         }
-    }
-
-    private func openSelection(_ selection: SelectionModel) {
-        delegate?.didActivateSection(.mediaPool)
-        if let idx = EditorProject.shared.selections.firstIndex(where: { $0.id == selection.id }) {
-            EditorProject.shared.activeSelectionIndex = idx
-        }
-        onOpenSelectionInSelectionMode?(selection)
-    }
-
-    private func showRenameSelectionDialog(for selection: SelectionModel) {
-        let alert = NSAlert()
-        alert.messageText = "Rinomina Selezione"
-        alert.informativeText = "Inserisci il nuovo nome per la selezione:"
-        alert.alertStyle = .informational
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        input.stringValue = selection.name
-        alert.accessoryView = input
-        alert.addButton(withTitle: "Rinomina")
-        alert.addButton(withTitle: "Annulla")
-
-        if alert.runModal() == .alertFirstButtonReturn {
-            let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !name.isEmpty {
-                selection.name = name
-                refreshMediaPoolDisplay()
-            }
-        }
-    }
-
-    private func duplicateSelection(_ selection: SelectionModel) {
-        _ = EditorProject.shared.duplicateSelection(id: selection.id)
-        refreshMediaPoolDisplay()
-    }
-
-    private func deleteSelection(_ selection: SelectionModel) {
-        EditorProject.shared.removeSelection(id: selection.id)
-        refreshMediaPoolDisplay()
     }
 
     private func showRenameProjectDialog() {
@@ -1339,10 +1316,15 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         panel.allowsMultipleSelection = true
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
-        panel.allowedContentTypes = [
+        panel.treatsFilePackagesAsDirectories = false
+        var types: [UTType] = [
             UTType.movie, UTType.video, UTType.quickTimeMovie, UTType.mpeg4Movie,
-            UTType.audio, UTType.mp3, UTType.wav, UTType.aiff, UTType.mpeg4Audio
+            UTType.audio, UTType.mp3, UTType.wav, UTType.aiff, UTType.mpeg4Audio,
+            UTType.xml
         ]
+        if let fcpxml = UTType(filenameExtension: "fcpxml") { types.append(fcpxml) }
+        if let fcpxmld = UTType(filenameExtension: "fcpxmld") { types.append(fcpxmld) }
+        panel.allowedContentTypes = types
         if panel.runModal() == .OK {
             processDroppedURLs(panel.urls)
         }
@@ -1366,11 +1348,18 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         delegate?.didChangeMediaOrientation(mediaItems[row])
     }
 
-    public func processDroppedURLs(_ urls: [URL]) {
+    public func processDroppedURLs(_ urls: [URL], targetFolderId: UUID? = nil) {
         var itemsToAdd: [URL] = []
         let fileManager = FileManager.default
+        let resolvedFolderId = targetFolderId ?? EditorProject.shared.activeFolderId
 
         for url in urls {
+            // FCPXML / .fcpxmld bundles appear as directories to FileManager, so check XML first
+            if FCPXMLImporter.isSupportedXMLURL(url) {
+                importFCPXML(url: url)
+                continue
+            }
+
             var isDir: ObjCBool = false
             if fileManager.fileExists(atPath: url.path, isDirectory: &isDir) {
                 if isDir.boolValue {
@@ -1392,7 +1381,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                         for itemURL in contents {
                             var itemIsDir: ObjCBool = false
                             if fileManager.fileExists(atPath: itemURL.path, isDirectory: &itemIsDir), !itemIsDir.boolValue {
-                                if supportedExtensions.contains(itemURL.pathExtension.lowercased()) {
+                                if Self.isSupportedMediaURL(itemURL) {
                                     folderMediaURLs.append(itemURL)
                                 }
                             }
@@ -1401,8 +1390,10 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                         importURLs(folderMediaURLs, targetFolderId: targetFolder.id)
                     } catch {}
                 } else {
-                    if supportedExtensions.contains(url.pathExtension.lowercased()) {
+                    if Self.isSupportedMediaURL(url) {
                         itemsToAdd.append(url)
+                    } else {
+                        DebugLogger.shared.log("Formato non supportato per '\(url.lastPathComponent)' (estensione .\(url.pathExtension)).", level: .warning)
                     }
                 }
             }
@@ -1410,49 +1401,120 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
 
         if !itemsToAdd.isEmpty {
             itemsToAdd.sort(by: { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending })
-            importURLs(itemsToAdd, targetFolderId: EditorProject.shared.activeFolderId)
+            importURLs(itemsToAdd, targetFolderId: resolvedFolderId)
         }
     }
 
-    private func importURLs(_ urls: [URL], targetFolderId: UUID? = nil) {
-        guard !urls.isEmpty else { return }
+    public func importFCPXML(url: URL) {
+        let snapshotMedia = self.mediaItems
+        let snapshotFolders = EditorProject.shared.folders
         Task {
+            do {
+                let result = try await FCPXMLImporter.importFromURL(
+                    url,
+                    existingMedia: snapshotMedia,
+                    existingFolders: snapshotFolders
+                )
+                await MainActor.run {
+                    if !result.newlyImportedMedia.isEmpty {
+                        self.mediaItems.append(contentsOf: result.newlyImportedMedia)
+                        for m in result.newlyImportedMedia {
+                            AudioWaveformCache.shared.loadWaveform(for: m)
+                        }
+                    }
+
+                    if let folder = result.createdFolder,
+                       !EditorProject.shared.folders.contains(where: { $0.id == folder.id }) {
+                        EditorProject.shared.folders.append(folder)
+                        for itemId in result.folderItemIds {
+                            EditorProject.shared.moveItem(itemId, toFolder: folder.id)
+                        }
+                    }
+
+                    if !result.importedTimelines.isEmpty {
+                        self.delegate?.didImportTimelinesFromXML(result.importedTimelines)
+                    } else {
+                        self.refreshMediaPoolDisplay()
+                    }
+
+                    DebugLogger.shared.log(
+                        "Importato XML '\(url.lastPathComponent)': \(result.newMediaCount) nuove clip, \(result.relinkedCount) ricollegate, \(result.missingCount) offline, \(result.importedTimelines.count) selezioni/timeline.",
+                        level: .info
+                    )
+                }
+            } catch {
+                await MainActor.run {
+                    let alert = NSAlert()
+                    alert.messageText = "Errore Importazione XML"
+                    alert.informativeText = "Impossibile importare '\(url.lastPathComponent)': \(error.localizedDescription)"
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
+    private func importURLs(_ urls: [URL], targetFolderId: UUID? = nil, completion: (([MediaItem]) -> Void)? = nil) {
+        guard !urls.isEmpty else {
+            completion?([])
+            return
+        }
+        Task {
+            var loadedOrExisting: [MediaItem] = []
             for url in urls {
+                let stdPath = url.standardizedFileURL.path
+                if let existing = await MainActor.run(body: {
+                    self.mediaItems.first(where: { $0.url.standardizedFileURL.path == stdPath })
+                }) {
+                    loadedOrExisting.append(existing)
+                    continue
+                }
                 do {
                     await CompositionEngine.shared.preloadMetadata(for: url)
                     let item = try await MediaItem.load(from: url)
-                    await MainActor.run {
-                        if !self.mediaItems.contains(where: { $0.url == item.url }) {
+                    let resolved: MediaItem = await MainActor.run {
+                        if let existing = self.mediaItems.first(where: { $0.url.standardizedFileURL.path == stdPath }) {
+                            return existing
+                        } else {
                             self.mediaItems.append(item)
                             AudioWaveformCache.shared.loadWaveform(for: item)
                             if let fId = targetFolderId {
                                 EditorProject.shared.moveItem(item.id, toFolder: fId)
                             }
                             self.refreshMediaPoolDisplay()
+                            return item
                         }
                     }
+                    loadedOrExisting.append(resolved)
                 } catch {
-                    DebugLogger.shared.log("Errore caricamento '\(url.lastPathComponent)': \(error)", level: .error)
+                    DebugLogger.shared.log("Errore caricamento '\(url.lastPathComponent)': \(error.localizedDescription)", level: .error)
                 }
             }
+            let finalItems = loadedOrExisting
+            await MainActor.run {
+                completion?(finalItems)
+            }
         }
+    }
+
+    public func importURLsForTimelineDrop(_ urls: [URL], completion: @escaping ([MediaItem]) -> Void) {
+        let supported = urls.filter { Self.isSupportedMediaURL($0) }
+        importURLs(supported, targetFolderId: EditorProject.shared.activeFolderId, completion: completion)
     }
 
     // MARK: - Timeline Grid Tab Logic
     private func updateTrackPopUp() {
         guard let model = timelineModel else { return }
-        trackPopUp.removeAllItems()
-        for track in model.videoTracks {
-            trackPopUp.addItem(withTitle: track.name)
-        }
-        if trackPopUp.numberOfItems > timelineGridView.selectedTrackIndex {
+        trackPopUp.setItems(model.videoTracks.map { $0.name })
+        if model.videoTracks.count > timelineGridView.selectedTrackIndex {
             trackPopUp.selectItem(at: timelineGridView.selectedTrackIndex)
         }
         updateTimelineGridInfo()
     }
 
     @objc private func onTrackPopUpChanged() {
-        let idx = trackPopUp.indexOfSelectedItem
+        let idx = trackPopUp.selectedIndex
         if idx >= 0 {
             timelineGridView.selectedTrackIndex = idx
             updateTimelineGridInfo()
@@ -1508,7 +1570,6 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                     switch currentListItems[idx] {
                     case .media(let m): return m.id
                     case .timeline(let tl, _): return tl.id
-                    case .selection(let sel, _): return sel.id
                     case .folder(let f): return f.id
                     }
                 }
@@ -1528,9 +1589,9 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             pbItem.setString(m.url.absoluteString, forType: .fileURL)
             pbItem.setString(m.url.path, forType: .string)
             return pbItem
-        case .selection(let sel, _):
+        case .timeline(let tl, _) where tl.isSelection:
             let pbItem = NSPasteboardItem()
-            pbItem.setString(sel.id.uuidString, forType: kSelectionPasteboardType)
+            pbItem.setString(tl.id.uuidString, forType: kSelectionPasteboardType)
             return pbItem
         default:
             return nil
@@ -1578,7 +1639,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 refreshMediaPoolDisplay()
                 return true
             } else if !fileURLs.isEmpty {
-                processDroppedURLs(fileURLs)
+                processDroppedURLs(fileURLs, targetFolderId: targetFolderId)
                 return true
             }
         } else if tableView == contentTableView {
@@ -1593,7 +1654,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 refreshMediaPoolDisplay()
                 return true
             } else if !fileURLs.isEmpty {
-                processDroppedURLs(fileURLs)
+                processDroppedURLs(fileURLs, targetFolderId: targetFolderId)
                 return true
             }
         }
@@ -1613,33 +1674,11 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             }
         }
 
-        if let fileObjects = pboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
-            for u in fileObjects {
-                if let m = mediaItems.first(where: { $0.url.path == u.path }) {
-                    if !ids.contains(m.id) { ids.append(m.id) }
-                } else {
-                    if !urls.contains(u) { urls.append(u) }
-                }
-            }
-        }
-
-        if ids.isEmpty && urls.isEmpty, let pbItems = pboard.pasteboardItems {
-            for item in pbItems {
-                if let path = item.string(forType: .fileURL) {
-                    let u: URL?
-                    if path.hasPrefix("file://") {
-                        u = URL(string: path)
-                    } else {
-                        u = URL(fileURLWithPath: path)
-                    }
-                    if let u = u {
-                        if let m = mediaItems.first(where: { $0.url.path == u.path }) {
-                            if !ids.contains(m.id) { ids.append(m.id) }
-                        } else {
-                            if !urls.contains(u) { urls.append(u) }
-                        }
-                    }
-                }
+        for u in Self.extractFileURLs(from: pboard) {
+            if let m = mediaItems.first(where: { $0.url.standardizedFileURL.path == u.standardizedFileURL.path }) {
+                if !ids.contains(m.id) { ids.append(m.id) }
+            } else if !urls.contains(u) {
+                urls.append(u)
             }
         }
 
@@ -1657,8 +1696,6 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             EditorProject.shared.activeTimelineIndex = idx
             delegate?.didSwitchActiveTimeline(to: tl)
             refreshMediaPoolDisplay()
-        case .selection(let sel, _):
-            openSelection(sel)
         case .media(let m):
             delegate?.didSelectAddClipToTimeline(m)
         case .folder(let f):
@@ -1755,17 +1792,19 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
 
             switch listItem {
             case .timeline(let tl, _):
-                cell?.imageView?.image = Lucide.image(.clapperboard, size: 14, color: .systemCyan)
-                cell?.textField?.stringValue = tl.name
-                cell?.textField?.textColor = .systemCyan
-            case .selection(let sel, _):
-                cell?.imageView?.image = Lucide.image(.sparkles, size: 14, color: .systemPurple)
-                cell?.textField?.stringValue = sel.name
-                cell?.textField?.textColor = .systemPurple
+                if tl.isSelection {
+                    cell?.imageView?.image = Lucide.image(.sparkles, size: 14, color: .systemPurple)
+                    cell?.textField?.stringValue = tl.name
+                    cell?.textField?.textColor = .systemPurple
+                } else {
+                    cell?.imageView?.image = Lucide.image(.clapperboard, size: 14, color: .systemCyan)
+                    cell?.textField?.stringValue = tl.name
+                    cell?.textField?.textColor = .systemCyan
+                }
             case .media(let m):
                 cell?.imageView?.image = Lucide.image(m.hasVideo ? .film : .music, size: 14, color: m.hasVideo ? .systemIndigo : .systemGreen)
                 if m.hasProxy {
-                    cell?.textField?.stringValue = "\(m.name) ⚡[P]"
+                    cell?.textField?.stringValue = "\(m.name) [P]"
                     cell?.textField?.textColor = .systemTeal
                 } else {
                     cell?.textField?.stringValue = m.name
@@ -1797,12 +1836,6 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                     let secs = Int(dur) % 60
                     textField?.stringValue = dur > 0 ? String(format: "%02d:%02d", mins, secs) : "--:--"
                     textField?.textColor = .secondaryLabelColor
-                case .selection(let sel, _):
-                    let dur = CMTimeGetSeconds(sel.totalSelectedDuration)
-                    let mins = Int(dur) / 60
-                    let secs = Int(dur) % 60
-                    textField?.stringValue = dur > 0 ? String(format: "%02d:%02d", mins, secs) : "--:--"
-                    textField?.textColor = .secondaryLabelColor
                 case .media(let m):
                     textField?.stringValue = m.formattedDuration
                     textField?.textColor = .labelColor
@@ -1813,10 +1846,12 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             case "Codec":
                 switch listItem {
                 case .timeline(let tl, _):
-                    textField?.stringValue = "Timeline (\(tl.format.name))"
-                    textField?.textColor = .secondaryLabelColor
-                case .selection(let sel, _):
-                    textField?.stringValue = "Selezione (\(sel.selectedClips.count) clip)"
+                    if tl.isSelection {
+                        let count = tl.videoTracks.first?.clips.count ?? 0
+                        textField?.stringValue = "Selezione (\(count) clip • 1V+1A)"
+                    } else {
+                        textField?.stringValue = "Timeline (\(tl.format.name))"
+                    }
                     textField?.textColor = .secondaryLabelColor
                 case .media(let m):
                     if m.hasVideo {

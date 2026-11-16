@@ -416,7 +416,7 @@ private final class LUTSelectorPopoverController: NSViewController {
     private let onPresetSelected: (LUTPreset) -> Void
     private let onToggleEnabled: (Bool) -> Void
     private let enabledSwitch = NSSwitch()
-    private let presetPopUp = NSPopUpButton()
+    private let presetPopUp = VisionDropdownButton()
 
     init(
         onPresetSelected: @escaping (LUTPreset) -> Void,
@@ -494,7 +494,7 @@ private final class LUTSelectorPopoverController: NSViewController {
     }
 
     @objc private func onPopUpChanged() {
-        guard let title = presetPopUp.selectedItem?.title,
+        guard let title = presetPopUp.selectedTitle,
               let preset = LUTPreset.allCases.first(where: { $0.rawValue == title }) else { return }
         onPresetSelected(preset)
         enabledSwitch.state = LUTEngine.shared.isEnabled ? .on : .off

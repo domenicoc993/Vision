@@ -18,6 +18,8 @@ public struct TimelineClip: Identifiable, Hashable {
     public var beatMarkers: [Double] // Beat / tagli ritmici legati al brano (secondi sorgente)
     public var beatBPM: Double? // BPM rilevato sul brano
     public var markers: [Double] // Marcatori manuali dell'utente (secondi sorgente, audio e video)
+    public var priority: Int? // Priorità in Selezione: 1 = Hero, 2 = Buona, 3 = Filler, nil = nessuna
+    public var isLocked: Bool // Lock manuale della clip in timeline (preservata in Auto-Fill e cancellazione)
 
     public init(
         id: UUID = UUID(),
@@ -35,7 +37,9 @@ public struct TimelineClip: Identifiable, Hashable {
         span: Int = 1,
         beatMarkers: [Double] = [],
         beatBPM: Double? = nil,
-        markers: [Double] = []
+        markers: [Double] = [],
+        priority: Int? = nil,
+        isLocked: Bool = false
     ) {
         self.id = id
         self.mediaItem = mediaItem
@@ -53,6 +57,8 @@ public struct TimelineClip: Identifiable, Hashable {
         self.beatMarkers = beatMarkers
         self.beatBPM = beatBPM
         self.markers = markers
+        self.priority = priority
+        self.isLocked = isLocked
     }
 
     private func mapSourceMarkersToTimeline(_ sourceMarkers: [Double]) -> [Double] {

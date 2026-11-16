@@ -46,10 +46,10 @@ public final class TimelineSettingsDialog {
         private weak var panel: NSPanel?
         var resultingFormat: TimelineFormat?
 
-        private let presetPopUp = NSPopUpButton()
+        private let presetPopUp = VisionDropdownButton()
         private let widthField = NSTextField()
         private let heightField = NSTextField()
-        private let fpsPopUp = NSPopUpButton()
+        private let fpsPopUp = VisionDropdownButton()
         private var isUpdatingFields = false
 
         init(timeline: TimelineModel, panel: NSPanel) {
@@ -232,7 +232,7 @@ public final class TimelineSettingsDialog {
 
         @objc private func onPresetChanged() {
             guard !isUpdatingFields else { return }
-            let idx = presetPopUp.indexOfSelectedItem
+            let idx = presetPopUp.selectedIndex
             guard idx >= 0 && idx < TimelineFormat.presets.count else { return }
             let chosen = TimelineFormat.presets[idx]
             syncControlsFromFormat(chosen)
@@ -246,8 +246,8 @@ public final class TimelineSettingsDialog {
         @objc private func onFpsChanged() {
             // Keep preset if resolution matches, or mark custom if FPS differs from preset
             guard !isUpdatingFields else { return }
-            let idx = presetPopUp.indexOfSelectedItem
-            let fpsIdx = fpsPopUp.indexOfSelectedItem
+            let idx = presetPopUp.selectedIndex
+            let fpsIdx = fpsPopUp.selectedIndex
             guard idx >= 0 && idx < TimelineFormat.presets.count,
                   fpsIdx >= 0 && fpsIdx < TimelineSettingsDialog.fpsChoices.count else { return }
             let preset = TimelineFormat.presets[idx]
@@ -265,7 +265,7 @@ public final class TimelineSettingsDialog {
         @objc private func onSave() {
             let w = max(128, min(8192, Int(widthField.stringValue) ?? Int(timeline.format.size.width)))
             let h = max(128, min(8192, Int(heightField.stringValue) ?? Int(timeline.format.size.height)))
-            let fpsIdx = max(0, min(TimelineSettingsDialog.fpsChoices.count - 1, fpsPopUp.indexOfSelectedItem))
+            let fpsIdx = max(0, min(TimelineSettingsDialog.fpsChoices.count - 1, fpsPopUp.selectedIndex))
             let fps = TimelineSettingsDialog.fpsChoices[fpsIdx].value
 
             if let matched = TimelineFormat.presets.first(where: {

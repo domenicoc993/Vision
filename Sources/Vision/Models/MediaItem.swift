@@ -93,6 +93,11 @@ public struct MediaItem: Identifiable, Hashable {
             } else if track.mediaType == .audio {
                 hasAudio = true
                 audioTracksFound += 1
+                if !hasVideo, detectedCodec == "Nessuno",
+                   let fds = try? await track.load(.formatDescriptions), let first = fds.first {
+                    let subType = CMFormatDescriptionGetMediaSubType(first)
+                    detectedCodec = fourCCToString(subType)
+                }
             }
         }
 
@@ -145,6 +150,12 @@ public struct MediaItem: Identifiable, Hashable {
         case "apcs": return "Apple ProRes 422 LT"
         case "apco": return "Apple ProRes 422 Proxy"
         case "ap4h": return "Apple ProRes 4444"
+        case "lpcm": return "Audio PCM / WAV"
+        case ".mp3": return "Audio MP3"
+        case "aac ", "aach", "aacp", "aace": return "Audio AAC"
+        case "flac": return "Audio FLAC"
+        case "alac": return "Apple Lossless (ALAC)"
+        case "opus": return "Audio Opus"
         default: return str.isEmpty ? "Sconosciuto" : str
         }
     }

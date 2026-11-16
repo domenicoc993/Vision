@@ -90,6 +90,8 @@ public struct TimelineClipData: Codable {
     public var beatMarkers: [Double]?
     public var beatBPM: Double?
     public var markers: [Double]?
+    public var priority: Int?
+    public var isLocked: Bool?
 
     public init(clip: TimelineClip) {
         self.id = clip.id
@@ -108,6 +110,8 @@ public struct TimelineClipData: Codable {
         self.beatMarkers = clip.beatMarkers.isEmpty ? nil : clip.beatMarkers
         self.beatBPM = clip.beatBPM
         self.markers = clip.markers.isEmpty ? nil : clip.markers
+        self.priority = clip.priority
+        self.isLocked = clip.isLocked ? true : nil
     }
 
     public func toClip(mediaItems: [UUID: MediaItem]) -> TimelineClip? {
@@ -130,7 +134,9 @@ public struct TimelineClipData: Codable {
             span: span ?? 1,
             beatMarkers: beatMarkers ?? [],
             beatBPM: beatBPM,
-            markers: markers ?? []
+            markers: markers ?? [],
+            priority: priority,
+            isLocked: isLocked ?? false
         )
     }
 }
@@ -169,6 +175,7 @@ public struct TimelineTrackData: Codable {
 public struct TimelineModelData: Codable {
     public var id: UUID
     public var name: String
+    public var isSelection: Bool?
     public var width: Double
     public var height: Double
     public var fps: Double
@@ -177,12 +184,14 @@ public struct TimelineModelData: Codable {
     public var isLinkActive: Bool
     public var isSnappingActive: Bool
     public var isSelectionFollowsPlayhead: Bool
+    public var isCageLockActive: Bool?
     public var rhythmicCages: [RhythmicCage]?
     public var detectedBPM: Double?
 
     public init(model: TimelineModel) {
         self.id = model.id
         self.name = model.name
+        self.isSelection = model.isSelection
         self.width = Double(model.format.size.width)
         self.height = Double(model.format.size.height)
         self.fps = Double(model.format.fps)
@@ -191,80 +200,87 @@ public struct TimelineModelData: Codable {
         self.isLinkActive = model.isLinkActive
         self.isSnappingActive = model.isSnappingActive
         self.isSelectionFollowsPlayhead = model.isSelectionFollowsPlayhead
+        self.isCageLockActive = model.isCageLockActive
         self.rhythmicCages = model.rhythmicCages
         self.detectedBPM = model.detectedBPM
     }
 
     public func toModel(mediaItems: [UUID: MediaItem]) -> TimelineModel {
-        let model = TimelineModel(name: name)
+        let isSel = isSelection ?? false
+        let model = TimelineModel(name: name, isSelection: isSel)
         model.format = TimelineFormat(id: "custom", name: "\(Int(width))×\(Int(height))", size: CGSize(width: width, height: height), fps: Float(fps))
         model.id = id
         model.videoTracks = videoTracks.map { $0.toTrack(mediaItems: mediaItems) }
         model.audioTracks = audioTracks.map { $0.toTrack(mediaItems: mediaItems) }
+        if isSel {
+            model.videoTracks = Array(model.videoTracks.prefix(1))
+            model.audioTracks = Array(model.audioTracks.prefix(1))
+        }
         model.isLinkActive = isLinkActive
         model.isSnappingActive = isSnappingActive
         model.isSelectionFollowsPlayhead = isSelectionFollowsPlayhead
+        model.isCageLockActive = isCageLockActive ?? true
         model.rhythmicCages = rhythmicCages ?? []
         model.detectedBPM = detectedBPM
         return model
     }
 }
 
-public struct SelectionClipData: Codable {
+public struct LegacySelectionClipData: Codable {
     public var id: UUID
     public var mediaItemId: UUID
     public var sourceInSeconds: Double
     public var durationSeconds: Double
     public var originalName: String
-
-    public init(clip: SelectionClip) {
-        self.id = clip.id
-        self.mediaItemId = clip.mediaItem.id
-        self.sourceInSeconds = CMTimeGetSeconds(clip.sourceIn)
-        self.durationSeconds = CMTimeGetSeconds(clip.duration)
-        self.originalName = clip.originalName
-    }
-
-    public func toClip(mediaItems: [UUID: MediaItem]) -> SelectionClip? {
-        guard let item = mediaItems[mediaItemId] else { return nil }
-        var clip = SelectionClip(
-            id: id,
-            mediaItem: item,
-            sourceIn: CMTime(seconds: sourceInSeconds, preferredTimescale: 600),
-            duration: CMTime(seconds: durationSeconds, preferredTimescale: 600)
-        )
-        clip.originalName = originalName
-        return clip
-    }
 }
 
-public struct SelectionModelData: Codable {
+public struct LegacySelectionModelData: Codable {
     public var id: UUID
     public var name: String
     public var initialClipIds: [UUID]
-    public var rejectedClips: [SelectionClipData]
-    public var analysisClips: [SelectionClipData]
-    public var selectedClips: [SelectionClipData]
+    public var rejectedClips: [LegacySelectionClipData]
+    public var analysisClips: [LegacySelectionClipData]
+    public var selectedClips: [LegacySelectionClipData]
     public var createdAt: Date
 
-    public init(sel: SelectionModel) {
-        self.id = sel.id
-        self.name = sel.name
-        self.initialClipIds = sel.initialClips.map { $0.id }
-        self.rejectedClips = sel.rejectedClips.map { SelectionClipData(clip: $0) }
-        self.analysisClips = sel.analysisClips.map { SelectionClipData(clip: $0) }
-        self.selectedClips = sel.selectedClips.map { SelectionClipData(clip: $0) }
-        self.createdAt = sel.createdAt
-    }
-
-    public func toModel(mediaItems: [UUID: MediaItem]) -> SelectionModel {
-        let inits = initialClipIds.compactMap { mediaItems[$0] }
-        let sel = SelectionModel(id: id, name: name, clips: inits)
-        sel.createdAt = createdAt
-        sel.rejectedClips = rejectedClips.compactMap { $0.toClip(mediaItems: mediaItems) }
-        sel.analysisClips = analysisClips.compactMap { $0.toClip(mediaItems: mediaItems) }
-        sel.selectedClips = selectedClips.compactMap { $0.toClip(mediaItems: mediaItems) }
-        return sel
+    public func toSelectionTimeline(mediaItems: [UUID: MediaItem]) -> TimelineModel {
+        let model = TimelineModel(name: name, isSelection: true)
+        model.id = id
+        let chosen = !selectedClips.isEmpty ? selectedClips : analysisClips
+        var cursor: CMTime = .zero
+        for itemData in chosen {
+            guard let m = mediaItems[itemData.mediaItemId] else { continue }
+            let dur = CMTime(seconds: max(0.05, itemData.durationSeconds), preferredTimescale: 600)
+            let sIn = CMTime(seconds: max(0, itemData.sourceInSeconds), preferredTimescale: 600)
+            let sOut = CMTimeAdd(sIn, dur)
+            let linkId = (m.hasVideo && m.hasAudio) ? UUID() : nil
+            if m.hasVideo {
+                model.videoTracks[0].clips.append(TimelineClip(
+                    mediaItem: m,
+                    sourceIn: sIn,
+                    sourceOut: sOut,
+                    timelineStart: cursor,
+                    trackIndex: 0,
+                    mediaType: .video,
+                    orientation: m.orientation,
+                    linkGroupId: linkId
+                ))
+            }
+            if m.hasAudio {
+                model.audioTracks[0].clips.append(TimelineClip(
+                    mediaItem: m,
+                    sourceIn: sIn,
+                    sourceOut: sOut,
+                    timelineStart: cursor,
+                    trackIndex: 0,
+                    mediaType: .audio,
+                    orientation: .normal,
+                    linkGroupId: linkId
+                ))
+            }
+            cursor = CMTimeAdd(cursor, dur)
+        }
+        return model
     }
 }
 
@@ -278,8 +294,8 @@ public struct ProjectDocumentData: Codable {
     public var mediaItems: [MediaItemData]
     public var timelines: [TimelineModelData]
     public var activeTimelineIndex: Int
-    public var selections: [SelectionModelData]
-    public var activeSelectionIndex: Int
+    public var selections: [LegacySelectionModelData]?
+    public var activeSelectionIndex: Int?
     public var isProxyPlaybackEnabled: Bool
     public var proxyOutputFolderPath: String?
 
@@ -296,8 +312,8 @@ public struct ProjectDocumentData: Codable {
         self.mediaItems = mediaItems.map { MediaItemData(item: $0) }
         self.timelines = project.timelines.map { TimelineModelData(model: $0) }
         self.activeTimelineIndex = project.activeTimelineIndex
-        self.selections = project.selections.map { SelectionModelData(sel: $0) }
-        self.activeSelectionIndex = project.activeSelectionIndex
+        self.selections = nil
+        self.activeSelectionIndex = nil
         self.isProxyPlaybackEnabled = project.isProxyPlaybackEnabled
         self.proxyOutputFolderPath = project.proxyOutputFolderURL?.path
     }
@@ -438,9 +454,9 @@ public final class ProjectDatabase: @unchecked Sendable {
         let fps = Double(primaryTimeline.format.fps)
         let width = Int(primaryTimeline.format.size.width)
         let height = Int(primaryTimeline.format.size.height)
-        let tCount = doc.timelines.count
+        let tCount = doc.timelines.filter { !($0.isSelection ?? false) }.count
         let mCount = doc.mediaItems.count
-        let sCount = doc.selections.count
+        let sCount = doc.timelines.filter { $0.isSelection ?? false }.count
 
         dbQueue.sync { [weak self] in
             guard let self = self, let db = self.db else { return }
@@ -550,9 +566,9 @@ public final class ProjectDatabase: @unchecked Sendable {
         let fps = newDoc.timelines.first?.fps ?? 25.0
         let width = Int(newDoc.timelines.first?.width ?? 1920)
         let height = Int(newDoc.timelines.first?.height ?? 1080)
-        let tCount = newDoc.timelines.count
+        let tCount = newDoc.timelines.filter { !($0.isSelection ?? false) }.count
         let mCount = newDoc.mediaItems.count
-        let sCount = newDoc.selections.count
+        let sCount = newDoc.timelines.filter { $0.isSelection ?? false }.count
 
         dbQueue.sync {
             guard db != nil else { return }

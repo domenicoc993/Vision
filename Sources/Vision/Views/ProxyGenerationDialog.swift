@@ -6,8 +6,8 @@ public final class ProxyGenerationDialog: NSWindowController {
     private var chosenFolderURL: URL
     private var onCompletion: (() -> Void)?
 
-    private let codecPopUp = NSPopUpButton()
-    private let scalePopUp = NSPopUpButton()
+    private let codecPopUp = VisionDropdownButton()
+    private let scalePopUp = VisionDropdownButton()
     private let pathLabel = NSTextField(labelWithString: "")
     private let chooseFolderBtn = NSButton()
     private let progressBar = NSProgressIndicator()
@@ -199,8 +199,8 @@ public final class ProxyGenerationDialog: NSWindowController {
         progressBar.isHidden = false
         progressBar.doubleValue = 0.0
 
-        let selectedCodec = ProxyCodec.allCases[max(0, codecPopUp.indexOfSelectedItem)]
-        let selectedScale = ProxyScale.allCases[max(0, scalePopUp.indexOfSelectedItem)]
+        let selectedCodec = ProxyCodec.allCases[max(0, codecPopUp.selectedIndex)]
+        let selectedScale = ProxyScale.allCases[max(0, scalePopUp.selectedIndex)]
         let folder = chosenFolderURL
 
         Task {

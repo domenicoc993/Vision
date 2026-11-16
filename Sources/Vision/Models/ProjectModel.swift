@@ -27,9 +27,6 @@ public final class EditorProject {
     public var timelines: [TimelineModel] = []
     public var activeTimelineIndex: Int = 0
 
-    public var selections: [SelectionModel] = []
-    public var activeSelectionIndex: Int = 0
-
     // Proxy Engine state
     public var isProxyPlaybackEnabled: Bool = false
     public var proxyOutputFolderURL: URL? = nil
@@ -37,42 +34,99 @@ public final class EditorProject {
 
     public var onProjectChanged: (() -> Void)?
 
-    public var activeSelection: SelectionModel? {
-        guard !selections.isEmpty else { return nil }
-        if activeSelectionIndex >= selections.count {
-            activeSelectionIndex = 0
-        }
-        return selections[activeSelectionIndex]
+    public var selectionTimelines: [TimelineModel] {
+        timelines.filter { $0.isSelection }
+    }
+
+    public var regularTimelines: [TimelineModel] {
+        timelines.filter { !$0.isSelection }
     }
 
     @discardableResult
-    public func createSelection(name: String, clips: [MediaItem]) -> SelectionModel {
-        let sel = SelectionModel(name: name, clips: clips)
-        selections.append(sel)
-        activeSelectionIndex = selections.count - 1
+    public func createSelection(name: String, clips: [MediaItem]) -> TimelineModel {
+        let sel = TimelineModel(name: name, isSelection: true)
+        let sortedItems = clips.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+        for item in sortedItems {
+            sel.appendClip(mediaItem: item)
+        }
+        timelines.append(sel)
+        activeTimelineIndex = timelines.count - 1
         onProjectChanged?()
         return sel
     }
 
     @discardableResult
-    public func duplicateSelection(id: UUID) -> SelectionModel? {
-        guard let orig = selections.first(where: { $0.id == id }) else { return nil }
-        let copy = SelectionModel(name: "\(orig.name) (Copia)", clips: orig.initialClips)
-        copy.analysisClips = orig.analysisClips
-        copy.rejectedClips = orig.rejectedClips
-        copy.selectedClips = orig.selectedClips
-        selections.append(copy)
-        activeSelectionIndex = selections.count - 1
+    public func duplicateTimeline(index: Int) -> TimelineModel? {
+        guard index >= 0 && index < timelines.count else { return nil }
+        let orig = timelines[index]
+        let copy = TimelineModel(name: "\(orig.name) (Copia)", isSelection: orig.isSelection)
+        copy.format = orig.format
+        copy.isLinkActive = orig.isLinkActive
+        copy.isSnappingActive = orig.isSnappingActive
+        copy.isSelectionFollowsPlayhead = orig.isSelectionFollowsPlayhead
+        copy.isCageLockActive = orig.isCageLockActive
+        copy.rhythmicCages = orig.rhythmicCages
+        copy.detectedBPM = orig.detectedBPM
+        copy.beatIntervalMode = orig.beatIntervalMode
+        copy.peakSensitivity = orig.peakSensitivity
+        copy.videoTracks = orig.videoTracks.map { track in
+            var t = track
+            t.clips = track.clips.map { clip in
+                TimelineClip(
+                    id: UUID(),
+                    mediaItem: clip.mediaItem,
+                    sourceIn: clip.sourceIn,
+                    sourceOut: clip.sourceOut,
+                    timelineStart: clip.timelineStart,
+                    trackIndex: clip.trackIndex,
+                    mediaType: clip.mediaType,
+                    orientation: clip.orientation,
+                    linkGroupId: clip.linkGroupId,
+                    isOrphan: clip.isOrphan,
+                    speed: clip.speed,
+                    cageIndex: clip.cageIndex,
+                    span: clip.span,
+                    beatMarkers: clip.beatMarkers,
+                    beatBPM: clip.beatBPM,
+                    markers: clip.markers,
+                    priority: clip.priority,
+                    isLocked: clip.isLocked
+                )
+            }
+            return t
+        }
+        copy.audioTracks = orig.audioTracks.map { track in
+            var t = track
+            t.clips = track.clips.map { clip in
+                TimelineClip(
+                    id: UUID(),
+                    mediaItem: clip.mediaItem,
+                    sourceIn: clip.sourceIn,
+                    sourceOut: clip.sourceOut,
+                    timelineStart: clip.timelineStart,
+                    trackIndex: clip.trackIndex,
+                    mediaType: clip.mediaType,
+                    orientation: clip.orientation,
+                    linkGroupId: clip.linkGroupId,
+                    isOrphan: clip.isOrphan,
+                    speed: clip.speed,
+                    cageIndex: clip.cageIndex,
+                    span: clip.span,
+                    beatMarkers: clip.beatMarkers,
+                    beatBPM: clip.beatBPM,
+                    markers: clip.markers,
+                    priority: clip.priority,
+                    isLocked: clip.isLocked
+                )
+            }
+            return t
+        }
+        timelines.append(copy)
+        activeTimelineIndex = timelines.count - 1
         onProjectChanged?()
         return copy
-    }
-
-    public func removeSelection(id: UUID) {
-        selections.removeAll(where: { $0.id == id })
-        if activeSelectionIndex >= selections.count {
-            activeSelectionIndex = max(0, selections.count - 1)
-        }
-        onProjectChanged?()
     }
 
     public var activeTimeline: TimelineModel {
@@ -92,10 +146,11 @@ public final class EditorProject {
     }
 
     @discardableResult
-    public func addTimeline(name: String? = nil) -> TimelineModel {
-        let count = timelines.count + 1
-        let tName = name ?? "Timeline \(count)"
-        let newModel = TimelineModel(name: tName)
+    public func addTimeline(name: String? = nil, isSelection: Bool = false) -> TimelineModel {
+        let count = timelines.filter { $0.isSelection == isSelection }.count + 1
+        let defaultPrefix = isSelection ? "Selezione" : "Timeline"
+        let tName = name ?? "\(defaultPrefix) \(count)"
+        let newModel = TimelineModel(name: tName, isSelection: isSelection)
         timelines.append(newModel)
         activeTimelineIndex = timelines.count - 1
         onProjectChanged?()
@@ -158,10 +213,18 @@ public final class EditorProject {
         self.activeFolderId = document.activeFolderId
 
         let mediaDict = Dictionary(uniqueKeysWithValues: restoredMedia.map { ($0.id, $0) })
-        self.timelines = document.timelines.map { $0.toModel(mediaItems: mediaDict) }
+        var loadedTimelines = document.timelines.map { $0.toModel(mediaItems: mediaDict) }
+        if let legacySelections = document.selections {
+            let existingIds = Set(loadedTimelines.map(\.id))
+            for legacy in legacySelections where !existingIds.contains(legacy.id) {
+                loadedTimelines.append(legacy.toSelectionTimeline(mediaItems: mediaDict))
+            }
+        }
+        if loadedTimelines.isEmpty {
+            loadedTimelines = [TimelineModel(name: "Timeline 1")]
+        }
+        self.timelines = loadedTimelines
         self.activeTimelineIndex = min(document.activeTimelineIndex, max(0, self.timelines.count - 1))
-        self.selections = document.selections.map { $0.toModel(mediaItems: mediaDict) }
-        self.activeSelectionIndex = min(document.activeSelectionIndex, max(0, self.selections.count - 1))
         self.isProxyPlaybackEnabled = document.isProxyPlaybackEnabled
         if let pPath = document.proxyOutputFolderPath {
             self.proxyOutputFolderURL = URL(fileURLWithPath: pPath)
