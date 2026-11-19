@@ -4,7 +4,7 @@ import CoreMedia
 import Accelerate
 import CoreML
 
-public struct StrongPeakCandidate: Sendable, Hashable {
+public struct StrongPeakCandidate: Sendable, Hashable, Codable {
     public let timeSeconds: Double
     public let strength: Double // 0.0 ... 1.0 normalized impact score
 
@@ -14,7 +14,7 @@ public struct StrongPeakCandidate: Sendable, Hashable {
     }
 }
 
-public struct AdaptiveGridSlot: Sendable, Hashable {
+public struct AdaptiveGridSlot: Sendable, Hashable, Codable {
     public let timeSeconds: Double
     public let isBeat: Bool
     public let isDownbeat: Bool
@@ -39,6 +39,91 @@ public struct AdaptiveGridSlot: Sendable, Hashable {
         self.envJump = envJump
         self.localRatio = localRatio
         self.localRmsNorm = localRmsNorm
+    }
+}
+
+/// Dati persistenti dell'analisi neurale Beat This! salvati sulla clip del progetto.
+public struct SavedBeatAnalysis: Codable, Hashable, Sendable {
+    public let bpm: Double
+    public let beatSeconds: [Double]
+    public let downbeatSeconds: [Double]
+    public let transientSeconds: [Double]
+    public let strongPeaks: [StrongPeakCandidate]
+    public let adaptiveGrid: [AdaptiveGridSlot]
+    public let durationSeconds: Double
+    public let analyzedAt: Date
+
+    public init(
+        bpm: Double,
+        beatSeconds: [Double],
+        downbeatSeconds: [Double],
+        transientSeconds: [Double],
+        strongPeaks: [StrongPeakCandidate],
+        adaptiveGrid: [AdaptiveGridSlot],
+        durationSeconds: Double,
+        analyzedAt: Date = Date()
+    ) {
+        self.bpm = bpm
+        self.beatSeconds = beatSeconds
+        self.downbeatSeconds = downbeatSeconds
+        self.transientSeconds = transientSeconds
+        self.strongPeaks = strongPeaks
+        self.adaptiveGrid = adaptiveGrid
+        self.durationSeconds = durationSeconds
+        self.analyzedAt = analyzedAt
+    }
+
+    /// Estrae una vista `BeatAnalysisResult` allineata alla finestra `[sourceStart ..< sourceStart + sourceDuration]` della clip.
+    public func toBeatAnalysisResult(
+        audioURL: URL,
+        sourceStart: Double = 0.0,
+        sourceDuration: Double? = nil
+    ) -> BeatAnalysisResult {
+        let start = max(0.0, sourceStart)
+        let dur = max(0.05, sourceDuration ?? max(0.05, durationSeconds - start))
+        let end = start + dur
+        let eps = 0.02
+
+        let slicedBeats = beatSeconds
+            .filter { $0 >= start - eps && $0 <= end + eps }
+            .map { CMTime(seconds: max(0.0, $0 - start), preferredTimescale: 600) }
+
+        let slicedDownbeats = downbeatSeconds
+            .filter { $0 >= start - eps && $0 <= end + eps }
+            .map { CMTime(seconds: max(0.0, $0 - start), preferredTimescale: 600) }
+
+        let slicedTransients = transientSeconds
+            .filter { $0 >= start - eps && $0 <= end + eps }
+            .map { CMTime(seconds: max(0.0, $0 - start), preferredTimescale: 600) }
+
+        let slicedPeaks = strongPeaks
+            .filter { $0.timeSeconds >= start - eps && $0.timeSeconds <= end + eps }
+            .map { StrongPeakCandidate(timeSeconds: max(0.0, $0.timeSeconds - start), strength: $0.strength) }
+
+        let slicedGrid = adaptiveGrid
+            .filter { $0.timeSeconds >= start - eps && $0.timeSeconds <= end + eps }
+            .map {
+                AdaptiveGridSlot(
+                    timeSeconds: max(0.0, $0.timeSeconds - start),
+                    isBeat: $0.isBeat,
+                    isDownbeat: $0.isDownbeat,
+                    globalStrength: $0.globalStrength,
+                    envJump: $0.envJump,
+                    localRatio: $0.localRatio,
+                    localRmsNorm: $0.localRmsNorm
+                )
+            }
+
+        return BeatAnalysisResult(
+            bpm: bpm,
+            beatTimes: slicedBeats,
+            downbeatTimes: slicedDownbeats,
+            transientTimes: slicedTransients,
+            strongPeaks: slicedPeaks,
+            adaptiveGrid: slicedGrid,
+            duration: CMTime(seconds: dur, preferredTimescale: 600),
+            audioURL: audioURL
+        )
     }
 }
 
@@ -72,7 +157,19 @@ public struct BeatAnalysisResult {
         self.audioURL = audioURL
     }
 
-    /// Filtra i candidati ai picchi forti in base alla sensibilità [0.0 = Solo Clou, 1.0 = Reattivo]
+    public func toSavedBeatAnalysis() -> SavedBeatAnalysis {
+        SavedBeatAnalysis(
+            bpm: bpm,
+            beatSeconds: beatTimes.map { CMTimeGetSeconds($0) },
+            downbeatSeconds: downbeatTimes.map { CMTimeGetSeconds($0) },
+            transientSeconds: transientTimes.map { CMTimeGetSeconds($0) },
+            strongPeaks: strongPeaks,
+            adaptiveGrid: adaptiveGrid,
+            durationSeconds: CMTimeGetSeconds(duration)
+        )
+    }
+
+    /// Filtra i candidati ai picchi forti in base alla sensibilità [0.0 = Solo Clou, 1.0 = Frenetico / Alta Densità]
     /// applicando Non-Maximum Suppression decrescente per punteggio.
     public func selectStrongPeaks(sensitivity: Double) -> [Double] {
         Self.selectStrongPeaks(from: strongPeaks, sensitivity: sensitivity)
@@ -80,8 +177,17 @@ public struct BeatAnalysisResult {
 
     public static func selectStrongPeaks(from candidates: [StrongPeakCandidate], sensitivity: Double) -> [Double] {
         let s = max(0.0, min(1.0, sensitivity))
-        let minStrength = 0.50 - 0.30 * s // 0.50 -> 0.35 -> 0.20
-        let minSpacing = 4.2 - 3.0 * s    // 4.2s -> 2.7s -> 1.2s
+        let minStrength: Double
+        let minSpacing: Double
+        if s <= 0.45 {
+            let t = s / 0.45
+            minStrength = 0.50 - 0.16 * t  // 0.50 -> 0.34
+            minSpacing = 4.2 - 1.75 * t    // 4.2s -> 2.45s
+        } else {
+            let t = (s - 0.45) / 0.55
+            minStrength = 0.34 - 0.28 * t  // 0.34 -> 0.06
+            minSpacing = 2.45 - 2.03 * t   // 2.45s -> 0.42s (~2+ tagli/s al 100%)
+        }
 
         var picked: [Double] = []
         for cand in candidates.sorted(by: { $0.strength > $1.strength }) {
@@ -94,7 +200,7 @@ public struct BeatAnalysisResult {
     }
 
     /// Regia Adattiva: seleziona tagli su griglia beat/ottavi combinando andatura di battuta,
-    /// contrasto locale (±4s) e raffiche/fill dinamici.
+    /// contrasto locale (±4s) e raffiche/fill dinamici (fino a ~1+ taglio/sec ad alta densità).
     public func selectAdaptiveCuts(sensitivity: Double) -> [Double] {
         Self.selectAdaptiveCuts(from: adaptiveGrid, bpm: bpm, sensitivity: sensitivity)
     }
@@ -109,26 +215,47 @@ public struct BeatAnalysisResult {
         let beatPeriod = 60.0 / max(40.0, bpm)
         let barDur = beatPeriod * 4.0
 
-        guard let firstIdx = grid.firstIndex(where: {
-            $0.localRatio >= 1.15 && ($0.isDownbeat || $0.envJump >= 1.50)
-        }) else {
-            return [grid[0].timeSeconds]
-        }
+        let firstMinRatio = s >= 0.70 ? 0.90 : 1.15
+        let firstIdx = grid.firstIndex(where: {
+            $0.localRatio >= firstMinRatio && ($0.isDownbeat || $0.envJump >= (s >= 0.70 ? 1.25 : 1.50))
+        }) ?? 0
 
         var cuts: [Double] = [grid[firstIdx].timeSeconds]
 
-        let minNormalGap = (0.76 - 0.18 * s) * barDur      // ~1.40s @ 0.45 (116 BPM)
-        let targetBarGap = (1.28 - 0.44 * s) * barDur      // ~2.23s @ 0.45
-        let maxBarGap = (1.95 - 0.55 * s) * barDur         // ~3.50s @ 0.45
-        let burstRatioThresh = 2.08 - 0.35 * s             // ~1.92 @ 0.45
-        let burstJumpThresh = 1.95 - 0.30 * s              // ~1.81 @ 0.45
-        let fillRatioThresh = 1.60 - 0.25 * s              // ~1.49 @ 0.45
-        let quietHighlightRatio = 3.2 - 0.6 * s            // sparse quiet section guard
-        let burstStrengthFloor = 0.42 - 0.12 * s
+        let minNormalGap: Double
+        let targetBarGap: Double
+        let maxBarGap: Double
+        if s <= 0.45 {
+            let t = s / 0.45
+            minNormalGap = (0.78 - 0.14 * t) * barDur          // 0.78 -> 0.64 bar
+            targetBarGap = (1.35 - 0.40 * t) * barDur          // 1.35 -> 0.95 bar
+            maxBarGap = (2.00 - 0.45 * t) * barDur             // 2.00 -> 1.55 bar
+        } else {
+            let t = (s - 0.45) / 0.55
+            // Progressive compression from bar-level pacing (~1.9s) down to fast beat-level pacing (~0.45-0.85s)
+            let highTarget = min(0.85, 1.05 * beatPeriod)
+            let highMinGap = max(0.24, 0.72 * beatPeriod)
+            let highMaxGap = max(0.85, 1.75 * beatPeriod)
+            let baseMinGap = 0.64 * barDur
+            let baseTarget = 0.95 * barDur
+            let baseMaxGap = 1.55 * barDur
+            let curve = pow(t, 1.15)
+            minNormalGap = baseMinGap + (highMinGap - baseMinGap) * curve
+            targetBarGap = baseTarget + (highTarget - baseTarget) * curve
+            maxBarGap = baseMaxGap + (highMaxGap - baseMaxGap) * curve
+        }
+
+        let burstRatioThresh = 2.08 - 0.68 * s             // 2.08 -> 1.40
+        let burstJumpThresh = 1.95 - 0.60 * s              // 1.95 -> 1.35
+        let fillRatioThresh = 1.60 - 0.45 * s              // 1.60 -> 1.15
+        let quietHighlightRatio = 3.2 - 1.3 * s            // 3.2 -> 1.9
+        let burstStrengthFloor = 0.42 - 0.24 * s
+        let maxBurstStreak = s >= 0.82 ? 24 : (s >= 0.62 ? 8 : 4)
+        let minSubBeatDt = s >= 0.80 ? max(0.19, 0.38 * beatPeriod) : max(0.20, 0.42 * beatPeriod)
 
         var curIdx = firstIdx
         var burstStreak = 0
-        var lastGap = barDur
+        var lastGap = targetBarGap
 
         while curIdx + 1 < grid.count {
             let tLast = cuts[cuts.count - 1]
@@ -141,31 +268,32 @@ public struct BeatAnalysisResult {
             while j < grid.count && grid[j].timeSeconds < burstLimitT {
                 let sl = grid[j]
                 let dt = sl.timeSeconds - tLast
-                if dt < max(0.20, 0.42 * beatPeriod) {
+                if dt < minSubBeatDt {
                     j += 1
                     continue
                 }
 
                 let isQuietSection = sl.localRmsNorm < 0.35
                 if isQuietSection {
-                    if sl.localRatio >= quietHighlightRatio && sl.envJump >= 2.5 && dt >= 0.85 * beatPeriod {
+                    if sl.localRatio >= quietHighlightRatio && sl.envJump >= (s >= 0.75 ? 1.8 : 2.5) && dt >= 0.85 * beatPeriod {
                         chosenIdx = j
                         wasBurst = true
                         break
                     }
                 } else if dt < 0.72 * beatPeriod {
-                    // 8th-note burst only when continuing an active burst/fill (capped at 4 steps)
-                    let allowSubBeat = (burstStreak >= 1 || lastGap <= 1.25 * beatPeriod) && burstStreak < 4
-                    if allowSubBeat && sl.localRatio >= fillRatioThresh && (sl.envJump >= 1.25 || sl.globalStrength >= 0.18) {
+                    // 8th-note burst when continuing an active burst/fill or at ultra-dense sensitivity
+                    let allowSubBeat = (burstStreak >= 1 || lastGap <= 1.25 * beatPeriod || s >= 0.88) && burstStreak < maxBurstStreak
+                    if allowSubBeat && sl.localRatio >= fillRatioThresh && (sl.envJump >= 1.20 || sl.globalStrength >= 0.14) {
                         chosenIdx = j
                         wasBurst = true
                         break
                     }
                 } else {
-                    // Quarter-note to <1 bar syncopated accent or hit
+                    // Quarter-note or fast beat accent/hit
                     let isStrongBurst = (sl.localRatio >= burstRatioThresh && sl.envJump >= burstJumpThresh)
-                        || (sl.globalStrength >= burstStrengthFloor && (sl.localRatio >= 1.60 || sl.envJump >= 2.20) && sl.envJump >= 1.50)
-                    let blockedByRefractory = (burstStreak >= 3 && dt < 1.25 * beatPeriod && sl.globalStrength < 0.50)
+                        || (sl.globalStrength >= burstStrengthFloor && (sl.localRatio >= (s >= 0.75 ? 1.25 : 1.60) || sl.envJump >= (s >= 0.75 ? 1.60 : 2.20)) && sl.envJump >= 1.35)
+                        || (s >= 0.90 && sl.isBeat && (sl.localRatio >= 1.15 || sl.envJump >= 1.25 || sl.globalStrength >= 0.10))
+                    let blockedByRefractory = (burstStreak >= maxBurstStreak && dt < 1.25 * beatPeriod && sl.globalStrength < 0.50)
                     if isStrongBurst && !blockedByRefractory {
                         chosenIdx = j
                         wasBurst = true
@@ -183,20 +311,26 @@ public struct BeatAnalysisResult {
                 while k < grid.count && grid[k].timeSeconds <= tLast + maxBarGap {
                     let sl = grid[k]
                     let dt = sl.timeSeconds - tLast
+                    if dt < minSubBeatDt {
+                        k += 1
+                        continue
+                    }
                     let distFromBar = abs(dt - barDur) / max(0.3, barDur)
-                    let distFromTarget = abs(dt - targetBarGap) / max(0.3, barDur)
+                    let distFromTarget = abs(dt - targetBarGap) / max(0.25, targetBarGap)
 
-                    var paceScore = 1.15 - 1.10 * min(1.5, distFromTarget)
-                    paceScore += max(0.0, 0.35 - 0.8 * distFromBar)
+                    var paceScore = 1.25 - 1.15 * min(1.5, distFromTarget)
+                    if s < 0.70 {
+                        paceScore += max(0.0, 0.35 - 0.8 * distFromBar)
+                    }
 
                     let isQuiet = sl.localRmsNorm < 0.35
                     let gridBonus: Double
                     if sl.isDownbeat {
-                        gridBonus = isQuiet ? 0.85 : 0.30
+                        gridBonus = isQuiet ? 0.85 : 0.38
                     } else if sl.isBeat {
-                        gridBonus = isQuiet ? 0.10 : 0.22
+                        gridBonus = s >= 0.75 ? 0.36 : (isQuiet ? 0.10 : 0.24)
                     } else {
-                        gridBonus = (sl.localRatio >= 1.85 && sl.envJump >= 1.80) ? 0.20 : -0.45
+                        gridBonus = (sl.localRatio >= (s >= 0.75 ? 1.45 : 1.85) && sl.envJump >= (s >= 0.75 ? 1.40 : 1.80)) ? 0.22 : -0.45
                     }
 
                     let prominence = (isQuiet ? 0.25 : 0.75) * min(1.6, sl.localRatio * 0.55 + sl.globalStrength)
@@ -207,6 +341,10 @@ public struct BeatAnalysisResult {
                         bestIdx = k
                     }
                     k += 1
+                }
+                if bestIdx == nil && j < grid.count {
+                    // Safety net at 100% density: advance to next rhythmic slot instead of stalling
+                    bestIdx = j
                 }
                 chosenIdx = bestIdx
                 wasBurst = false
@@ -1032,7 +1170,7 @@ public final class AudioBeatDetector {
         var rawCandidates: [(time: Double, score: Double)] = []
         for f in 6..<(nFrames - 6) {
             let s = score[f]
-            guard s > 0.18 else { continue }
+            guard s > 0.06 else { continue }
             var isMax = true
             for k in (f - 6)...(f + 6) where k != f {
                 if score[k] > s {

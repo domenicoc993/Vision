@@ -1,6 +1,108 @@
 import Foundation
 import AVFoundation
 import CoreGraphics
+import CoreImage
+import Metal
+
+public final class VisionLUTInstruction: NSObject, AVVideoCompositionInstructionProtocol, @unchecked Sendable {
+    public struct ClipTransformSegment {
+        public let start: CMTime
+        public let end: CMTime
+        public let transform: CGAffineTransform
+    }
+
+    public struct TrackLayer {
+        public let trackID: CMPersistentTrackID
+        public let segments: [ClipTransformSegment]
+    }
+
+    public let timeRange: CMTimeRange
+    public let enablePostProcessing: Bool = false
+    public let containsTweening: Bool = true
+    public let requiredSourceTrackIDs: [NSValue]?
+    public let passthroughTrackID: CMPersistentTrackID = kCMPersistentTrackID_Invalid
+    public let trackLayers: [TrackLayer] // Ordered bottom-most track to top-most track
+
+    public init(timeRange: CMTimeRange, trackLayers: [TrackLayer]) {
+        self.timeRange = timeRange
+        self.trackLayers = trackLayers
+        self.requiredSourceTrackIDs = trackLayers.map { NSNumber(value: $0.trackID) }
+        super.init()
+    }
+}
+
+public final class VisionLUTCompositor: NSObject, AVVideoCompositing, @unchecked Sendable {
+    private static let sharedCIContext: CIContext = {
+        if let device = MTLCreateSystemDefaultDevice() {
+            return CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
+        }
+        return CIContext(options: [.cacheIntermediates: false])
+    }()
+
+    private static let renderColorSpace: CGColorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+
+    public var sourcePixelBufferAttributes: [String: any Sendable]? {
+        [kCVPixelBufferPixelFormatTypeKey as String: [kCVPixelFormatType_32BGRA]]
+    }
+
+    public var requiredPixelBufferAttributesForRenderContext: [String: any Sendable] {
+        [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+    }
+
+    public func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) {}
+
+    public func cancelAllPendingVideoCompositionRequests() {}
+
+    public func startRequest(_ asyncVideoCompositionRequest: AVAsynchronousVideoCompositionRequest) {
+        autoreleasepool {
+            guard let instruction = asyncVideoCompositionRequest.videoCompositionInstruction as? VisionLUTInstruction else {
+                asyncVideoCompositionRequest.finishCancelledRequest()
+                return
+            }
+
+            guard let dstBuffer = asyncVideoCompositionRequest.renderContext.newPixelBuffer() else {
+                asyncVideoCompositionRequest.finish(with: NSError(domain: "VisionLUTCompositor", code: -1))
+                return
+            }
+
+            let renderSize = asyncVideoCompositionRequest.renderContext.size
+            let renderRect = CGRect(origin: .zero, size: renderSize)
+            let compTime = asyncVideoCompositionRequest.compositionTime
+
+            var composited = CIImage(color: CIColor.black).cropped(to: renderRect)
+
+            for layer in instruction.trackLayers {
+                guard let seg = layer.segments.first(where: {
+                    CMTimeCompare(compTime, $0.start) >= 0 && CMTimeCompare(compTime, $0.end) < 0
+                }) ?? layer.segments.first(where: {
+                    CMTimeCompare(compTime, $0.start) >= 0 && CMTimeCompare(compTime, $0.end) <= 0
+                }) else {
+                    continue
+                }
+
+                guard let srcBuffer = asyncVideoCompositionRequest.sourceFrame(byTrackID: layer.trackID) else {
+                    continue
+                }
+
+                let srcImg = CIImage(cvPixelBuffer: srcBuffer)
+                let srcExtent = srcImg.extent
+                let toTopLeft = CGAffineTransform(translationX: 0, y: srcExtent.height).scaledBy(x: 1, y: -1)
+                let backToBottomLeft = CGAffineTransform(translationX: 0, y: renderSize.height).scaledBy(x: 1, y: -1)
+                let ciTransform = toTopLeft.concatenating(seg.transform).concatenating(backToBottomLeft)
+                let transformed = srcImg.transformed(by: ciTransform)
+                composited = transformed.composited(over: composited)
+            }
+
+            if let lutParams = LUTEngine.shared.currentLUTParameters() {
+                composited = LUTEngine.apply(lutParams, to: composited)
+            }
+
+            composited = composited.cropped(to: renderRect)
+            Self.sharedCIContext.render(composited, to: dstBuffer, bounds: renderRect, colorSpace: Self.renderColorSpace)
+            asyncVideoCompositionRequest.finish(withComposedVideoFrame: dstBuffer)
+        }
+    }
+}
 
 public final class CompositionEngine {
     public static let shared = CompositionEngine()
@@ -76,9 +178,17 @@ public final class CompositionEngine {
         let frameRate: Float = model.format.fps
 
         var compVideoTracks: [Int: AVMutableCompositionTrack] = [:]
-        var clipTransforms: [Int: [(CMTime, CGAffineTransform)]] = [:]
+        var clipTransforms: [Int: [(start: CMTime, end: CMTime, transform: CGAffineTransform)]] = [:]
         var audioMixParameters: [AVMutableAudioMixInputParameters] = []
         var totalClipsCount = 0
+        var urlExistsCache: [URL: Bool] = [:]
+
+        func fileExistsCached(_ url: URL) -> Bool {
+            if let cached = urlExistsCache[url] { return cached }
+            let exists = FileManager.default.fileExists(atPath: url.path)
+            urlExistsCache[url] = exists
+            return exists
+        }
 
         // 1. Populate Video Tracks that have clips and are enabled
         for track in model.videoTracks {
@@ -94,17 +204,14 @@ public final class CompositionEngine {
 
             for clip in track.clips {
                 guard !clip.isOrphan else { continue }
-                guard FileManager.default.fileExists(atPath: clip.mediaItem.effectiveURL.path) else {
-                    DebugLogger.shared.log("Media offline per '\(clip.mediaItem.name)' in A\(track.id + 1)", level: .warning)
-                    continue
-                }
-                guard FileManager.default.fileExists(atPath: clip.mediaItem.effectiveURL.path) else {
+                let effURL = clip.mediaItem.effectiveURL
+                guard fileExistsCached(effURL) else {
                     DebugLogger.shared.log("Media offline per '\(clip.mediaItem.name)' in V\(track.id + 1)", level: .warning)
                     continue
                 }
                 totalClipsCount += 1
                 do {
-                    let metadata = try await getMetadata(for: clip.mediaItem.effectiveURL)
+                    let metadata = try await getMetadata(for: effURL)
                     if let videoTrack = metadata.videoTrack {
                         try compTrack.insertTimeRange(
                             clip.sourceTimeRange,
@@ -124,7 +231,7 @@ public final class CompositionEngine {
                             orientationAngle: clip.orientation.radians,
                             renderSize: renderSize
                         )
-                        clipTransforms[track.id]?.append((clip.timelineStart, transform))
+                        clipTransforms[track.id]?.append((start: clip.timelineStart, end: clip.timelineEnd, transform: transform))
                     }
                 } catch {
                     DebugLogger.shared.log("ERRORE inserimento video '\(clip.mediaItem.name)': \(error)", level: .error)
@@ -132,43 +239,76 @@ public final class CompositionEngine {
             }
         }
 
-        // 2. Populate Audio Tracks that have clips and are enabled (mute check)
+        // 2. Populate Audio Tracks that have clips and are enabled (mute check), reusing channel tracks per TimelineTrack
+        //    so 65 clips x 4 channels uses only 4 composition tracks instead of 260 parallel pipelines.
         for track in model.audioTracks {
             guard track.isEnabled else { continue }
             guard !track.clips.isEmpty else { continue }
 
+            var trackAudioChannels: [AVMutableCompositionTrack] = []
+            var spilloverAudioTracks: [AVMutableCompositionTrack] = []
+
             for clip in track.clips {
                 guard !clip.isOrphan else { continue }
-                guard FileManager.default.fileExists(atPath: clip.mediaItem.effectiveURL.path) else {
+                let effURL = clip.mediaItem.effectiveURL
+                guard fileExistsCached(effURL) else {
                     DebugLogger.shared.log("Media offline per '\(clip.mediaItem.name)' in A\(track.id + 1)", level: .warning)
                     continue
                 }
                 do {
-                    let metadata = try await getMetadata(for: clip.mediaItem.effectiveURL)
-                    for srcAudioTrack in metadata.audioTracks {
-                        guard let compAudioTrack = composition.addMutableTrack(
+                    let metadata = try await getMetadata(for: effURL)
+                    for (chIdx, srcAudioTrack) in metadata.audioTracks.enumerated() {
+                        let compAudioTrack: AVMutableCompositionTrack
+                        if chIdx < trackAudioChannels.count {
+                            compAudioTrack = trackAudioChannels[chIdx]
+                        } else if let newTrack = composition.addMutableTrack(
                             withMediaType: .audio,
                             preferredTrackID: kCMPersistentTrackID_Invalid
-                        ) else { continue }
-
-                        try compAudioTrack.insertTimeRange(
-                            clip.sourceTimeRange,
-                            of: srcAudioTrack,
-                            at: clip.timelineStart
-                        )
-
-                        if clip.speed != 1.0 && clip.speed > 0 {
-                            let insertedRange = CMTimeRange(start: clip.timelineStart, duration: clip.sourceDuration)
-                            compAudioTrack.scaleTimeRange(insertedRange, toDuration: clip.duration)
+                        ) {
+                            trackAudioChannels.append(newTrack)
+                            compAudioTrack = newTrack
+                        } else {
+                            continue
                         }
 
-                        let inputParam = AVMutableAudioMixInputParameters(track: compAudioTrack)
-                        inputParam.setVolume(1.0, at: .zero)
-                        audioMixParameters.append(inputParam)
+                        do {
+                            try compAudioTrack.insertTimeRange(
+                                clip.sourceTimeRange,
+                                of: srcAudioTrack,
+                                at: clip.timelineStart
+                            )
+                            if clip.speed != 1.0 && clip.speed > 0 {
+                                let insertedRange = CMTimeRange(start: clip.timelineStart, duration: clip.sourceDuration)
+                                compAudioTrack.scaleTimeRange(insertedRange, toDuration: clip.duration)
+                            }
+                        } catch {
+                            // Overlapping clip fallback on dedicated spillover track
+                            if let spill = composition.addMutableTrack(
+                                withMediaType: .audio,
+                                preferredTrackID: kCMPersistentTrackID_Invalid
+                            ) {
+                                try spill.insertTimeRange(
+                                    clip.sourceTimeRange,
+                                    of: srcAudioTrack,
+                                    at: clip.timelineStart
+                                )
+                                if clip.speed != 1.0 && clip.speed > 0 {
+                                    let insertedRange = CMTimeRange(start: clip.timelineStart, duration: clip.sourceDuration)
+                                    spill.scaleTimeRange(insertedRange, toDuration: clip.duration)
+                                }
+                                spilloverAudioTracks.append(spill)
+                            }
+                        }
                     }
                 } catch {
                     DebugLogger.shared.log("ERRORE inserimento audio '\(clip.mediaItem.name)': \(error)", level: .error)
                 }
+            }
+
+            for chTrack in trackAudioChannels + spilloverAudioTracks {
+                let inputParam = AVMutableAudioMixInputParameters(track: chTrack)
+                inputParam.setVolume(1.0, at: .zero)
+                audioMixParameters.append(inputParam)
             }
         }
 
@@ -191,23 +331,37 @@ public final class CompositionEngine {
             vComp.renderSize = renderSize
             vComp.frameDuration = CMTime(value: 1, timescale: Int32(frameRate > 0 ? frameRate : 30))
 
-            let instruction = AVMutableVideoCompositionInstruction()
-            instruction.timeRange = CMTimeRange(start: .zero, duration: totalDuration)
-
-            var layerInstructions: [AVMutableVideoCompositionLayerInstruction] = []
-            for track in model.videoTracks.reversed() {
-                if track.isEnabled, let compTrack = compVideoTracks[track.id] {
-                    let layerInst = AVMutableVideoCompositionLayerInstruction(assetTrack: compTrack)
-                    if let transforms = clipTransforms[track.id] {
-                        for (startTime, transform) in transforms {
-                            layerInst.setTransform(transform, at: startTime)
+            if LUTEngine.shared.currentLUTParameters() != nil {
+                var layers: [VisionLUTInstruction.TrackLayer] = []
+                for track in model.videoTracks where track.isEnabled {
+                    if let compTrack = compVideoTracks[track.id] {
+                        let segs = (clipTransforms[track.id] ?? []).map {
+                            VisionLUTInstruction.ClipTransformSegment(start: $0.start, end: $0.end, transform: $0.transform)
                         }
+                        layers.append(VisionLUTInstruction.TrackLayer(trackID: compTrack.trackID, segments: segs))
                     }
-                    layerInstructions.append(layerInst)
                 }
+                vComp.customVideoCompositorClass = VisionLUTCompositor.self
+                vComp.instructions = [VisionLUTInstruction(timeRange: CMTimeRange(start: .zero, duration: totalDuration), trackLayers: layers)]
+            } else {
+                let instruction = AVMutableVideoCompositionInstruction()
+                instruction.timeRange = CMTimeRange(start: .zero, duration: totalDuration)
+
+                var layerInstructions: [AVMutableVideoCompositionLayerInstruction] = []
+                for track in model.videoTracks.reversed() {
+                    if track.isEnabled, let compTrack = compVideoTracks[track.id] {
+                        let layerInst = AVMutableVideoCompositionLayerInstruction(assetTrack: compTrack)
+                        if let transforms = clipTransforms[track.id] {
+                            for item in transforms {
+                                layerInst.setTransform(item.transform, at: item.start)
+                            }
+                        }
+                        layerInstructions.append(layerInst)
+                    }
+                }
+                instruction.layerInstructions = layerInstructions
+                vComp.instructions = [instruction]
             }
-            instruction.layerInstructions = layerInstructions
-            vComp.instructions = [instruction]
             videoComposition = vComp
         }
 

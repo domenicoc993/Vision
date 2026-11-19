@@ -1,6 +1,16 @@
 import AppKit
 
 public final class FlatButton: NSButton {
+    public override var isEnabled: Bool {
+        didSet {
+            if !isEnabled {
+                isHovered = false
+                isPressed = false
+            }
+            updateColors()
+        }
+    }
+
     public var isAccentActive: Bool = false {
         didSet {
             updateColors()
@@ -27,6 +37,8 @@ public final class FlatButton: NSButton {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     private func setupUI() {
         wantsLayer = true
@@ -58,6 +70,7 @@ public final class FlatButton: NSButton {
     }
 
     public override func mouseEntered(with event: NSEvent) {
+        guard isEnabled else { return }
         isHovered = true
         updateColors()
     }
@@ -69,6 +82,7 @@ public final class FlatButton: NSButton {
     }
 
     public override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
         isPressed = true
         updateColors()
         super.mouseDown(with: event)
@@ -77,21 +91,31 @@ public final class FlatButton: NSButton {
     }
 
     private func updateColors() {
+        alphaValue = isEnabled ? 1.0 : 0.45
+
         if isBoxless {
             layer?.backgroundColor = NSColor.clear.cgColor
             layer?.borderColor = NSColor.clear.cgColor
             layer?.borderWidth = 0
-            if isAccentActive {
+            if !isEnabled {
+                contentTintColor = NSColor(calibratedWhite: 0.50, alpha: 1.0)
+            } else if isAccentActive {
                 contentTintColor = .systemCyan
             } else if isPressed || isHovered {
                 contentTintColor = .white
             } else {
                 contentTintColor = NSColor(calibratedWhite: 0.90, alpha: 1.0)
             }
+            needsDisplay = true
             return
         }
 
-        if isAccentActive {
+        if !isEnabled {
+            layer?.backgroundColor = NSColor(calibratedWhite: 0.11, alpha: 1.0).cgColor
+            layer?.borderColor = NSColor(calibratedWhite: 0.18, alpha: 1.0).cgColor
+            layer?.borderWidth = 1.0
+            contentTintColor = NSColor(calibratedWhite: 0.55, alpha: 1.0)
+        } else if isAccentActive {
             layer?.backgroundColor = NSColor(calibratedRed: 0.16, green: 0.32, blue: 0.46, alpha: 1.0).cgColor
             layer?.borderColor = NSColor.systemCyan.cgColor
             layer?.borderWidth = 1.2
@@ -112,6 +136,7 @@ public final class FlatButton: NSButton {
             layer?.borderWidth = 1.0
             contentTintColor = NSColor(calibratedWhite: 0.85, alpha: 1.0)
         }
+        needsDisplay = true
     }
 }
 
@@ -165,6 +190,8 @@ public final class IconActionButton: NSButton {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     private func setupUI() {
         wantsLayer = true

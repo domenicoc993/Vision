@@ -9,8 +9,19 @@ public extension Notification.Name {
 public struct WaveformData {
     public let peaks: [Float]
     public let rms: [Float]
+    public let displayPeaks: [Float]
+    public let displayRms: [Float]
     public let binsPerSecond: Double
     public let durationSeconds: Double
+
+    public init(peaks: [Float], rms: [Float], binsPerSecond: Double, durationSeconds: Double) {
+        self.peaks = peaks
+        self.rms = rms
+        self.displayPeaks = peaks.map { powf($0, 0.72) }
+        self.displayRms = rms.map { powf($0, 0.78) }
+        self.binsPerSecond = binsPerSecond
+        self.durationSeconds = durationSeconds
+    }
 
     /// Restituisce (picco massimo, RMS massimo) nell'intervallo [startTime, endTime] in secondi sorgente.
     public func envelope(from startTime: Double, to endTime: Double) -> (peak: Float, rms: Float) {
@@ -25,6 +36,25 @@ public struct WaveformData {
         for i in i0...i1 {
             let p = peaks[i]
             let r = rms[i]
+            if p > maxPeak { maxPeak = p }
+            if r > maxRms { maxRms = r }
+        }
+        return (maxPeak, maxRms)
+    }
+
+    /// Versione pre-curvata percettivamente per rendering a 60fps senza `pow()` sul main thread.
+    public func displayEnvelope(from startTime: Double, to endTime: Double) -> (peak: Float, rms: Float) {
+        guard !displayPeaks.isEmpty, binsPerSecond > 0 else { return (0, 0) }
+        let t0 = max(0.0, min(durationSeconds, startTime))
+        let t1 = max(t0, min(durationSeconds, endTime))
+        let i0 = max(0, min(displayPeaks.count - 1, Int(floor(t0 * binsPerSecond))))
+        let i1 = max(i0, min(displayPeaks.count - 1, Int(floor(t1 * binsPerSecond))))
+
+        var maxPeak: Float = 0
+        var maxRms: Float = 0
+        for i in i0...i1 {
+            let p = displayPeaks[i]
+            let r = displayRms[i]
             if p > maxPeak { maxPeak = p }
             if r > maxRms { maxRms = r }
         }

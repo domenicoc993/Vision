@@ -16,6 +16,7 @@ public struct MediaItem: Identifiable, Hashable {
     public var orientation: ClipOrientation
     public var thumbnail: NSImage?
     public var proxyURL: URL?
+    public var beatAnalysis: SavedBeatAnalysis?
 
     public var hasProxy: Bool {
         guard let p = proxyURL else { return false }
@@ -42,7 +43,8 @@ public struct MediaItem: Identifiable, Hashable {
         audioTrackCount: Int = 0,
         orientation: ClipOrientation = .normal,
         thumbnail: NSImage? = nil,
-        proxyURL: URL? = nil
+        proxyURL: URL? = nil,
+        beatAnalysis: SavedBeatAnalysis? = nil
     ) {
         self.id = id
         self.url = url
@@ -57,6 +59,7 @@ public struct MediaItem: Identifiable, Hashable {
         self.orientation = orientation
         self.thumbnail = thumbnail
         self.proxyURL = proxyURL
+        self.beatAnalysis = beatAnalysis
     }
 
     public static func == (lhs: MediaItem, rhs: MediaItem) -> Bool {
@@ -101,15 +104,18 @@ public struct MediaItem: Identifiable, Hashable {
             }
         }
 
-        // Generate thumbnail for preview grid
+        // Generate lightweight thumbnail and prime bounded disk/RAM cache
         var thumbImage: NSImage? = nil
         if hasVideo {
             let gen = AVAssetImageGenerator(asset: asset)
             gen.appliesPreferredTrackTransform = true
-            gen.maximumSize = CGSize(width: 320, height: 240)
+            gen.maximumSize = CGSize(width: 280, height: 160)
             let captureTime = CMTimeMultiplyByFloat64(duration, multiplier: 0.1) // 10% into clip
             if let cgImg = try? await gen.image(at: captureTime).image {
-                thumbImage = NSImage(cgImage: cgImg, size: NSSize(width: 160, height: 120))
+                thumbImage = NSImage(cgImage: cgImg, size: NSSize(width: CGFloat(cgImg.width), height: CGFloat(cgImg.height)))
+                if let t = thumbImage {
+                    ThumbnailCache.shared.store(t, for: url)
+                }
             }
         }
 

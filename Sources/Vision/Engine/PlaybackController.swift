@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import CoreGraphics
 
 public final class PlaybackController: NSObject {
     public let player = AVPlayer()
@@ -15,6 +16,8 @@ public final class PlaybackController: NSObject {
     public var onTimeChanged: ((CMTime) -> Void)?
     public var onPlayStateChanged: ((Bool) -> Void)?
     public var onStatusChanged: ((String) -> Void)?
+    public var onWillReplaceItem: ((CGImage?) -> Void)?
+    public var onReadyFrameRendered: (() -> Void)?
 
     private struct TimeObserver {
         let ownerId: ObjectIdentifier
@@ -35,8 +38,11 @@ public final class PlaybackController: NSObject {
 
     // Smooth Scrubbing: Seek-Chase Engine (Resolve style)
     private var isSeekInProgress = false
+    private var isLoadingItem = false
     private var chaseTime: CMTime = .invalid
+    private var chaseFrameAccurate: Bool = false
     private var seekGeneration: UInt64 = 0
+    private var jogSettleWorkItem: DispatchWorkItem?
 
     public func addTimeObserver(_ owner: AnyObject, handler: @escaping (CMTime) -> Void) {
         let oid = ObjectIdentifier(owner)
@@ -109,8 +115,8 @@ public final class PlaybackController: NSObject {
             if self.isPlaying != playing {
                 self.isPlaying = playing
             }
-            // While actively playing, always publish periodic time unless a seek is actively chasing
-            if self.isSeekInProgress && !playing { return }
+            // Ignore transitional AVPlayer timestamps when paused, loading a new item, or seeking
+            guard playing, !self.isLoadingItem, !self.isSeekInProgress else { return }
             self.currentTime = time
             self.notifyTimeChanged(time)
         }
@@ -132,12 +138,28 @@ public final class PlaybackController: NSObject {
         }
     }
 
+    public func setPlayheadForPendingReload(_ time: CMTime) {
+        jogSettleWorkItem?.cancel()
+        jogSettleWorkItem = nil
+        let clamped = CMTimeClampToRange(time, range: CMTimeRange(start: .zero, duration: max(duration, CMTime(value: 1, timescale: 600))))
+        seekGeneration &+= 1
+        isLoadingItem = true
+        isSeekInProgress = false
+        chaseTime = .invalid
+        currentTime = clamped
+        notifyTimeChanged(clamped)
+    }
+
     public func clear() {
+        jogSettleWorkItem?.cancel()
+        jogSettleWorkItem = nil
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
         seekGeneration &+= 1
+        isLoadingItem = false
         isSeekInProgress = false
         chaseTime = .invalid
+        onReadyFrameRendered?()
         player.replaceCurrentItem(with: nil)
         self.duration = .zero
         self.currentTime = .zero
@@ -147,7 +169,13 @@ public final class PlaybackController: NSObject {
         DebugLogger.shared.log("Player azzerato (timeline vuota).", level: .playback)
     }
 
-    public func load(item: AVPlayerItem?, duration: CMTime, targetFPS: Double = 30.0, seekToTime: CMTime? = nil) {
+    public func load(
+        item: AVPlayerItem?,
+        duration: CMTime,
+        targetFPS: Double = 30.0,
+        seekToTime: CMTime? = nil,
+        visualHoldImage: CGImage? = nil
+    ) {
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
 
@@ -170,10 +198,14 @@ public final class PlaybackController: NSObject {
             }
         }
 
+        onWillReplaceItem?(visualHoldImage)
+
         self.duration = duration
         self.fps = targetFPS
         self.currentTime = targetTime
         self.seekGeneration &+= 1
+        let loadGeneration = self.seekGeneration
+        self.isLoadingItem = true
         self.isSeekInProgress = false
         self.chaseTime = .invalid
 
@@ -181,20 +213,29 @@ public final class PlaybackController: NSObject {
             guard let self = self else { return }
             switch observedItem.status {
             case .readyToPlay:
-                DebugLogger.shared.log("PlayerItem status: READY TO PLAY (Pronto alla riproduzione)", level: .playback)
-                self.onStatusChanged?("Pronto")
-                // Seek frame-accurately now that decoders are active, avoiding black screens!
-                self.player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-                    DispatchQueue.main.async {
-                        guard let self = self else { return }
-                        self.currentTime = targetTime
-                        self.notifyTimeChanged(targetTime)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self, self.player.currentItem === observedItem else { return }
+                    DebugLogger.shared.log("PlayerItem status: READY TO PLAY (Pronto alla riproduzione)", level: .playback)
+                    self.onStatusChanged?("Pronto")
+                    let desiredTime = (self.seekGeneration == loadGeneration) ? targetTime : self.currentTime
+                    self.player.seek(to: desiredTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                        DispatchQueue.main.async {
+                            guard let self = self, self.player.currentItem === observedItem else { return }
+                            self.isLoadingItem = false
+                            self.currentTime = desiredTime
+                            self.notifyTimeChanged(desiredTime)
+                            self.onReadyFrameRendered?()
+                        }
                     }
                 }
             case .failed:
                 let errMsg = observedItem.error?.localizedDescription ?? "Errore sconosciuto"
                 DebugLogger.shared.log("PlayerItem status: FAILED - \(errMsg)", level: .error)
-                self.onStatusChanged?("Errore: \(errMsg)")
+                DispatchQueue.main.async { [weak self] in
+                    self?.isLoadingItem = false
+                    self?.onStatusChanged?("Errore: \(errMsg)")
+                    self?.onReadyFrameRendered?()
+                }
             case .unknown:
                 DebugLogger.shared.log("PlayerItem status: Inizializzazione...", level: .playback)
                 self.onStatusChanged?("Caricamento...")
@@ -204,8 +245,13 @@ public final class PlaybackController: NSObject {
         }
 
         player.replaceCurrentItem(with: item)
-        // Also seek immediately
-        seek(to: targetTime, frameAccurate: true)
+
+        // Safety failsafe so freeze overlay / loading flag can never linger if AVPlayer stalls
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self = self, self.seekGeneration == loadGeneration else { return }
+            self.isLoadingItem = false
+            self.onReadyFrameRendered?()
+        }
 
         DebugLogger.shared.log("Player caricato: durata = \(String(format: "%.2f", CMTimeGetSeconds(duration)))s, fps = \(targetFPS), playhead a \(formattedCurrentTime)", level: .playback)
     }
@@ -231,6 +277,9 @@ public final class PlaybackController: NSObject {
     }
 
     public func play() {
+        jogSettleWorkItem?.cancel()
+        jogSettleWorkItem = nil
+        onReadyFrameRendered?()
         // If at the end of the timeline, automatically rewind to start
         if CMTimeCompare(currentTime, duration) >= 0 {
             DebugLogger.shared.log("Play alla fine della timeline: riavvolgimento automatico a 00:00:00:00", level: .playback)
@@ -282,42 +331,55 @@ public final class PlaybackController: NSObject {
     }
 
     public func pause() {
+        jogSettleWorkItem?.cancel()
+        jogSettleWorkItem = nil
+        let wasPlaying = isPlaying || (player.rate != 0)
         player.pause()
-        isPlaying = false
-        if !isSeekInProgress {
-            let exact = player.currentTime()
-            if exact.isValid && !CMTimeGetSeconds(exact).isNaN {
-                let dur = max(duration, CMTime(value: 1, timescale: 600))
-                let clamped = CMTimeClampToRange(exact, range: CMTimeRange(start: .zero, duration: dur))
-                currentTime = clamped
-                notifyTimeChanged(clamped)
+        if wasPlaying {
+            isPlaying = false
+            if !isSeekInProgress && !isLoadingItem {
+                let exact = player.currentTime()
+                if exact.isValid && !CMTimeGetSeconds(exact).isNaN {
+                    let dur = max(duration, CMTime(value: 1, timescale: 600))
+                    let clamped = CMTimeClampToRange(exact, range: CMTimeRange(start: .zero, duration: dur))
+                    currentTime = clamped
+                    notifyTimeChanged(clamped)
+                }
             }
+            DebugLogger.shared.log("Pausa a \(formattedCurrentTime)", level: .playback)
+        } else {
+            isPlaying = false
         }
-        DebugLogger.shared.log("Pausa a \(formattedCurrentTime)", level: .playback)
     }
 
     // High performance seek-chase for dragging / scrubbing (Resolve style)
     public func scrub(to time: CMTime) {
+        jogSettleWorkItem?.cancel()
+        jogSettleWorkItem = nil
         let clampedTime = CMTimeClampToRange(time, range: CMTimeRange(start: .zero, duration: max(duration, CMTime(value: 1, timescale: 600))))
         currentTime = clampedTime
         notifyTimeChanged(clampedTime) // Instant 0ms latency UI update!
 
-        if !isSeekInProgress {
+        if !isSeekInProgress && !isLoadingItem {
             executeActualSeek(to: clampedTime, frameAccurate: false)
         } else {
             chaseTime = clampedTime
+            chaseFrameAccurate = false
         }
     }
 
     public func seek(to time: CMTime, frameAccurate: Bool = true) {
+        jogSettleWorkItem?.cancel()
+        jogSettleWorkItem = nil
         let clampedTime = CMTimeClampToRange(time, range: CMTimeRange(start: .zero, duration: max(duration, CMTime(value: 1, timescale: 600))))
         currentTime = clampedTime
         notifyTimeChanged(clampedTime)
 
-        if !isSeekInProgress {
+        if !isSeekInProgress && !isLoadingItem {
             executeActualSeek(to: clampedTime, frameAccurate: frameAccurate)
         } else {
             chaseTime = clampedTime
+            chaseFrameAccurate = frameAccurate
         }
     }
 
@@ -327,17 +389,19 @@ public final class PlaybackController: NSObject {
         let gen = seekGeneration
         let seekTarget = time
 
-        let tolerance: CMTime = frameAccurate ? .zero : CMTime(value: 1, timescale: 30)
+        let tolerance: CMTime = frameAccurate ? .zero : CMTimeMakeWithSeconds(1.0 / max(1.0, fps), preferredTimescale: 6000)
 
         player.seek(to: seekTarget, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self = self, self.seekGeneration == gen else { return }
                 if self.chaseTime.isValid && CMTimeCompare(self.chaseTime, seekTarget) != 0 {
                     let next = self.chaseTime
+                    let nextAccurate = self.chaseFrameAccurate
                     self.chaseTime = .invalid
-                    self.executeActualSeek(to: next, frameAccurate: frameAccurate)
+                    self.executeActualSeek(to: next, frameAccurate: nextAccurate)
                 } else {
                     self.isSeekInProgress = false
+                    self.onReadyFrameRendered?()
                 }
             }
         }
@@ -345,10 +409,74 @@ public final class PlaybackController: NSObject {
 
     public func step(by frames: Int) {
         pause()
-        let frameDuration = CMTime(value: 1, timescale: Int32(fps > 0 ? fps : 30.0))
-        let delta = CMTimeMultiply(frameDuration, multiplier: Int32(frames))
+        let safeFPS = max(1.0, fps)
+        let delta = CMTimeMakeWithSeconds(Double(frames) / safeFPS, preferredTimescale: 6000)
         let newTime = CMTimeAdd(currentTime, delta)
         seek(to: newTime, frameAccurate: true)
+    }
+
+    /// Jog fluido per la ghiera dello Speed Editor: evita snap-back da `player.currentTime()`,
+    /// usa seek rapido durante la rotazione veloce e assesta il frame esatto (`tolerance: .zero`) a fine corsa.
+    public func jog(byFrames frames: Int) {
+        guard frames != 0 else { return }
+        let safeDuration = max(duration, CMTime(value: 1, timescale: 600))
+        let baseTime: CMTime
+        if isPlaying || player.rate != 0 {
+            let live = accurateCurrentTime
+            player.pause()
+            isPlaying = false
+            baseTime = live
+        } else {
+            baseTime = currentTime
+        }
+
+        let safeFPS = max(1.0, fps)
+        let delta = CMTimeMakeWithSeconds(Double(frames) / safeFPS, preferredTimescale: 6000)
+        let clampedTime = CMTimeClampToRange(CMTimeAdd(baseTime, delta), range: CMTimeRange(start: .zero, duration: safeDuration))
+
+        currentTime = clampedTime
+        notifyTimeChanged(clampedTime)
+
+        jogSettleWorkItem?.cancel()
+        jogSettleWorkItem = nil
+
+        let useImmediateExact = abs(frames) <= 2 && !isSeekInProgress && !isLoadingItem
+        if !isSeekInProgress && !isLoadingItem {
+            executeActualSeek(to: clampedTime, frameAccurate: useImmediateExact)
+        } else {
+            chaseTime = clampedTime
+            chaseFrameAccurate = false
+        }
+
+        if !useImmediateExact {
+            let settle = DispatchWorkItem { [weak self] in
+                guard let self = self, !self.isPlaying, !self.isLoadingItem else { return }
+                let target = self.currentTime
+                if !self.isSeekInProgress {
+                    self.executeActualSeek(to: target, frameAccurate: true)
+                } else {
+                    self.chaseTime = target
+                    self.chaseFrameAccurate = true
+                }
+            }
+            jogSettleWorkItem = settle
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.09, execute: settle)
+        }
+    }
+
+    /// Controllo continuo della velocità in modalità Shuttle (-16x .. +16x; 0 = pausa).
+    public func setShuttleRate(_ rate: Float) {
+        jogSettleWorkItem?.cancel()
+        jogSettleWorkItem = nil
+        if abs(rate) < 0.05 {
+            if isPlaying || player.rate != 0 {
+                pause()
+            }
+        } else {
+            let clamped = max(-16.0, min(16.0, rate))
+            player.rate = clamped
+            isPlaying = true
+        }
     }
 
     public var formattedCurrentTime: String {

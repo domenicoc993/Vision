@@ -18,6 +18,7 @@ public struct MediaItemData: Codable {
     public var audioTrackCount: Int
     public var orientation: String
     public var proxyURLPath: String?
+    public var beatAnalysis: SavedBeatAnalysis?
 
     public init(item: MediaItem) {
         self.id = item.id
@@ -33,6 +34,7 @@ public struct MediaItemData: Codable {
         self.audioTrackCount = item.audioTrackCount
         self.orientation = item.orientation.rawValue
         self.proxyURLPath = item.proxyURL?.path
+        self.beatAnalysis = item.beatAnalysis
     }
 
     public func toMediaItem() -> MediaItem {
@@ -68,7 +70,8 @@ public struct MediaItemData: Codable {
             videoCodec: videoCodec,
             audioTrackCount: audioTrackCount,
             orientation: orient,
-            proxyURL: proxy
+            proxyURL: proxy,
+            beatAnalysis: beatAnalysis
         )
     }
 }
@@ -92,6 +95,8 @@ public struct TimelineClipData: Codable {
     public var markers: [Double]?
     public var priority: Int?
     public var isLocked: Bool?
+    public var selectionSourceIn: Double?
+    public var selectionSourceOut: Double?
 
     public init(clip: TimelineClip) {
         self.id = clip.id
@@ -112,6 +117,8 @@ public struct TimelineClipData: Codable {
         self.markers = clip.markers.isEmpty ? nil : clip.markers
         self.priority = clip.priority
         self.isLocked = clip.isLocked ? true : nil
+        self.selectionSourceIn = clip.selectionSourceIn
+        self.selectionSourceOut = clip.selectionSourceOut
     }
 
     public func toClip(mediaItems: [UUID: MediaItem]) -> TimelineClip? {
@@ -136,7 +143,9 @@ public struct TimelineClipData: Codable {
             beatBPM: beatBPM,
             markers: markers ?? [],
             priority: priority,
-            isLocked: isLocked ?? false
+            isLocked: isLocked ?? false,
+            selectionSourceIn: selectionSourceIn,
+            selectionSourceOut: selectionSourceOut
         )
     }
 }
@@ -187,6 +196,9 @@ public struct TimelineModelData: Codable {
     public var isCageLockActive: Bool?
     public var rhythmicCages: [RhythmicCage]?
     public var detectedBPM: Double?
+    public var beatIntervalMode: BeatIntervalMode?
+    public var peakSensitivity: Double?
+    public var playheadSeconds: Double?
 
     public init(model: TimelineModel) {
         self.id = model.id
@@ -203,6 +215,9 @@ public struct TimelineModelData: Codable {
         self.isCageLockActive = model.isCageLockActive
         self.rhythmicCages = model.rhythmicCages
         self.detectedBPM = model.detectedBPM
+        self.beatIntervalMode = model.beatIntervalMode
+        self.peakSensitivity = model.peakSensitivity
+        self.playheadSeconds = model.playheadSeconds
     }
 
     public func toModel(mediaItems: [UUID: MediaItem]) -> TimelineModel {
@@ -222,6 +237,13 @@ public struct TimelineModelData: Codable {
         model.isCageLockActive = isCageLockActive ?? true
         model.rhythmicCages = rhythmicCages ?? []
         model.detectedBPM = detectedBPM
+        if let savedMode = beatIntervalMode {
+            model.beatIntervalMode = savedMode
+        }
+        if let savedSens = peakSensitivity {
+            model.peakSensitivity = savedSens
+        }
+        model.playheadSeconds = max(0.0, playheadSeconds ?? 0.0)
         return model
     }
 }
@@ -298,6 +320,9 @@ public struct ProjectDocumentData: Codable {
     public var activeSelectionIndex: Int?
     public var isProxyPlaybackEnabled: Bool
     public var proxyOutputFolderPath: String?
+    public var lutEnabled: Bool?
+    public var lutPreset: String?
+    public var lutCustomPath: String?
 
     public init(
         project: EditorProject,
@@ -316,6 +341,9 @@ public struct ProjectDocumentData: Codable {
         self.activeSelectionIndex = nil
         self.isProxyPlaybackEnabled = project.isProxyPlaybackEnabled
         self.proxyOutputFolderPath = project.proxyOutputFolderURL?.path
+        self.lutEnabled = LUTEngine.shared.isEnabled
+        self.lutPreset = LUTEngine.shared.currentPreset.rawValue
+        self.lutCustomPath = LUTEngine.shared.activeCustomLUTPath
     }
 }
 
@@ -364,6 +392,15 @@ public final class ProjectDatabase: @unchecked Sendable {
     }
 
     private func getDatabaseURL() -> URL {
+        if let customPath = ProcessInfo.processInfo.environment["VISION_DB_PATH"], !customPath.isEmpty {
+            let url = URL(fileURLWithPath: customPath)
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            return url
+        }
+        let procName = ProcessInfo.processInfo.processName
+        if procName.contains("verify_") || procName.contains("xctest") || procName.hasPrefix("probe_") {
+            return FileManager.default.temporaryDirectory.appendingPathComponent("vision_test_projects.db")
+        }
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let visionDir = appSupport.appendingPathComponent("Vision", isDirectory: true)
         try? FileManager.default.createDirectory(at: visionDir, withIntermediateDirectories: true)
@@ -441,6 +478,33 @@ public final class ProjectDatabase: @unchecked Sendable {
 
     public func saveProjectImmediately(project: EditorProject, mediaItems: [MediaItem]) {
         let doc = ProjectDocumentData(project: project, mediaItems: mediaItems)
+        saveDocumentImmediately(doc)
+    }
+
+    public func saveDocumentImmediately(_ doc: ProjectDocumentData) {
+        dbQueue.sync { [weak self] in
+            self?.upsertDocumentLocked(doc)
+        }
+    }
+
+    public func scheduleRealtimeAutosave(project: EditorProject, mediaItems: [MediaItem]) {
+        pendingSaveWorkItem?.cancel()
+        let doc = ProjectDocumentData(project: project, mediaItems: mediaItems)
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.saveDocumentAsync(doc)
+        }
+        pendingSaveWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
+    }
+
+    private func saveDocumentAsync(_ doc: ProjectDocumentData) {
+        dbQueue.async { [weak self] in
+            self?.upsertDocumentLocked(doc)
+        }
+    }
+
+    private func upsertDocumentLocked(_ doc: ProjectDocumentData) {
+        guard let db = self.db else { return }
         guard let jsonData = try? JSONEncoder().encode(doc),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
             return
@@ -450,65 +514,53 @@ public final class ProjectDatabase: @unchecked Sendable {
         let name = doc.name
         let createdTs = doc.createdAt.timeIntervalSince1970
         let updatedTs = doc.updatedAt.timeIntervalSince1970
-        let primaryTimeline = project.activeTimeline
-        let fps = Double(primaryTimeline.format.fps)
-        let width = Int(primaryTimeline.format.size.width)
-        let height = Int(primaryTimeline.format.size.height)
+        let primaryTimeline = doc.timelines.indices.contains(doc.activeTimelineIndex) ? doc.timelines[doc.activeTimelineIndex] : doc.timelines.first
+        let fps = primaryTimeline?.fps ?? 30.0
+        let width = Int(primaryTimeline?.width ?? 1920)
+        let height = Int(primaryTimeline?.height ?? 1080)
         let tCount = doc.timelines.filter { !($0.isSelection ?? false) }.count
         let mCount = doc.mediaItems.count
         let sCount = doc.timelines.filter { $0.isSelection ?? false }.count
 
-        dbQueue.sync { [weak self] in
-            guard let self = self, let db = self.db else { return }
-            let upsertSQL = """
-            INSERT INTO projects (id, name, created_at, updated_at, fps, width, height, timelines_count, media_count, selections_count, project_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                updated_at = excluded.updated_at,
-                fps = excluded.fps,
-                width = excluded.width,
-                height = excluded.height,
-                timelines_count = excluded.timelines_count,
-                media_count = excluded.media_count,
-                selections_count = excluded.selections_count,
-                project_json = excluded.project_json;
-            """
+        let upsertSQL = """
+        INSERT INTO projects (id, name, created_at, updated_at, fps, width, height, timelines_count, media_count, selections_count, project_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            updated_at = excluded.updated_at,
+            fps = excluded.fps,
+            width = excluded.width,
+            height = excluded.height,
+            timelines_count = excluded.timelines_count,
+            media_count = excluded.media_count,
+            selections_count = excluded.selections_count,
+            project_json = excluded.project_json;
+        """
 
-            var stmt: OpaquePointer?
-            if sqlite3_prepare_v2(db, upsertSQL, -1, &stmt, nil) == SQLITE_OK {
-                sqlite3_bind_text(stmt, 1, (pId as NSString).utf8String, -1, nil)
-                sqlite3_bind_text(stmt, 2, (name as NSString).utf8String, -1, nil)
-                sqlite3_bind_double(stmt, 3, createdTs)
-                sqlite3_bind_double(stmt, 4, updatedTs)
-                sqlite3_bind_double(stmt, 5, fps)
-                sqlite3_bind_int(stmt, 6, Int32(width))
-                sqlite3_bind_int(stmt, 7, Int32(height))
-                sqlite3_bind_int(stmt, 8, Int32(tCount))
-                sqlite3_bind_int(stmt, 9, Int32(mCount))
-                sqlite3_bind_int(stmt, 10, Int32(sCount))
-                sqlite3_bind_text(stmt, 11, (jsonString as NSString).utf8String, -1, nil)
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, upsertSQL, -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(stmt, 1, (pId as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, 2, (name as NSString).utf8String, -1, nil)
+            sqlite3_bind_double(stmt, 3, createdTs)
+            sqlite3_bind_double(stmt, 4, updatedTs)
+            sqlite3_bind_double(stmt, 5, fps)
+            sqlite3_bind_int(stmt, 6, Int32(width))
+            sqlite3_bind_int(stmt, 7, Int32(height))
+            sqlite3_bind_int(stmt, 8, Int32(tCount))
+            sqlite3_bind_int(stmt, 9, Int32(mCount))
+            sqlite3_bind_int(stmt, 10, Int32(sCount))
+            sqlite3_bind_text(stmt, 11, (jsonString as NSString).utf8String, -1, nil)
 
-                if sqlite3_step(stmt) != SQLITE_DONE {
-                    DebugLogger.shared.log("Errore salvataggio progetto SQLite: \(String(cString: sqlite3_errmsg(db)))", level: .error)
-                }
-            }
-            sqlite3_finalize(stmt)
-
-            DispatchQueue.main.async {
-                EditorProject.shared.lastSavedAt = Date()
-                NotificationCenter.default.post(name: NSNotification.Name("ProjectSavedRealtime"), object: nil)
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                DebugLogger.shared.log("Errore salvataggio progetto SQLite: \(String(cString: sqlite3_errmsg(db)))", level: .error)
             }
         }
-    }
+        sqlite3_finalize(stmt)
 
-    public func scheduleRealtimeAutosave(project: EditorProject, mediaItems: [MediaItem]) {
-        pendingSaveWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.saveProjectImmediately(project: project, mediaItems: mediaItems)
+        DispatchQueue.main.async {
+            EditorProject.shared.lastSavedAt = Date()
+            NotificationCenter.default.post(name: NSNotification.Name("ProjectSavedRealtime"), object: nil)
         }
-        pendingSaveWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
     }
 
     public func loadProjectDocument(id: UUID) -> ProjectDocumentData? {

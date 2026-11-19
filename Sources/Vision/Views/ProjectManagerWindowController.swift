@@ -1,33 +1,53 @@
 import AppKit
 
-public final class ProjectManagerWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
+private final class ProjectListTableView: NSTableView {
+    var onRightClickRow: ((Int, NSEvent) -> Void)?
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        nil
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let row = self.row(at: point)
+        guard row >= 0 else { return }
+        if !selectedRowIndexes.contains(row) {
+            selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        onRightClickRow?(row, event)
+    }
+}
+
+public final class ProjectManagerWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate, NSTextFieldDelegate {
     public var onOpenProject: ((ProjectDocumentData) -> Void)?
     public var onCreateNewProject: ((String) -> Void)?
     public var onCloseWithoutProject: (() -> Void)?
+    public var activeLiveDocumentProvider: (() -> ProjectDocumentData?)?
 
     private var allProjects: [ProjectRecord] = []
     private var filteredProjects: [ProjectRecord] = []
 
-    private let searchField = NSSearchField()
-    private let tableView = NSTableView()
+    private let searchBtn = IconActionButton(toolTip: "Cerca progetti", isToggleMode: true)
+    private let searchField = NSTextField()
+    private var searchWidthConstraint: NSLayoutConstraint!
+    private var isSearchExpanded: Bool = false
+
+    private let newProjectBtn = IconActionButton(toolTip: "Nuovo Progetto", isToggleMode: false)
+    private let tableView = ProjectListTableView()
     private let scrollView = NSScrollView()
-    private let statusLabel = NSTextField(labelWithString: "")
     private let emptyStateLabel = NSTextField(labelWithString: "")
-    private let openBtn = NSButton()
-    private let duplicateBtn = NSButton()
-    private let renameBtn = NSButton()
-    private let deleteBtn = NSButton()
-    private let closeBtn = NSButton()
+    private let backupBtn = FlatButton(title: "Backup (3g)...")
+    private let openBtn = FlatButton(title: "Apri Progetto")
 
     public init() {
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 880, height: 530),
+            contentRect: NSRect(x: 0, y: 0, width: 820, height: 500),
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
-        win.minSize = NSSize(width: 720, height: 420)
-        win.title = "Project Manager — Vision"
+        win.minSize = NSSize(width: 680, height: 400)
+        win.title = "Progetti — Vision"
         win.titlebarAppearsTransparent = true
         win.backgroundColor = NSColor(calibratedWhite: 0.085, alpha: 1.0)
         win.isReleasedWhenClosed = false
@@ -56,44 +76,47 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
         contentView.wantsLayer = true
         contentView.layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0).cgColor
 
-        // 1. Top Header Bar
+        // 1. Minimal Top Header Bar (Search toggle + expandable borderless search + '+' action)
         let headerView = NSView()
         headerView.translatesAutoresizingMaskIntoConstraints = false
         headerView.wantsLayer = true
         headerView.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
         contentView.addSubview(headerView)
 
-        let titleIcon = NSImageView()
-        titleIcon.translatesAutoresizingMaskIntoConstraints = false
-        titleIcon.image = Lucide.image(.film, size: 22, color: .systemCyan)
-        headerView.addSubview(titleIcon)
+        let headerBorder = NSView()
+        headerBorder.translatesAutoresizingMaskIntoConstraints = false
+        headerBorder.wantsLayer = true
+        headerBorder.layer?.backgroundColor = NSColor(calibratedWhite: 0.16, alpha: 1.0).cgColor
+        headerView.addSubview(headerBorder)
 
-        let titleLabel = NSTextField(labelWithString: "Gestione Progetti")
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        titleLabel.font = NSFont.systemFont(ofSize: 15, weight: .bold)
-        titleLabel.textColor = .white
-        headerView.addSubview(titleLabel)
-
-        let subtitleLabel = NSTextField(labelWithString: "Database SQLite locale • Salvataggio continuo in tempo reale")
-        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
-        subtitleLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        subtitleLabel.textColor = NSColor(calibratedWhite: 0.65, alpha: 1.0)
-        headerView.addSubview(subtitleLabel)
+        searchBtn.translatesAutoresizingMaskIntoConstraints = false
+        searchBtn.image = Lucide.template(.search, size: 15)
+        searchBtn.activeTintColor = .systemCyan
+        searchBtn.inactiveTintColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
+        searchBtn.target = self
+        searchBtn.action = #selector(onToggleSearchClicked)
+        headerView.addSubview(searchBtn)
 
         searchField.translatesAutoresizingMaskIntoConstraints = false
+        searchField.isBordered = false
+        searchField.isBezeled = false
+        searchField.drawsBackground = false
+        searchField.focusRingType = .none
+        searchField.font = NSFont.systemFont(ofSize: 12.5, weight: .regular)
+        searchField.textColor = .white
         searchField.placeholderString = "Cerca progetti..."
-        searchField.target = self
-        searchField.action = #selector(onSearchChanged)
+        searchField.delegate = self
+        searchField.isHidden = true
+        searchField.alphaValue = 0.0
         headerView.addSubview(searchField)
 
-        let newProjBtn = NSButton()
-        newProjBtn.translatesAutoresizingMaskIntoConstraints = false
-        newProjBtn.title = "+ Nuovo Progetto"
-        newProjBtn.bezelStyle = .rounded
-        newProjBtn.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
-        newProjBtn.target = self
-        newProjBtn.action = #selector(onNewProjectClicked)
-        headerView.addSubview(newProjBtn)
+        newProjectBtn.translatesAutoresizingMaskIntoConstraints = false
+        newProjectBtn.image = Lucide.template(.plus, size: 17)
+        newProjectBtn.activeTintColor = .white
+        newProjectBtn.inactiveTintColor = NSColor(calibratedWhite: 0.85, alpha: 1.0)
+        newProjectBtn.target = self
+        newProjectBtn.action = #selector(onNewProjectClicked)
+        headerView.addSubview(newProjectBtn)
 
         // 2. Center Table View
         setupTableView()
@@ -115,82 +138,63 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
         emptyStateLabel.isHidden = true
         contentView.addSubview(emptyStateLabel)
 
-        // 3. Bottom Action Bar
+        // 3. Minimal Bottom Bar (Open Action only — window close via macOS traffic light)
         let bottomBar = NSView()
         bottomBar.translatesAutoresizingMaskIntoConstraints = false
         bottomBar.wantsLayer = true
         bottomBar.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
         contentView.addSubview(bottomBar)
 
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        statusLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        statusLabel.textColor = NSColor(calibratedWhite: 0.7, alpha: 1.0)
-        bottomBar.addSubview(statusLabel)
+        let bottomBorder = NSView()
+        bottomBorder.translatesAutoresizingMaskIntoConstraints = false
+        bottomBorder.wantsLayer = true
+        bottomBorder.layer?.backgroundColor = NSColor(calibratedWhite: 0.16, alpha: 1.0).cgColor
+        bottomBar.addSubview(bottomBorder)
 
-        let buttonStack = NSStackView()
-        buttonStack.translatesAutoresizingMaskIntoConstraints = false
-        buttonStack.orientation = .horizontal
-        buttonStack.spacing = 8
-        buttonStack.alignment = .centerY
-        bottomBar.addSubview(buttonStack)
+        backupBtn.translatesAutoresizingMaskIntoConstraints = false
+        backupBtn.image = Lucide.template(.history, size: 13)
+        backupBtn.imagePosition = .imageLeading
+        backupBtn.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        backupBtn.target = self
+        backupBtn.action = #selector(onBackupsClicked)
+        bottomBar.addSubview(backupBtn)
 
-        deleteBtn.title = "🗑️ Elimina"
-        deleteBtn.bezelStyle = .rounded
-        deleteBtn.target = self
-        deleteBtn.action = #selector(onDeleteClicked)
-        buttonStack.addArrangedSubview(deleteBtn)
-
-        duplicateBtn.title = "📋 Duplica"
-        duplicateBtn.bezelStyle = .rounded
-        duplicateBtn.target = self
-        duplicateBtn.action = #selector(onDuplicateClicked)
-        buttonStack.addArrangedSubview(duplicateBtn)
-
-        renameBtn.title = "✏️ Rinomina"
-        renameBtn.bezelStyle = .rounded
-        renameBtn.target = self
-        renameBtn.action = #selector(onRenameClicked)
-        buttonStack.addArrangedSubview(renameBtn)
-
-        openBtn.title = "🚀 Apri Progetto"
-        openBtn.bezelStyle = .rounded
+        openBtn.translatesAutoresizingMaskIntoConstraints = false
+        openBtn.image = Lucide.template(.play, size: 13)
+        openBtn.imagePosition = .imageLeading
+        openBtn.isAccentActive = true
         openBtn.keyEquivalent = "\r"
-        openBtn.font = NSFont.systemFont(ofSize: 12, weight: .bold)
+        openBtn.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         openBtn.target = self
         openBtn.action = #selector(onOpenClicked)
-        buttonStack.addArrangedSubview(openBtn)
+        bottomBar.addSubview(openBtn)
 
-        closeBtn.title = "Chiudi"
-        closeBtn.bezelStyle = .rounded
-        closeBtn.keyEquivalent = "\u{1b}"
-        closeBtn.target = self
-        closeBtn.action = #selector(onCloseClicked)
-        buttonStack.addArrangedSubview(closeBtn)
+        searchWidthConstraint = searchField.widthAnchor.constraint(equalToConstant: 0)
 
         NSLayoutConstraint.activate([
             headerView.topAnchor.constraint(equalTo: contentView.topAnchor),
             headerView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             headerView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            headerView.heightAnchor.constraint(equalToConstant: 58),
+            headerView.heightAnchor.constraint(equalToConstant: 44),
 
-            titleIcon.leadingAnchor.constraint(equalTo: headerView.leadingAnchor, constant: 18),
-            titleIcon.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
-            titleIcon.widthAnchor.constraint(equalToConstant: 24),
-            titleIcon.heightAnchor.constraint(equalToConstant: 24),
+            headerBorder.leadingAnchor.constraint(equalTo: headerView.leadingAnchor),
+            headerBorder.trailingAnchor.constraint(equalTo: headerView.trailingAnchor),
+            headerBorder.bottomAnchor.constraint(equalTo: headerView.bottomAnchor),
+            headerBorder.heightAnchor.constraint(equalToConstant: 1),
 
-            titleLabel.topAnchor.constraint(equalTo: headerView.topAnchor, constant: 12),
-            titleLabel.leadingAnchor.constraint(equalTo: titleIcon.trailingAnchor, constant: 10),
+            searchBtn.leadingAnchor.constraint(equalTo: headerView.leadingAnchor, constant: 14),
+            searchBtn.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
+            searchBtn.widthAnchor.constraint(equalToConstant: 26),
+            searchBtn.heightAnchor.constraint(equalToConstant: 26),
 
-            subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
-            subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-
-            newProjBtn.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -16),
-            newProjBtn.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
-            newProjBtn.heightAnchor.constraint(equalToConstant: 28),
-
-            searchField.trailingAnchor.constraint(equalTo: newProjBtn.leadingAnchor, constant: -12),
+            searchField.leadingAnchor.constraint(equalTo: searchBtn.trailingAnchor, constant: 6),
             searchField.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
-            searchField.widthAnchor.constraint(equalToConstant: 200),
+            searchWidthConstraint,
+
+            newProjectBtn.trailingAnchor.constraint(equalTo: headerView.trailingAnchor, constant: -14),
+            newProjectBtn.centerYAnchor.constraint(equalTo: headerView.centerYAnchor),
+            newProjectBtn.widthAnchor.constraint(equalToConstant: 28),
+            newProjectBtn.heightAnchor.constraint(equalToConstant: 28),
 
             scrollView.topAnchor.constraint(equalTo: headerView.bottomAnchor),
             scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
@@ -203,13 +207,22 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
             bottomBar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             bottomBar.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             bottomBar.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-            bottomBar.heightAnchor.constraint(equalToConstant: 48),
+            bottomBar.heightAnchor.constraint(equalToConstant: 46),
 
-            statusLabel.leadingAnchor.constraint(equalTo: bottomBar.leadingAnchor, constant: 16),
-            statusLabel.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
+            bottomBorder.leadingAnchor.constraint(equalTo: bottomBar.leadingAnchor),
+            bottomBorder.trailingAnchor.constraint(equalTo: bottomBar.trailingAnchor),
+            bottomBorder.topAnchor.constraint(equalTo: bottomBar.topAnchor),
+            bottomBorder.heightAnchor.constraint(equalToConstant: 1),
 
-            buttonStack.trailingAnchor.constraint(equalTo: bottomBar.trailingAnchor, constant: -16),
-            buttonStack.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor)
+            backupBtn.leadingAnchor.constraint(equalTo: bottomBar.leadingAnchor, constant: 14),
+            backupBtn.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
+            backupBtn.widthAnchor.constraint(equalToConstant: 146),
+            backupBtn.heightAnchor.constraint(equalToConstant: 28),
+
+            openBtn.trailingAnchor.constraint(equalTo: bottomBar.trailingAnchor, constant: -14),
+            openBtn.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
+            openBtn.widthAnchor.constraint(equalToConstant: 132),
+            openBtn.heightAnchor.constraint(equalToConstant: 28)
         ])
     }
 
@@ -224,15 +237,13 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
         tableView.target = self
         tableView.headerView = NSTableHeaderView()
         tableView.autoresizingMask = [.width, .height]
-
-        let colStatus = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("Status"))
-        colStatus.title = "Stato"
-        colStatus.width = 85
-        tableView.addTableColumn(colStatus)
+        tableView.onRightClickRow = { [weak self] row, event in
+            self?.presentContextMenu(forRow: row, event: event)
+        }
 
         let colName = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("Name"))
         colName.title = "Nome Progetto"
-        colName.width = 250
+        colName.width = 290
         tableView.addTableColumn(colName)
 
         let colRes = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("Resolution"))
@@ -242,7 +253,7 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
 
         let colTL = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("Timelines"))
         colTL.title = "Timeline & Selezioni"
-        colTL.width = 140
+        colTL.width = 150
         tableView.addTableColumn(colTL)
 
         let colClips = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("Clips"))
@@ -272,7 +283,7 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
 
         if filteredProjects.isEmpty {
             if searchField.stringValue.isEmpty {
-                emptyStateLabel.stringValue = "Nessun progetto nel database.\nFai clic su '+ Nuovo Progetto' in alto a destra per iniziare."
+                emptyStateLabel.stringValue = "Nessun progetto salvato.\nFai clic su + in alto a destra per iniziare."
             } else {
                 emptyStateLabel.stringValue = "Nessun progetto corrispondente a '\(searchField.stringValue)'"
             }
@@ -281,40 +292,153 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
             emptyStateLabel.isHidden = true
         }
 
-        // Auto-select currently active project if available, or first row
         if let activeIdx = filteredProjects.firstIndex(where: { $0.id == EditorProject.shared.projectId }) {
             tableView.selectRowIndexes(IndexSet(integer: activeIdx), byExtendingSelection: false)
         } else if !filteredProjects.isEmpty {
             tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         }
 
-        statusLabel.stringValue = "Progetti salvati nel DB: \(allProjects.count)"
         updateButtonStates()
     }
 
     private func updateButtonStates() {
         let selectedRow = tableView.selectedRow
-        let hasSelection = selectedRow >= 0 && selectedRow < filteredProjects.count
-        openBtn.isEnabled = hasSelection
-        duplicateBtn.isEnabled = hasSelection
-        renameBtn.isEnabled = hasSelection
-
-        if hasSelection {
-            let p = filteredProjects[selectedRow]
-            let isCurrent = p.id == EditorProject.shared.projectId
-            deleteBtn.isEnabled = !isCurrent
+        let valid = selectedRow >= 0 && selectedRow < filteredProjects.count
+        openBtn.isEnabled = valid
+        backupBtn.isEnabled = valid
+        if valid {
+            let count = ProjectBackupManager.shared.backupCount(for: filteredProjects[selectedRow].id)
+            backupBtn.title = count > 0 ? "Backup (\(count))..." : "Backup (3g)..."
         } else {
-            deleteBtn.isEnabled = false
+            backupBtn.title = "Backup (3g)..."
         }
     }
 
-    @objc private func onSearchChanged() {
+    @objc private func onToggleSearchClicked() {
+        setSearchExpanded(!isSearchExpanded)
+    }
+
+    private func setSearchExpanded(_ expanded: Bool) {
+        isSearchExpanded = expanded
+        searchBtn.isToggleActive = expanded
+        if expanded {
+            searchField.isHidden = false
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.18
+                ctx.allowsImplicitAnimation = true
+                searchWidthConstraint.constant = 240
+                searchField.alphaValue = 1.0
+                window?.contentView?.layoutSubtreeIfNeeded()
+            } completionHandler: { [weak self] in
+                guard let self else { return }
+                self.window?.makeFirstResponder(self.searchField)
+            }
+        } else {
+            if !searchField.stringValue.isEmpty {
+                searchField.stringValue = ""
+                applyFilter()
+            }
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.16
+                ctx.allowsImplicitAnimation = true
+                searchWidthConstraint.constant = 0
+                searchField.alphaValue = 0.0
+                window?.contentView?.layoutSubtreeIfNeeded()
+            } completionHandler: { [weak self] in
+                guard let self, !self.isSearchExpanded else { return }
+                self.searchField.isHidden = true
+            }
+        }
+    }
+
+    public func controlTextDidChange(_ obj: Notification) {
         applyFilter()
     }
 
+    public func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            setSearchExpanded(false)
+            return true
+        }
+        return false
+    }
+
+    private func presentContextMenu(forRow row: Int, event: NSEvent) {
+        guard row >= 0 && row < filteredProjects.count else { return }
+        let p = filteredProjects[row]
+        let isCurrent = p.id == EditorProject.shared.projectId
+
+        let backupCount = ProjectBackupManager.shared.backupCount(for: p.id)
+        let backupTitle = backupCount > 0 ? "Cronologia Backup (\(backupCount))..." : "Cronologia Backup (3 giorni)..."
+
+        let items: [VisionMenuItem] = [
+            .action(title: "Apri Progetto", icon: .play, iconColor: .systemCyan) { [weak self] in
+                self?.openProject(at: row)
+            },
+            .action(title: backupTitle, icon: .history, iconColor: .systemCyan) { [weak self] in
+                self?.showBackups(at: row)
+            },
+            .separator,
+            .action(title: "Rinomina", icon: .pencil) { [weak self] in
+                self?.renameProject(at: row)
+            },
+            .action(title: "Duplica", icon: .copy) { [weak self] in
+                self?.duplicateProject(at: row)
+            },
+            .separator,
+            .action(
+                title: "Elimina",
+                icon: .trash,
+                isEnabled: !isCurrent,
+                isDestructive: true
+            ) { [weak self] in
+                self?.deleteProject(at: row)
+            }
+        ]
+        VisionMenu(items: items).show(for: event, in: tableView)
+    }
+
     // MARK: - Actions
+    @objc private func onBackupsClicked() {
+        showBackups(at: tableView.selectedRow)
+    }
+
+    private func showBackups(at row: Int) {
+        guard row >= 0 && row < filteredProjects.count else { return }
+        let target = filteredProjects[row]
+        let liveProvider: (() -> ProjectDocumentData?)? = { [weak self] in
+            if let liveDoc = self?.activeLiveDocumentProvider?(), liveDoc.id == target.id {
+                return liveDoc
+            }
+            return nil
+        }
+
+        ProjectBackupDialog.showModal(
+            for: target,
+            relativeTo: self.window,
+            currentLiveDocumentProvider: liveProvider
+        ) { [weak self] action in
+            guard let self = self else { return }
+            switch action {
+            case .restoredCurrentProject(let restoredDoc):
+                self.onOpenProject?(restoredDoc)
+                self.closeModal(didOpenProject: true)
+            case .createdNewProject(let newDoc):
+                self.reloadProjects()
+                if let idx = self.filteredProjects.firstIndex(where: { $0.id == newDoc.id }) {
+                    self.tableView.selectRowIndexes(IndexSet(integer: idx), byExtendingSelection: false)
+                    self.tableView.scrollRowToVisible(idx)
+                }
+            }
+        }
+        updateButtonStates()
+    }
+
     @objc private func onOpenClicked() {
-        let row = tableView.selectedRow
+        openProject(at: tableView.selectedRow)
+    }
+
+    private func openProject(at row: Int) {
         guard row >= 0 && row < filteredProjects.count else { return }
         let targetRecord = filteredProjects[row]
 
@@ -358,8 +482,7 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
         }
     }
 
-    @objc private func onDuplicateClicked() {
-        let row = tableView.selectedRow
+    private func duplicateProject(at row: Int) {
         guard row >= 0 && row < filteredProjects.count else { return }
         let p = filteredProjects[row]
         if let _ = ProjectDatabase.shared.duplicateProject(id: p.id) {
@@ -367,8 +490,7 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
         }
     }
 
-    @objc private func onRenameClicked() {
-        let row = tableView.selectedRow
+    private func renameProject(at row: Int) {
         guard row >= 0 && row < filteredProjects.count else { return }
         let p = filteredProjects[row]
 
@@ -410,8 +532,7 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
         }
     }
 
-    @objc private func onDeleteClicked() {
-        let row = tableView.selectedRow
+    private func deleteProject(at row: Int) {
         guard row >= 0 && row < filteredProjects.count else { return }
         let p = filteredProjects[row]
         guard p.id != EditorProject.shared.projectId else { return }
@@ -437,10 +558,6 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
                 reloadProjects()
             }
         }
-    }
-
-    @objc private func onCloseClicked() {
-        closeModal(didOpenProject: false)
     }
 
     private func closeModal(didOpenProject: Bool = false) {
@@ -483,8 +600,9 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
 
                 let icon = NSImageView()
                 icon.translatesAutoresizingMaskIntoConstraints = false
-                icon.image = Lucide.image(.film, size: 16, color: .systemCyan)
+                icon.image = Lucide.template(.film, size: 16)
                 nameCell?.addSubview(icon)
+                nameCell?.imageView = icon
 
                 let tf = NSTextField(labelWithString: "")
                 tf.translatesAutoresizingMaskIntoConstraints = false
@@ -505,6 +623,7 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
                     tf.centerYAnchor.constraint(equalTo: nameCell!.centerYAnchor)
                 ])
             }
+            nameCell?.imageView?.contentTintColor = isCurrent ? NSColor.systemCyan : NSColor(calibratedWhite: 0.60, alpha: 1.0)
             nameCell?.textField?.stringValue = p.name
             nameCell?.textField?.textColor = isCurrent ? NSColor.systemCyan : NSColor.white
             nameCell?.textField?.font = NSFont.systemFont(ofSize: 12, weight: isCurrent ? .bold : .medium)
@@ -532,11 +651,6 @@ public final class ProjectManagerWindowController: NSWindowController, NSTableVi
         }
 
         switch colId {
-        case "Status":
-            cell?.textField?.stringValue = isCurrent ? "● ATTIVO" : "—"
-            cell?.textField?.textColor = isCurrent ? NSColor.systemCyan : NSColor.tertiaryLabelColor
-            cell?.textField?.font = NSFont.systemFont(ofSize: 10, weight: .bold)
-
         case "Resolution":
             cell?.textField?.stringValue = p.formattedResolution
             cell?.textField?.textColor = NSColor.secondaryLabelColor

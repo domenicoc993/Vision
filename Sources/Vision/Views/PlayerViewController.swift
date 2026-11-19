@@ -25,10 +25,19 @@ public final class PlayerViewController: NSViewController {
     private let fullScreenButton = IconActionButton(toolTip: "Schermo Intero (⌃F)", isToggleMode: false)
     private var fullScreenController: FullScreenPlayerWindowController?
 
-    // Video Canvas Frame Box (with gray workspace around it)
+    // Video Canvas Frame Box (with gray workspace around it) + Zoom/Pan support
     private let workspaceView = NSView()
     private let videoFrameBox = NSView()
+    private let zoomHostView = NSView()
+    private let freezeFrameOverlay = NSView()
+    private let interactionOverlay = ViewerZoomInteractionView()
+    private let zoomButton = FlatButton(title: "Adatta ▾")
+    private var zoomMenu: VisionMenu?
     private var aspectConstraint: NSLayoutConstraint?
+
+    public private(set) var isZoomFitMode: Bool = true
+    public private(set) var zoomScale: CGFloat = 1.0
+    private var zoomPanOffset: CGPoint = .zero
 
     public init(playbackController: PlaybackController) {
         self.playbackController = playbackController
@@ -61,6 +70,7 @@ public final class PlayerViewController: NSViewController {
         videoFrameBox.translatesAutoresizingMaskIntoConstraints = false
         videoFrameBox.wantsLayer = true
         videoFrameBox.layer?.backgroundColor = NSColor.black.cgColor
+        videoFrameBox.layer?.masksToBounds = true
         videoFrameBox.layer?.borderWidth = 0.0
         videoFrameBox.layer?.shadowColor = NSColor.black.cgColor
         videoFrameBox.layer?.shadowOpacity = 0.6
@@ -68,7 +78,13 @@ public final class PlayerViewController: NSViewController {
         videoFrameBox.layer?.shadowRadius = 10
         workspaceView.addSubview(videoFrameBox)
 
-        // Player View inside the frame box
+        // Zoomable Host inside videoFrameBox (frame managed dynamically to avoid AutoLayout churn during smooth zoom/pan)
+        zoomHostView.wantsLayer = true
+        zoomHostView.translatesAutoresizingMaskIntoConstraints = true
+        zoomHostView.autoresizingMask = []
+        videoFrameBox.addSubview(zoomHostView)
+
+        // Player View inside zoomHostView
         playerView.translatesAutoresizingMaskIntoConstraints = false
         playerView.wantsLayer = true
         playerView.player = playbackController.player
@@ -81,9 +97,30 @@ public final class PlayerViewController: NSViewController {
             playerView.allowsVideoFrameAnalysis = false
         }
 
-        videoFrameBox.addSubview(playerView)
+        zoomHostView.addSubview(playerView)
 
-        // Floating Proxy Active Indicator Badge
+        // Still-frame layer overlay holds trimmed frame across AVPlayerItem reloads without affecting Auto Layout size
+        freezeFrameOverlay.translatesAutoresizingMaskIntoConstraints = false
+        freezeFrameOverlay.wantsLayer = true
+        freezeFrameOverlay.layer?.contentsGravity = .resizeAspect
+        freezeFrameOverlay.layer?.masksToBounds = true
+        freezeFrameOverlay.isHidden = true
+        zoomHostView.addSubview(freezeFrameOverlay)
+
+        // Interactive overlay for mouse scroll zoom & hand pan
+        interactionOverlay.translatesAutoresizingMaskIntoConstraints = false
+        interactionOverlay.onScrollZoom = { [weak self] deltaY, pointInView, isPrecise in
+            self?.handleScrollZoom(deltaY: deltaY, anchorPoint: pointInView, isPrecise: isPrecise)
+        }
+        interactionOverlay.onPanDelta = { [weak self] dx, dy in
+            self?.handlePanDelta(dx: dx, dy: dy)
+        }
+        interactionOverlay.onDoubleClickReset = { [weak self] in
+            self?.setViewerZoomFit()
+        }
+        videoFrameBox.addSubview(interactionOverlay)
+
+        // Floating Proxy Active Indicator Badge (top-right inside frame)
         proxyBadgeLabel.translatesAutoresizingMaskIntoConstraints = false
         proxyBadgeLabel.wantsLayer = true
         proxyBadgeLabel.layer?.backgroundColor = NSColor(calibratedRed: 0.0, green: 0.75, blue: 0.45, alpha: 0.9).cgColor
@@ -93,6 +130,14 @@ public final class PlayerViewController: NSViewController {
         proxyBadgeLabel.alignment = .center
         proxyBadgeLabel.isHidden = !EditorProject.shared.isProxyPlaybackEnabled
         videoFrameBox.addSubview(proxyBadgeLabel)
+
+        // Top-left Viewer Zoom Dropdown Button inside workspaceView
+        zoomButton.translatesAutoresizingMaskIntoConstraints = false
+        zoomButton.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        zoomButton.toolTip = "Zoom Viewer (Scroll: Zoom, Trascina: Sposta, Doppio click: Adatta)"
+        zoomButton.target = self
+        zoomButton.action = #selector(onZoomDropdownClicked)
+        workspaceView.addSubview(zoomButton)
 
         // Transport Bar
         let transportBar = NSView()
@@ -129,15 +174,30 @@ public final class PlayerViewController: NSViewController {
             hConstraint,
             aspect,
 
-            playerView.topAnchor.constraint(equalTo: videoFrameBox.topAnchor),
-            playerView.leadingAnchor.constraint(equalTo: videoFrameBox.leadingAnchor),
-            playerView.trailingAnchor.constraint(equalTo: videoFrameBox.trailingAnchor),
-            playerView.bottomAnchor.constraint(equalTo: videoFrameBox.bottomAnchor),
+            playerView.topAnchor.constraint(equalTo: zoomHostView.topAnchor),
+            playerView.leadingAnchor.constraint(equalTo: zoomHostView.leadingAnchor),
+            playerView.trailingAnchor.constraint(equalTo: zoomHostView.trailingAnchor),
+            playerView.bottomAnchor.constraint(equalTo: zoomHostView.bottomAnchor),
+
+            freezeFrameOverlay.topAnchor.constraint(equalTo: zoomHostView.topAnchor),
+            freezeFrameOverlay.leadingAnchor.constraint(equalTo: zoomHostView.leadingAnchor),
+            freezeFrameOverlay.trailingAnchor.constraint(equalTo: zoomHostView.trailingAnchor),
+            freezeFrameOverlay.bottomAnchor.constraint(equalTo: zoomHostView.bottomAnchor),
+
+            interactionOverlay.topAnchor.constraint(equalTo: videoFrameBox.topAnchor),
+            interactionOverlay.leadingAnchor.constraint(equalTo: videoFrameBox.leadingAnchor),
+            interactionOverlay.trailingAnchor.constraint(equalTo: videoFrameBox.trailingAnchor),
+            interactionOverlay.bottomAnchor.constraint(equalTo: videoFrameBox.bottomAnchor),
 
             proxyBadgeLabel.topAnchor.constraint(equalTo: videoFrameBox.topAnchor, constant: 10),
-            proxyBadgeLabel.leadingAnchor.constraint(equalTo: videoFrameBox.leadingAnchor, constant: 10),
+            proxyBadgeLabel.trailingAnchor.constraint(equalTo: videoFrameBox.trailingAnchor, constant: -10),
             proxyBadgeLabel.widthAnchor.constraint(equalToConstant: 72),
             proxyBadgeLabel.heightAnchor.constraint(equalToConstant: 20),
+
+            zoomButton.topAnchor.constraint(equalTo: workspaceView.topAnchor, constant: 10),
+            zoomButton.leadingAnchor.constraint(equalTo: workspaceView.leadingAnchor, constant: 10),
+            zoomButton.heightAnchor.constraint(equalToConstant: 24),
+            zoomButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 74),
 
             transportBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             transportBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -149,6 +209,131 @@ public final class PlayerViewController: NSViewController {
         setupLUTBindings()
 
         self.view = root
+    }
+
+    public override func viewDidLayout() {
+        super.viewDidLayout()
+        applyZoomHostLayout()
+    }
+
+    // MARK: - Viewer Zoom & Pan Controls
+
+    public func setViewerZoomFit() {
+        isZoomFitMode = true
+        zoomScale = 1.0
+        zoomPanOffset = .zero
+        interactionOverlay.isPanEnabled = false
+        updateZoomButtonTitle()
+        applyZoomHostLayout()
+    }
+
+    public func setViewerZoom(scale: CGFloat) {
+        let clamped = max(0.5, min(6.0, scale))
+        isZoomFitMode = false
+        zoomScale = clamped
+        interactionOverlay.isPanEnabled = (clamped > 1.01)
+        updateZoomButtonTitle()
+        applyZoomHostLayout()
+    }
+
+    private func handleScrollZoom(deltaY: CGFloat, anchorPoint: CGPoint, isPrecise: Bool) {
+        guard abs(deltaY) > 0.001 else { return }
+        let oldScale = isZoomFitMode ? 1.0 : zoomScale
+        let factor = isPrecise ? exp(deltaY * 0.009) : exp(deltaY * 0.08)
+        let newScale = max(0.5, min(6.0, oldScale * factor))
+
+        let boxSize = videoFrameBox.bounds.size
+        if boxSize.width > 0, boxSize.height > 0, oldScale > 0 {
+            let ratio = newScale / oldScale
+            let dx = anchorPoint.x - boxSize.width * 0.5 - zoomPanOffset.x
+            let dy = anchorPoint.y - boxSize.height * 0.5 - zoomPanOffset.y
+            zoomPanOffset.x += dx * (1.0 - ratio)
+            zoomPanOffset.y += dy * (1.0 - ratio)
+        }
+
+        if abs(newScale - 1.0) < 0.025 && (isZoomFitMode == false && oldScale > 1.0 && newScale <= 1.025) {
+            setViewerZoomFit()
+            return
+        }
+
+        isZoomFitMode = false
+        zoomScale = newScale
+        interactionOverlay.isPanEnabled = (newScale > 1.01)
+        updateZoomButtonTitle()
+        applyZoomHostLayout()
+    }
+
+    private func handlePanDelta(dx: CGFloat, dy: CGFloat) {
+        guard !isZoomFitMode, zoomScale > 1.01 else { return }
+        zoomPanOffset.x += dx
+        zoomPanOffset.y += dy
+        applyZoomHostLayout()
+    }
+
+    private func updateZoomButtonTitle() {
+        if isZoomFitMode {
+            zoomButton.title = "Adatta ▾"
+            zoomButton.isAccentActive = false
+        } else {
+            let pct = Int((zoomScale * 100.0).rounded())
+            zoomButton.title = "\(pct)% ▾"
+            zoomButton.isAccentActive = (abs(zoomScale - 1.0) > 0.01)
+        }
+    }
+
+    private func applyZoomHostLayout() {
+        let boxSize = videoFrameBox.bounds.size
+        guard boxSize.width > 0, boxSize.height > 0 else { return }
+        let s = isZoomFitMode ? 1.0 : zoomScale
+        let w = boxSize.width * s
+        let h = boxSize.height * s
+        let maxPanX = max(0.0, (w - boxSize.width) * 0.5)
+        let maxPanY = max(0.0, (h - boxSize.height) * 0.5)
+        zoomPanOffset.x = max(-maxPanX, min(maxPanX, zoomPanOffset.x))
+        zoomPanOffset.y = max(-maxPanY, min(maxPanY, zoomPanOffset.y))
+        if s <= 1.0 {
+            zoomPanOffset = .zero
+        }
+        let x = (boxSize.width - w) * 0.5 + zoomPanOffset.x
+        let y = (boxSize.height - h) * 0.5 + zoomPanOffset.y
+        zoomHostView.frame = CGRect(x: x, y: y, width: w, height: h)
+        zoomHostView.layoutSubtreeIfNeeded()
+    }
+
+    @objc private func onZoomDropdownClicked() {
+        let presets: [(title: String, scale: CGFloat)] = [
+            ("50%", 0.5),
+            ("100%", 1.0),
+            ("150%", 1.5),
+            ("200%", 2.0),
+            ("300%", 3.0),
+            ("400%", 4.0)
+        ]
+
+        var items: [VisionMenuItem] = [
+            .action(
+                title: "Adatta",
+                icon: .maximize2,
+                isSelected: isZoomFitMode
+            ) { [weak self] in
+                self?.setViewerZoomFit()
+            },
+            .separator
+        ]
+
+        for preset in presets {
+            let isSelected = !isZoomFitMode && abs(zoomScale - preset.scale) < 0.03
+            items.append(.action(
+                title: preset.title,
+                isSelected: isSelected
+            ) { [weak self] in
+                self?.setViewerZoom(scale: preset.scale)
+            })
+        }
+
+        let menu = VisionMenu(items: items)
+        self.zoomMenu = menu
+        menu.show(below: zoomButton, minWidth: 135)
     }
 
     private func setupTransportBar(_ bar: NSView) {
@@ -257,7 +442,10 @@ public final class PlayerViewController: NSViewController {
     private func setupControllerBindings() {
         playbackController.addTimeObserver(self) { [weak self] _ in
             guard let self = self else { return }
-            self.timecodeLabel.stringValue = self.playbackController.formattedCurrentTime
+            let formatted = self.playbackController.formattedCurrentTime
+            if self.timecodeLabel.stringValue != formatted {
+                self.timecodeLabel.stringValue = formatted
+            }
         }
 
         playbackController.addPlayStateObserver(self) { [weak self] isPlaying in
@@ -267,16 +455,39 @@ public final class PlayerViewController: NSViewController {
 
         let icon: LucideIcon = playbackController.isPlaying ? .pause : .play
         playPauseButton.image = Lucide.template(icon, size: 18)
+
+        playbackController.onWillReplaceItem = { [weak self] cgImage in
+            let apply = { [weak self] in
+                guard let self = self else { return }
+                if let cg = cgImage {
+                    self.freezeFrameOverlay.layer?.contents = cg
+                    self.freezeFrameOverlay.isHidden = false
+                } else {
+                    self.freezeFrameOverlay.isHidden = true
+                    self.freezeFrameOverlay.layer?.contents = nil
+                }
+            }
+            if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
+        }
+        playbackController.onReadyFrameRendered = { [weak self] in
+            let clear = { [weak self] in
+                self?.freezeFrameOverlay.isHidden = true
+                self?.freezeFrameOverlay.layer?.contents = nil
+            }
+            if Thread.isMainThread { clear() } else { DispatchQueue.main.async(execute: clear) }
+        }
     }
 
     private func setupLUTBindings() {
         updateLUTFilter()
         updateLUTButtonState()
-        LUTEngine.shared.onLUTStateChanged = { [weak self] in
-            DispatchQueue.main.async {
-                self?.updateLUTFilter()
-                self?.updateLUTButtonState()
-            }
+        NotificationCenter.default.addObserver(
+            forName: LUTEngine.stateChangedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateLUTFilter()
+            self?.updateLUTButtonState()
         }
     }
 
@@ -285,10 +496,12 @@ public final class PlayerViewController: NSViewController {
     }
 
     private func updateLUTFilter() {
-        if let filter = LUTEngine.shared.activeFilter() {
-            playerView.layer?.filters = [filter]
-        } else {
+        // LUT rendering executes cleanly in CompositionEngine GPU VisionLUTCompositor (never layer?.filters on AVPlayerView).
+        if !(playerView.layer?.filters?.isEmpty ?? true) {
             playerView.layer?.filters = []
+        }
+        if !(freezeFrameOverlay.layer?.filters?.isEmpty ?? true) {
+            freezeFrameOverlay.layer?.filters = []
         }
     }
 
@@ -327,7 +540,7 @@ public final class PlayerViewController: NSViewController {
         popover.behavior = .transient
         popover.appearance = NSAppearance(named: .darkAqua)
         popover.contentViewController = vc
-        popover.contentSize = NSSize(width: 280, height: 150)
+        popover.contentSize = NSSize(width: 300, height: 155)
         popover.show(relativeTo: lutToggleButton.bounds, of: lutToggleButton, preferredEdge: .maxY)
         self.lutPopover = popover
     }
@@ -412,11 +625,90 @@ public final class PlayerViewController: NSViewController {
     }
 }
 
+private final class ViewerZoomInteractionView: NSView {
+    var onScrollZoom: ((CGFloat, CGPoint, Bool) -> Void)?
+    var onPanDelta: ((CGFloat, CGFloat) -> Void)?
+    var onDoubleClickReset: (() -> Void)?
+    var isPanEnabled: Bool = false {
+        didSet {
+            if isPanEnabled != oldValue {
+                window?.invalidateCursorRects(for: self)
+            }
+        }
+    }
+
+    private var isDraggingPan = false
+    private var lastDragScreenPoint: CGPoint = .zero
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if isPanEnabled {
+            addCursorRect(bounds, cursor: .openHand)
+        }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        let local = convert(event.locationInWindow, from: nil)
+        let dy = abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX) ? event.scrollingDeltaY : event.scrollingDeltaX
+        if abs(dy) > 0.001 {
+            onScrollZoom?(dy, local, event.hasPreciseScrollingDeltas)
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            onDoubleClickReset?()
+            return
+        }
+        guard isPanEnabled else {
+            super.mouseDown(with: event)
+            return
+        }
+        isDraggingPan = true
+        lastDragScreenPoint = NSEvent.mouseLocation
+        NSCursor.closedHand.set()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isDraggingPan else {
+            super.mouseDragged(with: event)
+            return
+        }
+        let cur = NSEvent.mouseLocation
+        let dx = cur.x - lastDragScreenPoint.x
+        let dy = cur.y - lastDragScreenPoint.y
+        lastDragScreenPoint = cur
+        onPanDelta?(dx, dy)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if isDraggingPan {
+            isDraggingPan = false
+            if isPanEnabled {
+                NSCursor.openHand.set()
+            } else {
+                NSCursor.arrow.set()
+            }
+            return
+        }
+        super.mouseUp(with: event)
+    }
+}
+
 private final class LUTSelectorPopoverController: NSViewController {
     private let onPresetSelected: (LUTPreset) -> Void
     private let onToggleEnabled: (Bool) -> Void
     private let enabledSwitch = NSSwitch()
     private let presetPopUp = VisionDropdownButton()
+    private let removeCustomBtn = FlatButton(title: "Rimuovi")
+
+    private enum DropdownEntry {
+        case preset(LUTPreset)
+        case customLink(SavedCustomLUT)
+    }
+    private var dropdownEntries: [DropdownEntry] = []
 
     init(
         onPresetSelected: @escaping (LUTPreset) -> Void,
@@ -430,7 +722,7 @@ private final class LUTSelectorPopoverController: NSViewController {
     required init?(coder: NSCoder) { fatalError() }
 
     override func loadView() {
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 150))
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 155))
         root.wantsLayer = true
         root.layer?.backgroundColor = NSColor(calibratedWhite: 0.09, alpha: 1.0).cgColor
         self.view = root
@@ -451,13 +743,14 @@ private final class LUTSelectorPopoverController: NSViewController {
         presetLbl.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
         presetLbl.translatesAutoresizingMaskIntoConstraints = false
 
-        for preset in LUTPreset.allCases {
-            presetPopUp.addItem(withTitle: preset.rawValue)
-        }
-        presetPopUp.selectItem(withTitle: LUTEngine.shared.currentPreset.rawValue)
         presetPopUp.target = self
         presetPopUp.action = #selector(onPopUpChanged)
         presetPopUp.translatesAutoresizingMaskIntoConstraints = false
+        reloadPresetPopUp()
+
+        removeCustomBtn.target = self
+        removeCustomBtn.action = #selector(onRemoveCustomClicked)
+        removeCustomBtn.translatesAutoresizingMaskIntoConstraints = false
 
         let loadCubeBtn = FlatButton(title: "Carica file .cube...", target: self, action: #selector(onLoadCubeClicked))
         loadCubeBtn.translatesAutoresizingMaskIntoConstraints = false
@@ -466,6 +759,7 @@ private final class LUTSelectorPopoverController: NSViewController {
         root.addSubview(enabledSwitch)
         root.addSubview(presetLbl)
         root.addSubview(presetPopUp)
+        root.addSubview(removeCustomBtn)
         root.addSubview(loadCubeBtn)
 
         NSLayoutConstraint.activate([
@@ -482,11 +776,50 @@ private final class LUTSelectorPopoverController: NSViewController {
             presetPopUp.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
             presetPopUp.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
 
+            removeCustomBtn.topAnchor.constraint(equalTo: presetPopUp.bottomAnchor, constant: 12),
+            removeCustomBtn.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            removeCustomBtn.heightAnchor.constraint(equalToConstant: 24),
+            removeCustomBtn.widthAnchor.constraint(equalToConstant: 82),
+
             loadCubeBtn.topAnchor.constraint(equalTo: presetPopUp.bottomAnchor, constant: 12),
             loadCubeBtn.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
             loadCubeBtn.heightAnchor.constraint(equalToConstant: 24),
-            loadCubeBtn.widthAnchor.constraint(equalToConstant: 130)
+            loadCubeBtn.widthAnchor.constraint(equalToConstant: 136)
         ])
+    }
+
+    private func reloadPresetPopUp() {
+        presetPopUp.removeAllItems()
+        dropdownEntries.removeAll()
+
+        for preset in LUTPreset.allCases where preset != .custom {
+            presetPopUp.addItem(withTitle: preset.rawValue)
+            dropdownEntries.append(.preset(preset))
+        }
+        for custom in LUTEngine.shared.customLUTs {
+            presetPopUp.addItem(withTitle: "★ \(custom.name)")
+            dropdownEntries.append(.customLink(custom))
+        }
+
+        let engine = LUTEngine.shared
+        var selectedIdx = 0
+        if engine.currentPreset == .custom, let activePath = engine.activeCustomLUTPath,
+           let cIdx = dropdownEntries.firstIndex(where: {
+               if case .customLink(let item) = $0 { return item.path == activePath }
+               return false
+           }) {
+            selectedIdx = cIdx
+        } else if let pIdx = dropdownEntries.firstIndex(where: {
+            if case .preset(let p) = $0 { return p == engine.currentPreset }
+            return false
+        }) {
+            selectedIdx = pIdx
+        }
+
+        if !dropdownEntries.isEmpty {
+            presetPopUp.selectItem(at: selectedIdx)
+        }
+        removeCustomBtn.isHidden = (engine.currentPreset != .custom || engine.activeCustomLUTPath == nil)
     }
 
     @objc private func onSwitchChanged() {
@@ -494,9 +827,27 @@ private final class LUTSelectorPopoverController: NSViewController {
     }
 
     @objc private func onPopUpChanged() {
-        guard let title = presetPopUp.selectedTitle,
-              let preset = LUTPreset.allCases.first(where: { $0.rawValue == title }) else { return }
-        onPresetSelected(preset)
+        let idx = presetPopUp.selectedIndex
+        guard idx >= 0 && idx < dropdownEntries.count else { return }
+        switch dropdownEntries[idx] {
+        case .preset(let preset):
+            onPresetSelected(preset)
+        case .customLink(let saved):
+            if LUTEngine.shared.selectCustomLUT(path: saved.path) {
+                LUTEngine.shared.isEnabled = true
+            } else {
+                DebugLogger.shared.log("File LUT .cube non trovato: '\(saved.name)'. Rimosso dalla lista.", level: .warning)
+                reloadPresetPopUp()
+            }
+        }
+        enabledSwitch.state = LUTEngine.shared.isEnabled ? .on : .off
+        removeCustomBtn.isHidden = (LUTEngine.shared.currentPreset != .custom || LUTEngine.shared.activeCustomLUTPath == nil)
+    }
+
+    @objc private func onRemoveCustomClicked() {
+        guard let activePath = LUTEngine.shared.activeCustomLUTPath else { return }
+        LUTEngine.shared.removeCustomLUT(path: activePath)
+        reloadPresetPopUp()
         enabledSwitch.state = LUTEngine.shared.isEnabled ? .on : .off
     }
 

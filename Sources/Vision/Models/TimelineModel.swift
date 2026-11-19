@@ -6,9 +6,93 @@ public enum ClipEdge {
     case end
 }
 
+public struct ClipboardClipEntry {
+    public let mediaItem: MediaItem
+    public let sourceIn: CMTime
+    public let sourceOut: CMTime
+    public let relativeStart: CMTime
+    public let trackIndex: Int
+    public let isVideo: Bool
+    public let orientation: ClipOrientation
+    public let linkGroupId: UUID?
+    public let speed: Double
+    public let span: Int
+    public let beatMarkers: [Double]
+    public let beatBPM: Double?
+    public let markers: [Double]
+    public let priority: Int?
+    public let selectionSourceIn: Double?
+    public let selectionSourceOut: Double?
+}
+
+public final class VisionTimelineClipboard {
+    public static let shared = VisionTimelineClipboard()
+    public var entries: [ClipboardClipEntry] = []
+    private init() {}
+}
+
+public struct SelectionSmartFilter: Equatable {
+    public var includePriority1: Bool = false
+    public var includePriority2: Bool = false
+    public var includePriority3: Bool = false
+    public var includeNoPriority: Bool = false
+    public var includeWithMarkers: Bool = false
+    public var includeWithoutMarkers: Bool = false
+
+    public var isActive: Bool {
+        includePriority1 || includePriority2 || includePriority3 || includeNoPriority || includeWithMarkers || includeWithoutMarkers
+    }
+
+    public func matches(_ clip: TimelineClip) -> Bool {
+        guard isActive else { return true }
+
+        let hasPriorityFilter = includePriority1 || includePriority2 || includePriority3 || includeNoPriority
+        if hasPriorityFilter {
+            let pOk: Bool
+            switch clip.priority {
+            case 1?: pOk = includePriority1
+            case 2?: pOk = includePriority2
+            case 3?: pOk = includePriority3
+            default: pOk = includeNoPriority
+            }
+            if !pOk { return false }
+        }
+
+        let hasMarkerFilter = includeWithMarkers || includeWithoutMarkers
+        if hasMarkerFilter {
+            let hasMarkers = !clip.markers.isEmpty
+            if !((hasMarkers && includeWithMarkers) || (!hasMarkers && includeWithoutMarkers)) {
+                return false
+            }
+        }
+
+        return true
+    }
+}
+
 public enum AutoFillOrderMode: String, CaseIterable {
     case chronological = "Cronologia Elastica (ordine Selezione)"
     case random = "Casuale (Random)"
+}
+
+public enum AutoFillStartMode: Int, CaseIterable {
+    case fromFirstCage = 0
+    case fromPlayhead = 1
+}
+
+public struct AutoFillForecast {
+    public let totalTargetCages: Int
+    public let lockedCagesCount: Int
+    public let unlockedCagesCount: Int
+    public let selectionClipCount: Int
+    public let p1Count: Int
+    public let p2Count: Int
+    public let p3Count: Int
+    public let predictedUniqueCount: Int
+    public let predictedSubsegmentCount: Int
+    public let predictedFilledCount: Int
+    public let predictedEmptyCount: Int
+    public let startingCageNumber: Int // 1-based index in full cage list
 }
 
 public struct AutoFillResult {
@@ -81,6 +165,11 @@ public final class TimelineModel {
     public var beatIntervalMode: BeatIntervalMode = .dynamicTransients
     public var peakSensitivity: Double = 0.45
     public var isRhythmicGridVisible: Bool = true
+    public var smartFilter = SelectionSmartFilter()
+    public var isSmartFilterActive: Bool { isSelection && smartFilter.isActive }
+    public var videoTrackHeights: [Int: Double] = [:]
+    public var audioTrackHeights: [Int: Double] = [:]
+    public var playheadSeconds: Double = 0.0
 
     public var onModelChanged: (() -> Void)?
 
@@ -165,6 +254,9 @@ public final class TimelineModel {
             audioTracks = [TimelineTrack(id: 0, name: "A1", mediaType: .audio)]
         }
         isSelection = true
+        if isSelection {
+            repackSelectionContiguously()
+        }
         onModelChanged?()
         return true
     }
@@ -172,11 +264,165 @@ public final class TimelineModel {
     public func convertToTimeline() {
         guard isSelection else { return }
         isSelection = false
+        smartFilter = SelectionSmartFilter()
         onModelChanged?()
+    }
+
+    // MARK: - Smart Filter (Selezione Compatta V1+A1)
+    private struct FilteredSelectionEntry {
+        let videoClip: TimelineClip?
+        let audioClip: TimelineClip?
+        let realStart: CMTime
+        let realDuration: CMTime
+        let displayStart: CMTime
+
+        var displayEnd: CMTime { CMTimeAdd(displayStart, realDuration) }
+        var realEnd: CMTime { CMTimeAdd(realStart, realDuration) }
+    }
+
+    private func filteredSelectionEntries() -> [FilteredSelectionEntry] {
+        guard isSmartFilterActive else { return [] }
+        let vClips = (videoTracks.first?.clips ?? []).sorted { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
+        let aClips = (audioTracks.first?.clips ?? []).sorted { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
+        var usedAudioIds: Set<UUID> = []
+
+        func findCompanionAudio(for vClip: TimelineClip) -> TimelineClip? {
+            if let lId = vClip.linkGroupId,
+               let match = aClips.first(where: { !usedAudioIds.contains($0.id) && $0.linkGroupId == lId }) {
+                return match
+            }
+            let vStart = CMTimeGetSeconds(vClip.timelineStart)
+            let vEnd = CMTimeGetSeconds(vClip.timelineEnd)
+            return aClips.first { aClip in
+                !usedAudioIds.contains(aClip.id)
+                    && aClip.mediaItem.url == vClip.mediaItem.url
+                    && abs(CMTimeGetSeconds(aClip.timelineStart) - vStart) < 0.025
+                    && abs(CMTimeGetSeconds(aClip.timelineEnd) - vEnd) < 0.025
+            }
+        }
+
+        var rawPairs: [(video: TimelineClip?, audio: TimelineClip?, realStart: CMTime, dur: CMTime)] = []
+        for v in vClips {
+            let a = findCompanionAudio(for: v)
+            if let a = a { usedAudioIds.insert(a.id) }
+            let matches = smartFilter.matches(v) || (a.map { smartFilter.matches($0) } ?? false)
+            if matches {
+                let dur = max(v.duration, a?.duration ?? .zero)
+                rawPairs.append((v, a, v.timelineStart, dur))
+            }
+        }
+        for a in aClips where !usedAudioIds.contains(a.id) {
+            if smartFilter.matches(a) {
+                rawPairs.append((nil, a, a.timelineStart, a.duration))
+            }
+        }
+
+        rawPairs.sort { CMTimeCompare($0.realStart, $1.realStart) < 0 }
+
+        var cursor: CMTime = .zero
+        var result: [FilteredSelectionEntry] = []
+        result.reserveCapacity(rawPairs.count)
+        for pair in rawPairs {
+            result.append(FilteredSelectionEntry(
+                videoClip: pair.video,
+                audioClip: pair.audio,
+                realStart: pair.realStart,
+                realDuration: pair.dur,
+                displayStart: cursor
+            ))
+            cursor = CMTimeAdd(cursor, pair.dur)
+        }
+        return result
+    }
+
+    public var displayedTotalDuration: CMTime {
+        guard isSmartFilterActive else { return totalDuration }
+        return filteredSelectionEntries().last?.displayEnd ?? .zero
+    }
+
+    public func displayedClips(isVideo: Bool, trackIndex: Int) -> [(clip: TimelineClip, displayStart: CMTime)] {
+        if !isSmartFilterActive {
+            let tracks = isVideo ? videoTracks : audioTracks
+            guard trackIndex >= 0 && trackIndex < tracks.count else { return [] }
+            return tracks[trackIndex].clips.map { ($0, $0.timelineStart) }
+        }
+        guard trackIndex == 0 else { return [] }
+        return filteredSelectionEntries().compactMap { entry in
+            if isVideo, let v = entry.videoClip {
+                return (v, entry.displayStart)
+            } else if !isVideo, let a = entry.audioClip {
+                return (a, entry.displayStart)
+            }
+            return nil
+        }
+    }
+
+    public func displayedStartTime(for clip: TimelineClip, isVideo: Bool) -> CMTime {
+        guard isSmartFilterActive else { return clip.timelineStart }
+        for entry in filteredSelectionEntries() {
+            if isVideo, entry.videoClip?.id == clip.id { return entry.displayStart }
+            if !isVideo, entry.audioClip?.id == clip.id { return entry.displayStart }
+        }
+        return clip.timelineStart
+    }
+
+    public func realTimelineTime(forDisplayedTime displayTime: CMTime) -> CMTime {
+        guard isSmartFilterActive else { return displayTime }
+        let entries = filteredSelectionEntries()
+        guard !entries.isEmpty else { return .zero }
+        let sec = CMTimeGetSeconds(displayTime)
+        if sec <= 0 { return entries[0].realStart }
+        for entry in entries {
+            let ds = CMTimeGetSeconds(entry.displayStart)
+            let de = CMTimeGetSeconds(entry.displayEnd)
+            if sec >= ds && sec < de {
+                let offset = CMTimeSubtract(displayTime, entry.displayStart)
+                return CMTimeAdd(entry.realStart, offset)
+            }
+        }
+        return entries.last?.realEnd ?? totalDuration
+    }
+
+    public func displayedTime(forRealTime realTime: CMTime) -> CMTime {
+        guard isSmartFilterActive else { return realTime }
+        let entries = filteredSelectionEntries()
+        guard !entries.isEmpty else { return .zero }
+        let sec = CMTimeGetSeconds(realTime)
+        for entry in entries {
+            let rs = CMTimeGetSeconds(entry.realStart)
+            let re = CMTimeGetSeconds(entry.realEnd)
+            if sec >= rs && sec < re {
+                let offset = CMTimeSubtract(realTime, entry.realStart)
+                return CMTimeAdd(entry.displayStart, offset)
+            }
+            if sec < rs {
+                return entry.displayStart
+            }
+        }
+        return displayedTotalDuration
+    }
+
+    public func compactedFilteredModel() -> TimelineModel {
+        let copy = TimelineModel(name: name, isSelection: true)
+        copy.format = format
+        copy.isLinkActive = isLinkActive
+        let entries = filteredSelectionEntries()
+        for entry in entries {
+            if var v = entry.videoClip {
+                v.timelineStart = entry.displayStart
+                copy.videoTracks[0].clips.append(v)
+            }
+            if var a = entry.audioClip {
+                a.timelineStart = entry.displayStart
+                copy.audioTracks[0].clips.append(a)
+            }
+        }
+        return copy
     }
 
     // MARK: - Track Mute & Lock (Lucchetto)
     public func toggleTrackLock(id: Int, isVideo: Bool) {
+        guard !isSelection else { return }
         if isVideo {
             guard id < videoTracks.count else { return }
             videoTracks[id].isLocked.toggle()
@@ -206,6 +452,36 @@ public final class TimelineModel {
     public func updateSelectionAtPlayhead(time: CMTime) {
         guard isSelectionFollowsPlayhead else { return }
         let timeSec = CMTimeGetSeconds(time)
+
+        if isSmartFilterActive {
+            var foundClip: TimelineClip? = nil
+            for (clip, dStart) in displayedClips(isVideo: true, trackIndex: 0) {
+                let s = CMTimeGetSeconds(dStart)
+                let e = s + CMTimeGetSeconds(clip.duration)
+                if timeSec >= s && timeSec < e {
+                    foundClip = clip
+                    break
+                }
+            }
+            if foundClip == nil {
+                for (clip, dStart) in displayedClips(isVideo: false, trackIndex: 0) {
+                    let s = CMTimeGetSeconds(dStart)
+                    let e = s + CMTimeGetSeconds(clip.duration)
+                    if timeSec >= s && timeSec < e {
+                        foundClip = clip
+                        break
+                    }
+                }
+            }
+            if let clip = foundClip {
+                let newSelection = isLinkActive || isSelection ? resolveSelectionCompanionClipIds(for: [clip.id]) : [clip.id]
+                if selectedClipIds != newSelection {
+                    selectedClipIds = newSelection
+                    onModelChanged?()
+                }
+            }
+            return
+        }
 
         // Prioritize highest unmuted, unlocked video track
         var foundClip: TimelineClip? = nil
@@ -324,7 +600,380 @@ public final class TimelineModel {
         DebugLogger.shared.log("Clip riordinate sulla traccia \(isVideo ? "V\(trackIndex + 1)" : "A\(trackIndex + 1)"): spostata da #\(fromIndex + 1) a #\(toIndex + 1)", level: .info)
     }
 
+    /// Reorders a group of selected clips sequentially on `trackIndex` to insertion `slot` (`0...clips.count`).
+    @discardableResult
+    public func reorderClipGroup(clipIds: Set<UUID>, trackIndex: Int, isVideo: Bool, toSlot slot: Int) -> Bool {
+        guard trackIndex >= 0, !clipIds.isEmpty else { return false }
+        if isVideo {
+            guard trackIndex < videoTracks.count, !videoTracks[trackIndex].isLocked else { return false }
+            let clips = videoTracks[trackIndex].clips
+            guard !clips.isEmpty else { return false }
+
+            var movingClips: [TimelineClip] = []
+            var remainingClips: [TimelineClip] = []
+            var removedBeforeSlot = 0
+            for (idx, c) in clips.enumerated() {
+                if clipIds.contains(c.id) {
+                    movingClips.append(c)
+                    if idx < slot { removedBeforeSlot += 1 }
+                } else {
+                    remainingClips.append(c)
+                }
+            }
+            guard !movingClips.isEmpty else { return false }
+            let insertAt = max(0, min(remainingClips.count, slot - removedBeforeSlot))
+            var reordered = remainingClips
+            reordered.insert(contentsOf: movingClips, at: insertAt)
+
+            var currentT: CMTime = .zero
+            for i in 0..<reordered.count {
+                let oldStart = reordered[i].timelineStart
+                let newStart = currentT
+                let deltaSec = CMTimeGetSeconds(newStart) - CMTimeGetSeconds(oldStart)
+                reordered[i].timelineStart = newStart
+                currentT = CMTimeAdd(currentT, reordered[i].duration)
+
+                if isLinkActive, let lId = reordered[i].linkGroupId, abs(deltaSec) > 0.0005 {
+                    for aTrackIdx in 0..<audioTracks.count where !audioTracks[aTrackIdx].isLocked {
+                        if let aIdx = audioTracks[aTrackIdx].clips.firstIndex(where: { $0.linkGroupId == lId }) {
+                            let aOldStart = audioTracks[aTrackIdx].clips[aIdx].timelineStart
+                            audioTracks[aTrackIdx].clips[aIdx].timelineStart = max(.zero, CMTime(seconds: CMTimeGetSeconds(aOldStart) + deltaSec, preferredTimescale: 600))
+                            audioTracks[aTrackIdx].clips.sort(by: { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 })
+                        }
+                    }
+                }
+            }
+            videoTracks[trackIndex].clips = reordered
+            onModelChanged?()
+            return true
+        }
+        return false
+    }
+
+    /// Inserts media items sequentially at storyboard slot `slot` on `trackIndex`, shifting subsequent clips forward cleanly.
+    @discardableResult
+    public func insertMediaItemsSequentially(_ items: [MediaItem], atSlot slot: Int, trackIndex: Int = 0) -> Bool {
+        guard !items.isEmpty, trackIndex >= 0, trackIndex < videoTracks.count, !videoTracks[trackIndex].isLocked else {
+            return false
+        }
+        var clips = videoTracks[trackIndex].clips
+        let clampedSlot = max(0, min(clips.count, slot))
+        let insertStart: CMTime = clampedSlot == 0
+            ? .zero
+            : CMTimeAdd(clips[clampedSlot - 1].timelineStart, clips[clampedSlot - 1].duration)
+
+        var newVideoClips: [TimelineClip] = []
+        var newAudioClips: [TimelineClip] = []
+        var cursor = insertStart
+        var totalAddedDur: CMTime = .zero
+
+        for item in items {
+            let linkId = (item.hasVideo && item.hasAudio && isLinkActive) ? UUID() : nil
+            if item.hasVideo {
+                let vClip = TimelineClip(
+                    mediaItem: item,
+                    sourceIn: .zero,
+                    sourceOut: item.duration,
+                    timelineStart: cursor,
+                    trackIndex: trackIndex,
+                    mediaType: .video,
+                    orientation: item.orientation,
+                    linkGroupId: linkId
+                )
+                newVideoClips.append(vClip)
+            }
+            if item.hasAudio && (isLinkActive || !item.hasVideo) {
+                let aTrack = min(trackIndex, max(0, audioTracks.count - 1))
+                if aTrack < audioTracks.count && !audioTracks[aTrack].isLocked {
+                    let aClip = TimelineClip(
+                        mediaItem: item,
+                        sourceIn: .zero,
+                        sourceOut: item.duration,
+                        timelineStart: cursor,
+                        trackIndex: aTrack,
+                        mediaType: .audio,
+                        orientation: .normal,
+                        linkGroupId: linkId
+                    )
+                    newAudioClips.append(aClip)
+                }
+            }
+            cursor = CMTimeAdd(cursor, item.duration)
+            totalAddedDur = CMTimeAdd(totalAddedDur, item.duration)
+        }
+
+        guard !newVideoClips.isEmpty || !newAudioClips.isEmpty else { return false }
+
+        // Shift subsequent clips forward by totalAddedDur
+        if clampedSlot < clips.count && !newVideoClips.isEmpty {
+            let shiftDelta = CMTimeGetSeconds(totalAddedDur)
+            for i in clampedSlot..<clips.count {
+                let oldStart = clips[i].timelineStart
+                clips[i].timelineStart = CMTimeAdd(oldStart, totalAddedDur)
+                if isLinkActive, let lId = clips[i].linkGroupId {
+                    for aTrackIdx in 0..<audioTracks.count where !audioTracks[aTrackIdx].isLocked {
+                        if let aIdx = audioTracks[aTrackIdx].clips.firstIndex(where: { $0.linkGroupId == lId }) {
+                            audioTracks[aTrackIdx].clips[aIdx].timelineStart = CMTimeAdd(
+                                audioTracks[aTrackIdx].clips[aIdx].timelineStart,
+                                CMTime(seconds: shiftDelta, preferredTimescale: 600)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if !newVideoClips.isEmpty {
+            clips.insert(contentsOf: newVideoClips, at: clampedSlot)
+            videoTracks[trackIndex].clips = clips
+        }
+        for aClip in newAudioClips {
+            overwriteAndInsert(incoming: aClip, trackIndex: aClip.trackIndex, isVideo: false)
+        }
+        if !newAudioClips.isEmpty && newAudioClips[0].trackIndex < audioTracks.count {
+            audioTracks[newAudioClips[0].trackIndex].clips.sort { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
+        }
+        selectedClipIds = Set(newVideoClips.map(\.id) + newAudioClips.map(\.id))
+        onModelChanged?()
+        return true
+    }
+
+    // MARK: - Copy / Cut / Paste across Timelines & Selezioni
+
+    @discardableResult
+    public func copySelectedClips(atPlayhead playhead: CMTime) -> Int {
+        var collected: [TimelineClip] = []
+        var seenIds: Set<UUID> = []
+
+        func collect(_ clip: TimelineClip) {
+            if seenIds.insert(clip.id).inserted {
+                collected.append(clip)
+            }
+        }
+
+        if !selectedClipIds.isEmpty {
+            for track in videoTracks {
+                for clip in track.clips where selectedClipIds.contains(clip.id) {
+                    collect(clip)
+                }
+            }
+            for track in audioTracks {
+                for clip in track.clips where selectedClipIds.contains(clip.id) {
+                    collect(clip)
+                }
+            }
+        } else {
+            // Fallback to clip(s) under playhead
+            for track in videoTracks {
+                for clip in track.clips where CMTimeCompare(playhead, clip.timelineStart) >= 0 && CMTimeCompare(playhead, clip.timelineEnd) < 0 {
+                    collect(clip)
+                }
+            }
+            if collected.isEmpty {
+                for track in audioTracks {
+                    for clip in track.clips where CMTimeCompare(playhead, clip.timelineStart) >= 0 && CMTimeCompare(playhead, clip.timelineEnd) < 0 {
+                        collect(clip)
+                    }
+                }
+            }
+        }
+
+        // Also pull linked audio/video partners when in Selezione or Link mode
+        if isSelection || isLinkActive {
+            let linkIds = Set(collected.compactMap(\.linkGroupId))
+            if !linkIds.isEmpty {
+                for track in videoTracks {
+                    for clip in track.clips where clip.linkGroupId != nil && linkIds.contains(clip.linkGroupId!) {
+                        collect(clip)
+                    }
+                }
+                for track in audioTracks {
+                    for clip in track.clips where clip.linkGroupId != nil && linkIds.contains(clip.linkGroupId!) {
+                        collect(clip)
+                    }
+                }
+            }
+        }
+
+        guard !collected.isEmpty else { return 0 }
+        let minStart = collected.map(\.timelineStart).min(by: { CMTimeCompare($0, $1) < 0 }) ?? .zero
+
+        VisionTimelineClipboard.shared.entries = collected.map { clip in
+            ClipboardClipEntry(
+                mediaItem: clip.mediaItem,
+                sourceIn: clip.sourceIn,
+                sourceOut: clip.sourceOut,
+                relativeStart: max(.zero, CMTimeSubtract(clip.timelineStart, minStart)),
+                trackIndex: clip.trackIndex,
+                isVideo: clip.mediaType == .video,
+                orientation: clip.orientation,
+                linkGroupId: clip.linkGroupId,
+                speed: clip.speed,
+                span: clip.span,
+                beatMarkers: clip.beatMarkers,
+                beatBPM: clip.beatBPM,
+                markers: clip.markers,
+                priority: clip.priority,
+                selectionSourceIn: clip.selectionSourceIn,
+                selectionSourceOut: clip.selectionSourceOut
+            )
+        }
+        return collected.count
+    }
+
+    @discardableResult
+    public func pasteClipboardClips(at targetTime: CMTime) -> (pastedCount: Int, endTime: CMTime) {
+        let entries = VisionTimelineClipboard.shared.entries
+        guard !entries.isEmpty else { return (0, targetTime) }
+
+        var baseTime = max(.zero, targetTime)
+        if isSelection {
+            let vEnd = videoTracks.first?.clips.map(\.timelineEnd).max(by: { CMTimeCompare($0, $1) < 0 }) ?? .zero
+            let aEnd = audioTracks.first?.clips.map(\.timelineEnd).max(by: { CMTimeCompare($0, $1) < 0 }) ?? .zero
+            let currentEnd = max(vEnd, aEnd)
+            if CMTimeCompare(baseTime, currentEnd) > 0 {
+                baseTime = currentEnd
+            }
+        }
+        var linkMap: [UUID: UUID] = [:]
+        var pastedIds: Set<UUID> = []
+        var maxEnd = baseTime
+
+        for entry in entries {
+            let newLinkId: UUID? = entry.linkGroupId.map { oldId in
+                if let mapped = linkMap[oldId] { return mapped }
+                let fresh = UUID()
+                linkMap[oldId] = fresh
+                return fresh
+            }
+
+            let destTrackIdx = isSelection ? 0 : min(entry.trackIndex, (entry.isVideo ? maxVideoTracks : maxAudioTracks) - 1)
+            if entry.isVideo {
+                ensureVideoTrack(id: destTrackIdx)
+                guard !videoTracks[destTrackIdx].isLocked else { continue }
+            } else {
+                ensureAudioTrack(id: destTrackIdx)
+                guard !audioTracks[destTrackIdx].isLocked else { continue }
+            }
+
+            let destStart = CMTimeAdd(baseTime, entry.relativeStart)
+            let dur = CMTime(seconds: CMTimeGetSeconds(CMTimeSubtract(entry.sourceOut, entry.sourceIn)) / max(0.05, entry.speed), preferredTimescale: 600)
+            let destEnd = CMTimeAdd(destStart, dur)
+            guard !hasLockedClipOverlap(start: destStart, end: destEnd, trackIndex: destTrackIdx, isVideo: entry.isVideo) else {
+                continue
+            }
+
+            let newClip = TimelineClip(
+                id: UUID(),
+                mediaItem: entry.mediaItem,
+                sourceIn: entry.sourceIn,
+                sourceOut: entry.sourceOut,
+                timelineStart: destStart,
+                trackIndex: destTrackIdx,
+                mediaType: entry.isVideo ? .video : .audio,
+                orientation: entry.orientation,
+                linkGroupId: newLinkId,
+                speed: entry.speed,
+                span: entry.span,
+                beatMarkers: entry.beatMarkers,
+                beatBPM: entry.beatBPM,
+                markers: entry.markers,
+                priority: entry.priority,
+                selectionSourceIn: entry.selectionSourceIn,
+                selectionSourceOut: entry.selectionSourceOut
+            )
+            overwriteAndInsert(incoming: newClip, trackIndex: destTrackIdx, isVideo: entry.isVideo)
+            pastedIds.insert(newClip.id)
+            if CMTimeCompare(destEnd, maxEnd) > 0 {
+                maxEnd = destEnd
+            }
+        }
+
+        if !pastedIds.isEmpty {
+            selectedClipIds = pastedIds
+            onModelChanged?()
+        }
+        return (pastedIds.count, maxEnd)
+    }
+
     // MARK: - Overwrite Editing Core Engine
+    /// Returns true if placing `[start, end)` on the specified track would hit a locked track or overlap any locked clip (excluding `excludingClipIds`).
+    public func hasLockedClipOverlap(
+        start: CMTime,
+        end: CMTime,
+        trackIndex: Int,
+        isVideo: Bool,
+        excludingClipIds: Set<UUID> = []
+    ) -> Bool {
+        let s = CMTimeGetSeconds(start)
+        let e = CMTimeGetSeconds(end)
+        guard e > s + 0.001 else { return false }
+
+        let tracks = isVideo ? videoTracks : audioTracks
+        guard trackIndex >= 0 && trackIndex < tracks.count else { return false }
+        let track = tracks[trackIndex]
+        if track.isLocked { return true }
+
+        return track.clips.contains { clip in
+            guard clip.isLocked && !excludingClipIds.contains(clip.id) else { return false }
+            let cs = CMTimeGetSeconds(clip.timelineStart)
+            let ce = CMTimeGetSeconds(clip.timelineEnd)
+            return max(cs, s) < min(ce, e) - 0.001
+        }
+    }
+
+    /// Resolves a start time near `proposedStart` on `trackIndex` that avoids overlapping any locked clips.
+    /// Returns `nil` if the track is locked or no nearby non-overlapping position is valid.
+    public func resolveNonLockedStartTime(
+        proposedStart: CMTime,
+        duration: CMTime,
+        trackIndex: Int,
+        isVideo: Bool,
+        excludingClipIds: Set<UUID> = []
+    ) -> CMTime? {
+        let dur = CMTimeGetSeconds(duration)
+        let baseStart = max(0.0, CMTimeGetSeconds(proposedStart))
+        let baseCM = CMTime(seconds: baseStart, preferredTimescale: 600)
+        let baseEndCM = CMTimeAdd(baseCM, duration)
+
+        if !hasLockedClipOverlap(start: baseCM, end: baseEndCM, trackIndex: trackIndex, isVideo: isVideo, excludingClipIds: excludingClipIds) {
+            return baseCM
+        }
+
+        let tracks = isVideo ? videoTracks : audioTracks
+        guard trackIndex >= 0 && trackIndex < tracks.count else { return baseCM }
+        let track = tracks[trackIndex]
+        if track.isLocked { return nil }
+
+        let lockedClips = track.clips
+            .filter { $0.isLocked && !excludingClipIds.contains($0.id) }
+            .sorted { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
+
+        var candidates: [Double] = []
+        for lc in lockedClips {
+            let cs = CMTimeGetSeconds(lc.timelineStart)
+            let ce = CMTimeGetSeconds(lc.timelineEnd)
+            if max(cs, baseStart) < min(ce, baseStart + dur) - 0.001 {
+                let leftCandidate = cs - dur
+                if leftCandidate >= 0.0 {
+                    candidates.append(leftCandidate)
+                }
+                candidates.append(ce)
+            }
+        }
+
+        let validCandidates = candidates.compactMap { candSec -> CMTime? in
+            let candCM = CMTime(seconds: candSec, preferredTimescale: 600)
+            let candEndCM = CMTimeAdd(candCM, duration)
+            guard !hasLockedClipOverlap(start: candCM, end: candEndCM, trackIndex: trackIndex, isVideo: isVideo, excludingClipIds: excludingClipIds) else {
+                return nil
+            }
+            return candCM
+        }
+
+        return validCandidates.min { abs(CMTimeGetSeconds($0) - baseStart) < abs(CMTimeGetSeconds($1) - baseStart) }
+    }
+
     public func overwriteAndInsert(incoming: TimelineClip, trackIndex: Int, isVideo: Bool) {
         if isVideo {
             ensureVideoTrack(id: trackIndex)
@@ -347,6 +996,17 @@ public final class TimelineModel {
         let E = CMTimeGetSeconds(incoming.timelineEnd)
 
         guard E > S + 0.001 else { return existing }
+
+        // Locked clips cannot be overwritten, split, or overlapped by incoming clips
+        let hitsLockedClip = existing.contains { clip in
+            guard clip.id != incoming.id && clip.isLocked else { return false }
+            let CS = CMTimeGetSeconds(clip.timelineStart)
+            let CE = CMTimeGetSeconds(clip.timelineEnd)
+            return max(CS, S) < min(CE, E) - 0.001
+        }
+        if hitsLockedClip {
+            return existing
+        }
 
         for clip in existing {
             if clip.id == incoming.id {
@@ -384,7 +1044,9 @@ public final class TimelineModel {
                         speed: clip.speed,
                         beatMarkers: clip.beatMarkers,
                         beatBPM: clip.beatBPM,
-                        markers: clip.markers
+                        markers: clip.markers,
+                        selectionSourceIn: clip.selectionSourceIn,
+                        selectionSourceOut: clip.selectionSourceOut
                     )
                     result.append(leftClip)
                 }
@@ -408,7 +1070,9 @@ public final class TimelineModel {
                         speed: clip.speed,
                         beatMarkers: clip.beatMarkers,
                         beatBPM: clip.beatBPM,
-                        markers: clip.markers
+                        markers: clip.markers,
+                        selectionSourceIn: clip.selectionSourceIn,
+                        selectionSourceOut: clip.selectionSourceOut
                     )
                     result.append(rightClip)
                 }
@@ -521,12 +1185,13 @@ public final class TimelineModel {
                 linkGroupId: linkId,
                 cageIndex: assignedCageIndex
             )
+            guard !hasLockedClipOverlap(start: vClip.timelineStart, end: vClip.timelineEnd, trackIndex: safeVideoTrack, isVideo: true) else { return }
             overwriteAndInsert(incoming: vClip, trackIndex: safeVideoTrack, isVideo: true)
 
             if mediaItem.hasAudio && isLinkActive {
                 let audioTrackIdx = min(safeVideoTrack, maxAudioTracks - 1)
                 ensureAudioTrack(id: audioTrackIdx)
-                if !audioTracks[audioTrackIdx].isLocked {
+                if !hasLockedClipOverlap(start: effectiveStart, end: CMTimeAdd(effectiveStart, effectiveOut), trackIndex: audioTrackIdx, isVideo: false) {
                     let aClip = TimelineClip(
                         mediaItem: mediaItem,
                         sourceIn: .zero,
@@ -555,12 +1220,13 @@ public final class TimelineModel {
                 mediaType: .audio,
                 linkGroupId: linkId
             )
+            guard !hasLockedClipOverlap(start: aClip.timelineStart, end: aClip.timelineEnd, trackIndex: safeAudioTrack, isVideo: false) else { return }
             overwriteAndInsert(incoming: aClip, trackIndex: safeAudioTrack, isVideo: false)
 
             if mediaItem.hasVideo && isLinkActive {
                 let videoTrackIdx = min(safeAudioTrack, maxVideoTracks - 1)
                 ensureVideoTrack(id: videoTrackIdx)
-                if !videoTracks[videoTrackIdx].isLocked {
+                if !hasLockedClipOverlap(start: validTime, end: CMTimeAdd(validTime, mediaItem.duration), trackIndex: videoTrackIdx, isVideo: true) {
                     let vClip = TimelineClip(
                         mediaItem: mediaItem,
                         sourceIn: .zero,
@@ -579,11 +1245,16 @@ public final class TimelineModel {
     }
 
     public func previewMoveClip(id: UUID, toTrack targetTrack: Int, isVideo: Bool, newStartTime: CMTime) {
+        let clampedStart = max(.zero, newStartTime)
         if isVideo {
             guard targetTrack < videoTracks.count, !videoTracks[targetTrack].isLocked else { return }
             for trackIdx in 0..<videoTracks.count where !videoTracks[trackIdx].isLocked {
                 if let clipIdx = videoTracks[trackIdx].clips.firstIndex(where: { $0.id == id && !$0.isLocked }) {
-                    videoTracks[trackIdx].clips[clipIdx].timelineStart = max(.zero, newStartTime)
+                    let dur = videoTracks[trackIdx].clips[clipIdx].duration
+                    guard !hasLockedClipOverlap(start: clampedStart, end: CMTimeAdd(clampedStart, dur), trackIndex: targetTrack, isVideo: true, excludingClipIds: [id]) else {
+                        return
+                    }
+                    videoTracks[trackIdx].clips[clipIdx].timelineStart = clampedStart
                     videoTracks[trackIdx].clips[clipIdx].trackIndex = targetTrack
                     return
                 }
@@ -592,7 +1263,11 @@ public final class TimelineModel {
             guard targetTrack < audioTracks.count, !audioTracks[targetTrack].isLocked else { return }
             for trackIdx in 0..<audioTracks.count where !audioTracks[trackIdx].isLocked {
                 if let clipIdx = audioTracks[trackIdx].clips.firstIndex(where: { $0.id == id && !$0.isLocked }) {
-                    audioTracks[trackIdx].clips[clipIdx].timelineStart = max(.zero, newStartTime)
+                    let dur = audioTracks[trackIdx].clips[clipIdx].duration
+                    guard !hasLockedClipOverlap(start: clampedStart, end: CMTimeAdd(clampedStart, dur), trackIndex: targetTrack, isVideo: false, excludingClipIds: [id]) else {
+                        return
+                    }
+                    audioTracks[trackIdx].clips[clipIdx].timelineStart = clampedStart
                     audioTracks[trackIdx].clips[clipIdx].trackIndex = targetTrack
                     return
                 }
@@ -608,18 +1283,22 @@ public final class TimelineModel {
         companionId: UUID? = nil
     ) {
         var movedClip: TimelineClip? = nil
+        var originalTrackIndex: Int = 0
 
         if isVideo {
             for trackIdx in 0..<videoTracks.count where !videoTracks[trackIdx].isLocked {
                 if let clipIdx = videoTracks[trackIdx].clips.firstIndex(where: { $0.id == id && !$0.isLocked }) {
+                    originalTrackIndex = trackIdx
                     movedClip = videoTracks[trackIdx].clips.remove(at: clipIdx)
                     break
                 }
             }
             var finalClipStart: CMTime? = nil
             var finalClipSourceOut: CMTime? = nil
+            var didRevertPrimary = false
 
-            if var clip = movedClip {
+            if let originalClip = movedClip {
+                var clip = originalClip
                 ensureVideoTrack(id: targetTrack)
                 clip.trackIndex = targetTrack
                 if let newStart = newStartTime {
@@ -650,13 +1329,25 @@ public final class TimelineModel {
                     finalClipSourceOut = clip.sourceOut
                 }
 
-                overwriteAndInsert(incoming: clip, trackIndex: targetTrack, isVideo: true)
+                if hasLockedClipOverlap(start: clip.timelineStart, end: clip.timelineEnd, trackIndex: targetTrack, isVideo: true, excludingClipIds: [clip.id]) {
+                    var restored = originalClip
+                    restored.trackIndex = originalTrackIndex
+                    overwriteAndInsert(incoming: restored, trackIndex: originalTrackIndex, isVideo: true)
+                    didRevertPrimary = true
+                } else {
+                    overwriteAndInsert(incoming: clip, trackIndex: targetTrack, isVideo: true)
+                }
             }
 
             if isLinkActive, let cId = companionId ?? findCompanionId(for: movedClip?.linkGroupId, isVideo: true) {
                 for trackIdx in 0..<audioTracks.count where !audioTracks[trackIdx].isLocked {
-                    if let clipIdx = audioTracks[trackIdx].clips.firstIndex(where: { $0.id == cId }) {
-                        var aClip = audioTracks[trackIdx].clips.remove(at: clipIdx)
+                    if let clipIdx = audioTracks[trackIdx].clips.firstIndex(where: { $0.id == cId && !$0.isLocked }) {
+                        let originalAClip = audioTracks[trackIdx].clips.remove(at: clipIdx)
+                        if didRevertPrimary {
+                            overwriteAndInsert(incoming: originalAClip, trackIndex: trackIdx, isVideo: false)
+                            break
+                        }
+                        var aClip = originalAClip
                         if let fStart = finalClipStart {
                             aClip.timelineStart = fStart
                         }
@@ -664,7 +1355,11 @@ public final class TimelineModel {
                             let maxA = CMTimeGetSeconds(aClip.mediaItem.duration)
                             aClip.sourceOut = CMTime(seconds: min(maxA, CMTimeGetSeconds(fOut)), preferredTimescale: 600)
                         }
-                        overwriteAndInsert(incoming: aClip, trackIndex: aClip.trackIndex, isVideo: false)
+                        if hasLockedClipOverlap(start: aClip.timelineStart, end: aClip.timelineEnd, trackIndex: aClip.trackIndex, isVideo: false, excludingClipIds: [aClip.id]) {
+                            overwriteAndInsert(incoming: originalAClip, trackIndex: trackIdx, isVideo: false)
+                        } else {
+                            overwriteAndInsert(incoming: aClip, trackIndex: aClip.trackIndex, isVideo: false)
+                        }
                         break
                     }
                 }
@@ -672,29 +1367,160 @@ public final class TimelineModel {
         } else {
             for trackIdx in 0..<audioTracks.count where !audioTracks[trackIdx].isLocked {
                 if let clipIdx = audioTracks[trackIdx].clips.firstIndex(where: { $0.id == id && !$0.isLocked }) {
+                    originalTrackIndex = trackIdx
                     movedClip = audioTracks[trackIdx].clips.remove(at: clipIdx)
                     break
                 }
             }
-            if var clip = movedClip {
+            var didRevertPrimary = false
+            if let originalClip = movedClip {
+                var clip = originalClip
                 ensureAudioTrack(id: targetTrack)
                 clip.trackIndex = targetTrack
                 if let newStart = newStartTime {
                     clip.timelineStart = max(.zero, newStart)
                 }
-                overwriteAndInsert(incoming: clip, trackIndex: targetTrack, isVideo: false)
+                if hasLockedClipOverlap(start: clip.timelineStart, end: clip.timelineEnd, trackIndex: targetTrack, isVideo: false, excludingClipIds: [clip.id]) {
+                    var restored = originalClip
+                    restored.trackIndex = originalTrackIndex
+                    overwriteAndInsert(incoming: restored, trackIndex: originalTrackIndex, isVideo: false)
+                    didRevertPrimary = true
+                } else {
+                    overwriteAndInsert(incoming: clip, trackIndex: targetTrack, isVideo: false)
+                }
             }
 
             if isLinkActive, let cId = companionId ?? findCompanionId(for: movedClip?.linkGroupId, isVideo: false) {
                 for trackIdx in 0..<videoTracks.count where !videoTracks[trackIdx].isLocked {
-                    if let clipIdx = videoTracks[trackIdx].clips.firstIndex(where: { $0.id == cId }) {
-                        let vClip = videoTracks[trackIdx].clips.remove(at: clipIdx)
-                        overwriteAndInsert(incoming: vClip, trackIndex: vClip.trackIndex, isVideo: true)
+                    if let clipIdx = videoTracks[trackIdx].clips.firstIndex(where: { $0.id == cId && !$0.isLocked }) {
+                        let originalVClip = videoTracks[trackIdx].clips.remove(at: clipIdx)
+                        if didRevertPrimary || hasLockedClipOverlap(start: originalVClip.timelineStart, end: originalVClip.timelineEnd, trackIndex: originalVClip.trackIndex, isVideo: true, excludingClipIds: [originalVClip.id]) {
+                            overwriteAndInsert(incoming: originalVClip, trackIndex: trackIdx, isVideo: true)
+                        } else {
+                            overwriteAndInsert(incoming: originalVClip, trackIndex: originalVClip.trackIndex, isVideo: true)
+                        }
                         break
                     }
                 }
             }
         }
+        onModelChanged?()
+    }
+
+    /// Moves a batch of clips atomically (used for multi-selection drag / ⌘A drag),
+    /// removing all moved clips before re-inserting so contiguous clips do not overwrite each other.
+    public func commitMoveClips(_ moves: [(id: UUID, toTrack: Int, isVideo: Bool, newStartTime: CMTime)]) {
+        guard !moves.isEmpty else { return }
+
+        var extracted: [(originalTrack: Int, clip: TimelineClip, targetTrack: Int, isVideo: Bool, newStartTime: CMTime)] = []
+        var seenIds: Set<UUID> = []
+
+        for move in moves {
+            guard seenIds.insert(move.id).inserted else { continue }
+            if move.isVideo {
+                for trackIdx in 0..<videoTracks.count where !videoTracks[trackIdx].isLocked {
+                    if let clipIdx = videoTracks[trackIdx].clips.firstIndex(where: { $0.id == move.id && !$0.isLocked }) {
+                        let clip = videoTracks[trackIdx].clips.remove(at: clipIdx)
+                        extracted.append((originalTrack: trackIdx, clip: clip, targetTrack: move.toTrack, isVideo: true, newStartTime: move.newStartTime))
+                        break
+                    }
+                }
+            } else {
+                for trackIdx in 0..<audioTracks.count where !audioTracks[trackIdx].isLocked {
+                    if let clipIdx = audioTracks[trackIdx].clips.firstIndex(where: { $0.id == move.id && !$0.isLocked }) {
+                        let clip = audioTracks[trackIdx].clips.remove(at: clipIdx)
+                        extracted.append((originalTrack: trackIdx, clip: clip, targetTrack: move.toTrack, isVideo: false, newStartTime: move.newStartTime))
+                        break
+                    }
+                }
+            }
+        }
+
+        guard !extracted.isEmpty else { return }
+
+        // Apply video clips first so cage locks can compute consistent audio companion adjustments if needed
+        let ordered = extracted.sorted { a, b in
+            if a.isVideo != b.isVideo { return a.isVideo && !b.isVideo }
+            return CMTimeCompare(a.newStartTime, b.newStartTime) < 0
+        }
+
+        var videoAdjustmentsByLink: [UUID: (start: CMTime, sourceOut: CMTime)] = [:]
+        var plannedPlacements: [(clip: TimelineClip, targetTrack: Int, isVideo: Bool)] = []
+        var anyLockedConflict = false
+
+        for entry in ordered {
+            var candidate = entry.clip
+            if entry.isVideo {
+                ensureVideoTrack(id: entry.targetTrack)
+                guard entry.targetTrack < videoTracks.count, !videoTracks[entry.targetTrack].isLocked else {
+                    anyLockedConflict = true
+                    break
+                }
+                candidate.trackIndex = entry.targetTrack
+                candidate.timelineStart = max(.zero, entry.newStartTime)
+
+                if isCageLockActive, !activeCageBoundaries().isEmpty {
+                    let startSec = CMTimeGetSeconds(candidate.timelineStart)
+                    if let targetCage = nearestCageStart(to: startSec) {
+                        candidate.timelineStart = targetCage.startTime
+                        candidate.cageIndex = targetCage.index
+                    }
+                    let alignedStartSec = CMTimeGetSeconds(candidate.timelineStart)
+                    let curEndSec = alignedStartSec + CMTimeGetSeconds(candidate.duration)
+                    let boundaries = activeCageBoundaries()
+                    let alreadyOnBar = boundaries.contains(where: { abs($0 - curEndSec) < 0.015 })
+                    if !alreadyOnBar {
+                        let availSource = max(0.1, CMTimeGetSeconds(candidate.mediaItem.duration) - CMTimeGetSeconds(candidate.sourceIn))
+                        let speedFactor = candidate.speed > 0 ? candidate.speed : 1.0
+                        let maxTimelineDur = availSource / speedFactor
+                        if let snappedEnd = snappedCageEnd(forStart: alignedStartSec, desiredEndSeconds: curEndSec, maxAvailableTimelineDuration: maxTimelineDur) {
+                            let newTimelineDur = max(0.1, snappedEnd - alignedStartSec)
+                            let newSourceOut = min(CMTimeGetSeconds(candidate.mediaItem.duration), CMTimeGetSeconds(candidate.sourceIn) + newTimelineDur * speedFactor)
+                            candidate.sourceOut = CMTime(seconds: newSourceOut, preferredTimescale: 600)
+                        }
+                    }
+                    if isLinkActive, let lId = candidate.linkGroupId {
+                        videoAdjustmentsByLink[lId] = (candidate.timelineStart, candidate.sourceOut)
+                    }
+                }
+                if hasLockedClipOverlap(start: candidate.timelineStart, end: candidate.timelineEnd, trackIndex: entry.targetTrack, isVideo: true, excludingClipIds: [candidate.id]) {
+                    anyLockedConflict = true
+                    break
+                }
+                plannedPlacements.append((clip: candidate, targetTrack: entry.targetTrack, isVideo: true))
+            } else {
+                ensureAudioTrack(id: entry.targetTrack)
+                guard entry.targetTrack < audioTracks.count, !audioTracks[entry.targetTrack].isLocked else {
+                    anyLockedConflict = true
+                    break
+                }
+                candidate.trackIndex = entry.targetTrack
+                candidate.timelineStart = max(.zero, entry.newStartTime)
+                if let lId = candidate.linkGroupId, let adj = videoAdjustmentsByLink[lId] {
+                    candidate.timelineStart = adj.start
+                    let maxA = CMTimeGetSeconds(candidate.mediaItem.duration)
+                    candidate.sourceOut = CMTime(seconds: min(maxA, CMTimeGetSeconds(adj.sourceOut)), preferredTimescale: 600)
+                }
+                if hasLockedClipOverlap(start: candidate.timelineStart, end: candidate.timelineEnd, trackIndex: entry.targetTrack, isVideo: false, excludingClipIds: [candidate.id]) {
+                    anyLockedConflict = true
+                    break
+                }
+                plannedPlacements.append((clip: candidate, targetTrack: entry.targetTrack, isVideo: false))
+            }
+        }
+
+        if anyLockedConflict {
+            for entry in ordered {
+                var restored = entry.clip
+                restored.trackIndex = entry.originalTrack
+                overwriteAndInsert(incoming: restored, trackIndex: entry.originalTrack, isVideo: entry.isVideo)
+            }
+        } else {
+            for item in plannedPlacements {
+                overwriteAndInsert(incoming: item.clip, trackIndex: item.targetTrack, isVideo: item.isVideo)
+            }
+        }
+
         onModelChanged?()
     }
 
@@ -837,6 +1663,18 @@ public final class TimelineModel {
         DebugLogger.shared.log("Pulizia completata: rimaste \(videoTracks.count) tracce video e \(audioTracks.count) tracce audio.", level: .info)
     }
 
+    /// Removes trailing temporary empty tracks created above the baseline counts during a drag gesture.
+    public func trimEmptyTracksCreatedSince(videoCount: Int, audioCount: Int) {
+        let minV = max(1, videoCount)
+        while videoTracks.count > minV, let last = videoTracks.last, last.clips.isEmpty {
+            videoTracks.removeLast()
+        }
+        let minA = max(1, audioCount)
+        while audioTracks.count > minA, let last = audioTracks.last, last.clips.isEmpty {
+            audioTracks.removeLast()
+        }
+    }
+
     public func setClipOrientation(id: UUID, orientation: ClipOrientation) {
         for trackIdx in 0..<videoTracks.count where !videoTracks[trackIdx].isLocked {
             if let clipIdx = videoTracks[trackIdx].clips.firstIndex(where: { $0.id == id }) {
@@ -854,6 +1692,7 @@ public final class TimelineModel {
             for cIdx in 0..<videoTracks[tIdx].clips.count {
                 if videoTracks[tIdx].clips[cIdx].mediaItem.id == id || (url != nil && videoTracks[tIdx].clips[cIdx].mediaItem.url == url) {
                     videoTracks[tIdx].clips[cIdx].isOrphan = true
+                    videoTracks[tIdx].clips[cIdx].mediaItem.beatAnalysis = nil
                     didMark = true
                 }
             }
@@ -862,6 +1701,7 @@ public final class TimelineModel {
             for cIdx in 0..<audioTracks[tIdx].clips.count {
                 if audioTracks[tIdx].clips[cIdx].mediaItem.id == id || (url != nil && audioTracks[tIdx].clips[cIdx].mediaItem.url == url) {
                     audioTracks[tIdx].clips[cIdx].isOrphan = true
+                    audioTracks[tIdx].clips[cIdx].mediaItem.beatAnalysis = nil
                     didMark = true
                 }
             }
@@ -906,7 +1746,9 @@ public final class TimelineModel {
             guard durSec > 0.001 else { continue }
 
             var idsToRemove: Set<UUID> = [targetClip.id]
-            if isLinkActive, let lId = targetClip.linkGroupId {
+            if isSelection {
+                idsToRemove = resolveSelectionCompanionClipIds(for: [targetClip.id])
+            } else if isLinkActive, let lId = targetClip.linkGroupId {
                 for track in videoTracks where !track.isLocked {
                     for c in track.clips where c.linkGroupId == lId { idsToRemove.insert(c.id) }
                 }
@@ -915,35 +1757,56 @@ public final class TimelineModel {
                 }
             }
 
-            // Remove from tracks
+            // Remove from tracks (skip if already removed as companion of a previously processed clip)
+            var removedCount = 0
             for trackIdx in 0..<videoTracks.count where !videoTracks[trackIdx].isLocked {
+                let before = videoTracks[trackIdx].clips.count
                 videoTracks[trackIdx].clips.removeAll(where: { idsToRemove.contains($0.id) })
+                removedCount += (before - videoTracks[trackIdx].clips.count)
             }
             for trackIdx in 0..<audioTracks.count where !audioTracks[trackIdx].isLocked {
+                let before = audioTracks[trackIdx].clips.count
                 audioTracks[trackIdx].clips.removeAll(where: { idsToRemove.contains($0.id) })
+                removedCount += (before - audioTracks[trackIdx].clips.count)
             }
             selectedClipIds.subtract(idsToRemove)
+            guard removedCount > 0 else { continue }
 
             // Modalità con scarto: ripple all clips on unlocked tracks starting at or after endSec backward (skip individually locked clips)
+            let downstreamThreshold = endSec - 0.025
             for trackIdx in 0..<videoTracks.count where !videoTracks[trackIdx].isLocked {
-                for cIdx in 0..<videoTracks[trackIdx].clips.count {
+                let sortedIndices = videoTracks[trackIdx].clips.indices.sorted {
+                    CMTimeCompare(videoTracks[trackIdx].clips[$0].timelineStart, videoTracks[trackIdx].clips[$1].timelineStart) < 0
+                }
+                var prevEndSec: Double = 0.0
+                for cIdx in sortedIndices {
                     let clip = videoTracks[trackIdx].clips[cIdx]
-                    guard !clip.isLocked else { continue }
                     let clipStart = CMTimeGetSeconds(clip.timelineStart)
-                    if clipStart >= endSec - 0.01 {
-                        let newStart = max(startSec, clipStart - durSec)
+                    let clipDur = CMTimeGetSeconds(clip.duration)
+                    if !clip.isLocked && clipStart >= downstreamThreshold {
+                        let newStart = max(startSec, max(prevEndSec, clipStart - durSec))
                         videoTracks[trackIdx].clips[cIdx].timelineStart = CMTime(seconds: newStart, preferredTimescale: 600)
+                        prevEndSec = max(prevEndSec, newStart + clipDur)
+                    } else {
+                        prevEndSec = max(prevEndSec, clipStart + clipDur)
                     }
                 }
             }
             for trackIdx in 0..<audioTracks.count where !audioTracks[trackIdx].isLocked {
-                for cIdx in 0..<audioTracks[trackIdx].clips.count {
+                let sortedIndices = audioTracks[trackIdx].clips.indices.sorted {
+                    CMTimeCompare(audioTracks[trackIdx].clips[$0].timelineStart, audioTracks[trackIdx].clips[$1].timelineStart) < 0
+                }
+                var prevEndSec: Double = 0.0
+                for cIdx in sortedIndices {
                     let clip = audioTracks[trackIdx].clips[cIdx]
-                    guard !clip.isLocked else { continue }
                     let clipStart = CMTimeGetSeconds(clip.timelineStart)
-                    if clipStart >= endSec - 0.01 {
-                        let newStart = max(startSec, clipStart - durSec)
+                    let clipDur = CMTimeGetSeconds(clip.duration)
+                    if !clip.isLocked && clipStart >= downstreamThreshold {
+                        let newStart = max(startSec, max(prevEndSec, clipStart - durSec))
                         audioTracks[trackIdx].clips[cIdx].timelineStart = CMTime(seconds: newStart, preferredTimescale: 600)
+                        prevEndSec = max(prevEndSec, newStart + clipDur)
+                    } else {
+                        prevEndSec = max(prevEndSec, clipStart + clipDur)
                     }
                 }
             }
@@ -952,8 +1815,82 @@ public final class TimelineModel {
         }
 
         if didRipple {
+            if isSelection {
+                repackSelectionContiguously()
+            }
             onModelChanged?()
             DebugLogger.shared.log("Eliminazione con scarto (Ripple Delete) completata: rimosso spazio vuoto.", level: .info)
+        }
+    }
+
+    /// Garantisce che in Selezione tutte le clip su V1 e A1 restino sempre perfettamente contigue
+    /// dalla posizione 0 senza buchi vuoti né sovrapposizioni dopo split, trim o ripple delete.
+    public func repackSelectionContiguously() {
+        guard isSelection else { return }
+
+        if !videoTracks.isEmpty {
+            let originalVideo = videoTracks[0].clips.sorted {
+                let c = CMTimeCompare($0.timelineStart, $1.timelineStart)
+                if c != 0 { return c < 0 }
+                return CMTimeCompare($0.sourceIn, $1.sourceIn) < 0
+            }
+
+            var newStartByLink: [UUID: CMTime] = [:]
+            var matchedAudioIndices: Set<Int> = []
+            var newAudioStartByAudioIdx: [Int: CMTime] = [:]
+
+            var cursor: CMTime = .zero
+            var repackedVideo: [TimelineClip] = []
+            repackedVideo.reserveCapacity(originalVideo.count)
+
+            let existingAudio = audioTracks.first?.clips ?? []
+
+            for var vClip in originalVideo {
+                let oldStart = CMTimeGetSeconds(vClip.timelineStart)
+                let oldEnd = CMTimeGetSeconds(vClip.timelineEnd)
+                vClip.timelineStart = cursor
+                vClip.trackIndex = 0
+                repackedVideo.append(vClip)
+
+                if let lid = vClip.linkGroupId {
+                    newStartByLink[lid] = cursor
+                }
+                for (aIdx, aClip) in existingAudio.enumerated() where !matchedAudioIndices.contains(aIdx) {
+                    if let lid = vClip.linkGroupId, aClip.linkGroupId == lid {
+                        matchedAudioIndices.insert(aIdx)
+                        newAudioStartByAudioIdx[aIdx] = cursor
+                        break
+                    }
+                    let asSec = CMTimeGetSeconds(aClip.timelineStart)
+                    let aeSec = CMTimeGetSeconds(aClip.timelineEnd)
+                    if aClip.mediaItem.url == vClip.mediaItem.url && abs(asSec - oldStart) < 0.05 && abs(aeSec - oldEnd) < 0.05 {
+                        matchedAudioIndices.insert(aIdx)
+                        newAudioStartByAudioIdx[aIdx] = cursor
+                        break
+                    }
+                }
+                cursor = CMTimeAdd(cursor, vClip.duration)
+            }
+            videoTracks[0].clips = repackedVideo
+
+            if !audioTracks.isEmpty {
+                var repackedAudio: [TimelineClip] = []
+                var tailCursor = cursor
+                for (aIdx, var aClip) in existingAudio.enumerated() {
+                    if let mappedStart = newAudioStartByAudioIdx[aIdx] {
+                        aClip.timelineStart = mappedStart
+                    } else if let lid = aClip.linkGroupId, let mappedStart = newStartByLink[lid] {
+                        aClip.timelineStart = mappedStart
+                    } else {
+                        aClip.timelineStart = tailCursor
+                        tailCursor = CMTimeAdd(tailCursor, aClip.duration)
+                    }
+                    aClip.trackIndex = 0
+                    repackedAudio.append(aClip)
+                }
+                repackedAudio.sort { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
+                audioTracks[0].clips = repackedAudio
+            }
         }
     }
 
@@ -1064,6 +2001,9 @@ public final class TimelineModel {
         }
 
         if didTrim {
+            if isSelection {
+                repackSelectionContiguously()
+            }
             onModelChanged?()
             DebugLogger.shared.log("Trim Inizio Senza Scarto (Q) eseguito a \(String(format: "%.2f", CMTimeGetSeconds(time)))s (Ripple: \(String(format: "%.2f", totalDeltaSec))s)", level: .info)
             return targetTimelineStart
@@ -1162,6 +2102,9 @@ public final class TimelineModel {
         }
 
         if didTrim {
+            if isSelection {
+                repackSelectionContiguously()
+            }
             onModelChanged?()
             DebugLogger.shared.log("Trim Fine Senza Scarto (W) eseguito a \(String(format: "%.2f", CMTimeGetSeconds(time)))s (Ripple: \(String(format: "%.2f", totalDeltaSec))s)", level: .info)
         }
@@ -1232,7 +2175,9 @@ public final class TimelineModel {
                             beatBPM: clip.beatBPM,
                             markers: clip.markers,
                             priority: clip.priority,
-                            isLocked: clip.isLocked
+                            isLocked: clip.isLocked,
+                            selectionSourceIn: clip.selectionSourceIn,
+                            selectionSourceOut: clip.selectionSourceOut
                         )
 
                         let rightClip = TimelineClip(
@@ -1251,7 +2196,9 @@ public final class TimelineModel {
                             beatBPM: clip.beatBPM,
                             markers: clip.markers,
                             priority: clip.priority,
-                            isLocked: clip.isLocked
+                            isLocked: clip.isLocked,
+                            selectionSourceIn: clip.selectionSourceIn,
+                            selectionSourceOut: clip.selectionSourceOut
                         )
 
                         newClips.append(leftClip)
@@ -1383,6 +2330,7 @@ public final class TimelineModel {
             for c in 0..<videoTracks[t].clips.count {
                 if videoTracks[t].clips[c].mediaItem.id == mediaId {
                     videoTracks[t].clips[c].isOrphan = true
+                    videoTracks[t].clips[c].mediaItem.beatAnalysis = nil
                     changed = true
                 }
             }
@@ -1391,6 +2339,7 @@ public final class TimelineModel {
             for c in 0..<audioTracks[t].clips.count {
                 if audioTracks[t].clips[c].mediaItem.id == mediaId {
                     audioTracks[t].clips[c].isOrphan = true
+                    audioTracks[t].clips[c].mediaItem.beatAnalysis = nil
                     changed = true
                 }
             }
@@ -1410,6 +2359,7 @@ public final class TimelineModel {
     ) -> Bool {
         var targetClip: TimelineClip?
         var linkId: UUID?
+        let pairedIds: Set<UUID> = isSelection ? resolveSelectionCompanionClipIds(for: [clipId]) : [clipId]
 
         if isVideo {
             for track in videoTracks {
@@ -1445,12 +2395,11 @@ public final class TimelineModel {
 
             let durationDelta = -appliedInDelta
 
-            func applyStartTrim(to trackList: inout [TimelineTrack], matchClipId: UUID?, matchLinkId: UUID?) {
+            func applyStartTrim(to trackList: inout [TimelineTrack], matchIds: Set<UUID>, matchLinkId: UUID?) {
                 for tIdx in 0..<trackList.count where !trackList[tIdx].isLocked {
                     for cIdx in 0..<trackList[tIdx].clips.count {
                         let c = trackList[tIdx].clips[cIdx]
-                        let isThisClip = (matchClipId != nil && c.id == matchClipId!) ||
-                                         (matchLinkId != nil && c.linkGroupId == matchLinkId!)
+                        let isThisClip = matchIds.contains(c.id) || (matchLinkId != nil && c.linkGroupId == matchLinkId!)
                         if isThisClip {
                             let newIn = max(0, min(CMTimeGetSeconds(c.sourceOut) - 0.1, CMTimeGetSeconds(c.sourceIn) + appliedInDelta))
                             trackList[tIdx].clips[cIdx].sourceIn = CMTime(seconds: newIn, preferredTimescale: 600)
@@ -1462,8 +2411,8 @@ public final class TimelineModel {
                 }
             }
 
-            applyStartTrim(to: &videoTracks, matchClipId: isVideo ? clipId : nil, matchLinkId: linkId)
-            applyStartTrim(to: &audioTracks, matchClipId: !isVideo ? clipId : nil, matchLinkId: linkId)
+            applyStartTrim(to: &videoTracks, matchIds: pairedIds, matchLinkId: linkId)
+            applyStartTrim(to: &audioTracks, matchIds: pairedIds, matchLinkId: linkId)
 
         } else {
             let minDur: Double = 0.1
@@ -1473,12 +2422,11 @@ public final class TimelineModel {
             let durationDelta = proposedDur - curDur
             guard abs(durationDelta) > 0.001 else { return false }
 
-            func applyEndTrim(to trackList: inout [TimelineTrack], matchClipId: UUID?, matchLinkId: UUID?) {
+            func applyEndTrim(to trackList: inout [TimelineTrack], matchIds: Set<UUID>, matchLinkId: UUID?) {
                 for tIdx in 0..<trackList.count where !trackList[tIdx].isLocked {
                     for cIdx in 0..<trackList[tIdx].clips.count {
                         let c = trackList[tIdx].clips[cIdx]
-                        let isThisClip = (matchClipId != nil && c.id == matchClipId!) ||
-                                         (matchLinkId != nil && c.linkGroupId == matchLinkId!)
+                        let isThisClip = matchIds.contains(c.id) || (matchLinkId != nil && c.linkGroupId == matchLinkId!)
                         if isThisClip {
                             let cIn = CMTimeGetSeconds(c.sourceIn)
                             let cMaxOut = CMTimeGetSeconds(c.mediaItem.duration)
@@ -1492,10 +2440,13 @@ public final class TimelineModel {
                 }
             }
 
-            applyEndTrim(to: &videoTracks, matchClipId: isVideo ? clipId : nil, matchLinkId: linkId)
-            applyEndTrim(to: &audioTracks, matchClipId: !isVideo ? clipId : nil, matchLinkId: linkId)
+            applyEndTrim(to: &videoTracks, matchIds: pairedIds, matchLinkId: linkId)
+            applyEndTrim(to: &audioTracks, matchIds: pairedIds, matchLinkId: linkId)
         }
 
+        if isSelection {
+            repackSelectionContiguously()
+        }
         onModelChanged?()
         return true
     }
@@ -1524,13 +2475,52 @@ public final class TimelineModel {
 
     // MARK: - Manual Clip Markers (M) on Audio & Video Clips
 
+    private func resolveSelectionCompanionClipIds(for seedIds: Set<UUID>) -> Set<UUID> {
+        guard isSelection, !seedIds.isEmpty else { return seedIds }
+        var result = seedIds
+        var linkGroups: Set<UUID> = []
+        var windows: [(url: URL, start: Double, end: Double)] = []
+
+        for track in videoTracks {
+            for c in track.clips where seedIds.contains(c.id) {
+                if let lid = c.linkGroupId { linkGroups.insert(lid) }
+                windows.append((c.mediaItem.url, CMTimeGetSeconds(c.timelineStart), CMTimeGetSeconds(c.timelineEnd)))
+            }
+        }
+        for track in audioTracks {
+            for c in track.clips where seedIds.contains(c.id) {
+                if let lid = c.linkGroupId { linkGroups.insert(lid) }
+                windows.append((c.mediaItem.url, CMTimeGetSeconds(c.timelineStart), CMTimeGetSeconds(c.timelineEnd)))
+            }
+        }
+
+        func matches(_ c: TimelineClip) -> Bool {
+            if let lid = c.linkGroupId, linkGroups.contains(lid) { return true }
+            let cs = CMTimeGetSeconds(c.timelineStart)
+            let ce = CMTimeGetSeconds(c.timelineEnd)
+            return windows.contains { w in
+                w.url == c.mediaItem.url && abs(w.start - cs) < 0.025 && abs(w.end - ce) < 0.025
+            }
+        }
+
+        for track in videoTracks {
+            for c in track.clips where matches(c) { result.insert(c.id) }
+        }
+        for track in audioTracks {
+            for c in track.clips where matches(c) { result.insert(c.id) }
+        }
+        return result
+    }
+
     /// Aggiunge o rimuove (se entro ±0.08s) un marcatore sulle clip audio/video sotto la testina.
+    /// In Selezione (`isSelection`), Video e Audio vengono sempre gestiti insieme in modo sincronizzato.
     @discardableResult
     public func toggleClipMarker(at time: CMTime) -> (added: Int, removed: Int, summary: [String]) {
-        let timeSec = CMTimeGetSeconds(time)
-        let selectedIds = selectedClipIds
+        let effectiveTime = isSmartFilterActive ? realTimelineTime(forDisplayedTime: time) : time
+        let timeSec = CMTimeGetSeconds(effectiveTime)
+        let selectedIds = isSelection ? resolveSelectionCompanionClipIds(for: selectedClipIds) : selectedClipIds
 
-        // Se almeno una clip selezionata si trova sotto la testina, agisci solo su quelle selezionate
+        // Se almeno una clip selezionata si trova sotto la testina, agisci solo su quelle selezionate (e companion in Selezione)
         var hasSelectedUnderPlayhead = false
         if !selectedIds.isEmpty {
             for track in videoTracks where !track.isLocked {
@@ -1549,6 +2539,28 @@ public final class TimelineModel {
             }
         }
 
+        // In Selezione, se almeno uno tra V e A ha già un marcatore in quel punto, rimuovi su entrambi; altrimenti aggiungi su entrambi
+        var forceSelectionRemove: Bool? = nil
+        if isSelection {
+            var anyExisting = false
+            for track in (videoTracks + audioTracks) where !track.isLocked {
+                for clip in track.clips {
+                    if hasSelectedUnderPlayhead && !selectedIds.contains(clip.id) { continue }
+                    let cStart = CMTimeGetSeconds(clip.timelineStart)
+                    let cEnd = CMTimeGetSeconds(clip.timelineEnd)
+                    guard timeSec >= cStart - 0.001 && timeSec <= cEnd + 0.001 else { continue }
+                    let spd = clip.speed > 0 ? clip.speed : 1.0
+                    let sourceSec = max(CMTimeGetSeconds(clip.sourceIn), min(CMTimeGetSeconds(clip.sourceOut), CMTimeGetSeconds(clip.sourceIn) + (timeSec - cStart) * spd))
+                    if clip.markers.contains(where: { abs($0 - sourceSec) <= 0.08 * spd }) {
+                        anyExisting = true
+                        break
+                    }
+                }
+                if anyExisting { break }
+            }
+            forceSelectionRemove = anyExisting
+        }
+
         var added = 0
         var removed = 0
         var summary: [String] = []
@@ -1565,9 +2577,23 @@ public final class TimelineModel {
                     let spd = clip.speed > 0 ? clip.speed : 1.0
                     let sourceSec = max(CMTimeGetSeconds(clip.sourceIn), min(CMTimeGetSeconds(clip.sourceOut), CMTimeGetSeconds(clip.sourceIn) + (timeSec - cStart) * spd))
                     let tolSource = 0.08 * spd
+                    let existingIdx = clip.markers.firstIndex(where: { abs($0 - sourceSec) <= tolSource })
 
-                    if let existingIdx = clip.markers.firstIndex(where: { abs($0 - sourceSec) <= tolSource }) {
-                        clip.markers.remove(at: existingIdx)
+                    if let forceRemove = forceSelectionRemove {
+                        if forceRemove {
+                            if let idx = existingIdx {
+                                clip.markers.remove(at: idx)
+                                removed += 1
+                                summary.append("\(clip.mediaItem.name): rimosso a \(formatMarkerTime(timeSec))")
+                            }
+                        } else if existingIdx == nil {
+                            clip.markers.append(sourceSec)
+                            clip.markers.sort()
+                            added += 1
+                            summary.append("\(clip.mediaItem.name): segnato a \(formatMarkerTime(timeSec)) (\(clip.markers.count))")
+                        }
+                    } else if let idx = existingIdx {
+                        clip.markers.remove(at: idx)
                         removed += 1
                         summary.append("\(clip.mediaItem.name): rimosso a \(formatMarkerTime(timeSec))")
                     } else {
@@ -1592,27 +2618,61 @@ public final class TimelineModel {
 
     @discardableResult
     public func toggleMarker(clipId: UUID, at timelineSec: Double) -> Bool {
+        let targetIds = isSelection ? resolveSelectionCompanionClipIds(for: [clipId]) : [clipId]
+
+        // Determina se il marker va rimosso (in base alla clip cliccata) per mantenerne sincronia su V+A in Selezione
+        var shouldRemove: Bool? = nil
+        if isSelection {
+            for track in (videoTracks + audioTracks) where !track.isLocked {
+                if let clip = track.clips.first(where: { $0.id == clipId }) {
+                    let cStart = CMTimeGetSeconds(clip.timelineStart)
+                    let spd = clip.speed > 0 ? clip.speed : 1.0
+                    let sourceSec = max(CMTimeGetSeconds(clip.sourceIn), min(CMTimeGetSeconds(clip.sourceOut), CMTimeGetSeconds(clip.sourceIn) + (timelineSec - cStart) * spd))
+                    shouldRemove = clip.markers.contains(where: { abs($0 - sourceSec) <= 0.12 * spd })
+                    break
+                }
+            }
+        }
+
         func apply(_ tracks: inout [TimelineTrack]) -> Bool {
+            var changed = false
             for tIdx in 0..<tracks.count where !tracks[tIdx].isLocked {
-                if let cIdx = tracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) {
+                for cIdx in 0..<tracks[tIdx].clips.count where targetIds.contains(tracks[tIdx].clips[cIdx].id) {
                     var clip = tracks[tIdx].clips[cIdx]
                     let cStart = CMTimeGetSeconds(clip.timelineStart)
                     let spd = clip.speed > 0 ? clip.speed : 1.0
                     let sourceSec = max(CMTimeGetSeconds(clip.sourceIn), min(CMTimeGetSeconds(clip.sourceOut), CMTimeGetSeconds(clip.sourceIn) + (timelineSec - cStart) * spd))
                     let tolSource = 0.12 * spd
-                    if let existingIdx = clip.markers.firstIndex(where: { abs($0 - sourceSec) <= tolSource }) {
-                        clip.markers.remove(at: existingIdx)
+                    let existingIdx = clip.markers.firstIndex(where: { abs($0 - sourceSec) <= tolSource })
+
+                    if let removeAction = shouldRemove {
+                        if removeAction {
+                            if let idx = existingIdx {
+                                clip.markers.remove(at: idx)
+                                changed = true
+                            }
+                        } else if existingIdx == nil {
+                            clip.markers.append(sourceSec)
+                            clip.markers.sort()
+                            changed = true
+                        }
+                    } else if let idx = existingIdx {
+                        clip.markers.remove(at: idx)
+                        changed = true
                     } else {
                         clip.markers.append(sourceSec)
                         clip.markers.sort()
+                        changed = true
                     }
                     tracks[tIdx].clips[cIdx] = clip
-                    return true
                 }
             }
-            return false
+            return changed
         }
-        if apply(&videoTracks) || apply(&audioTracks) {
+
+        let didV = apply(&videoTracks)
+        let didA = apply(&audioTracks)
+        if didV || didA {
             onModelChanged?()
             return true
         }
@@ -1621,16 +2681,22 @@ public final class TimelineModel {
 
     @discardableResult
     public func clearMarkers(clipId: UUID) -> Bool {
+        let targetIds = isSelection ? resolveSelectionCompanionClipIds(for: [clipId]) : [clipId]
         func clear(_ tracks: inout [TimelineTrack]) -> Bool {
+            var changed = false
             for tIdx in 0..<tracks.count where !tracks[tIdx].isLocked {
-                if let cIdx = tracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) {
-                    tracks[tIdx].clips[cIdx].markers.removeAll()
-                    return true
+                for cIdx in 0..<tracks[tIdx].clips.count where targetIds.contains(tracks[tIdx].clips[cIdx].id) {
+                    if !tracks[tIdx].clips[cIdx].markers.isEmpty {
+                        tracks[tIdx].clips[cIdx].markers.removeAll()
+                        changed = true
+                    }
                 }
             }
-            return false
+            return changed
         }
-        if clear(&videoTracks) || clear(&audioTracks) {
+        let didV = clear(&videoTracks)
+        let didA = clear(&audioTracks)
+        if didV || didA {
             onModelChanged?()
             return true
         }
@@ -1639,7 +2705,7 @@ public final class TimelineModel {
 
     @discardableResult
     public func clearAllClipMarkers(at time: CMTime?) -> Int {
-        let selectedIds = selectedClipIds
+        let selectedIds = isSelection ? resolveSelectionCompanionClipIds(for: selectedClipIds) : selectedClipIds
         let timeSec = time.map { CMTimeGetSeconds($0) }
         var clearedCount = 0
 
@@ -1674,34 +2740,42 @@ public final class TimelineModel {
         fromSourceSec: Double,
         toSourceSec: Double
     ) -> Double? {
-        func update(in tracks: inout [TimelineTrack]) -> Double? {
+        let targetIds: Set<UUID> = (isSelection && !isBeatMarker)
+            ? resolveSelectionCompanionClipIds(for: [clipId])
+            : [clipId]
+
+        func update(in tracks: inout [TimelineTrack], matchingIds: Set<UUID>) -> Double? {
+            var firstUpdated: Double? = nil
             for tIdx in 0..<tracks.count where !tracks[tIdx].isLocked {
-                guard let cIdx = tracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) else { continue }
-                var clip = tracks[tIdx].clips[cIdx]
-                let sIn = CMTimeGetSeconds(clip.sourceIn)
-                let sOut = CMTimeGetSeconds(clip.sourceOut)
-                let clamped = max(sIn, min(sOut, toSourceSec))
+                for cIdx in 0..<tracks[tIdx].clips.count where matchingIds.contains(tracks[tIdx].clips[cIdx].id) {
+                    var clip = tracks[tIdx].clips[cIdx]
+                    let sIn = CMTimeGetSeconds(clip.sourceIn)
+                    let sOut = CMTimeGetSeconds(clip.sourceOut)
+                    let clamped = max(sIn, min(sOut, toSourceSec))
 
-                var arr = isBeatMarker ? clip.beatMarkers : clip.markers
-                guard let matchIdx = arr.enumerated().min(by: { abs($0.element - fromSourceSec) < abs($1.element - fromSourceSec) })?.offset,
-                      abs(arr[matchIdx] - fromSourceSec) <= 0.25 else {
-                    return nil
-                }
+                    var arr = isBeatMarker ? clip.beatMarkers : clip.markers
+                    guard let matchIdx = arr.enumerated().min(by: { abs($0.element - fromSourceSec) < abs($1.element - fromSourceSec) })?.offset,
+                          abs(arr[matchIdx] - fromSourceSec) <= 0.25 else {
+                        continue
+                    }
 
-                arr[matchIdx] = clamped
-                arr.sort()
-                if isBeatMarker {
-                    clip.beatMarkers = arr
-                } else {
-                    clip.markers = arr
+                    arr[matchIdx] = clamped
+                    arr.sort()
+                    if isBeatMarker {
+                        clip.beatMarkers = arr
+                    } else {
+                        clip.markers = arr
+                    }
+                    tracks[tIdx].clips[cIdx] = clip
+                    if firstUpdated == nil { firstUpdated = clamped }
                 }
-                tracks[tIdx].clips[cIdx] = clip
-                return clamped
             }
-            return nil
+            return firstUpdated
         }
 
-        if let newSec = update(in: &videoTracks) ?? update(in: &audioTracks) {
+        let resV = update(in: &videoTracks, matchingIds: targetIds)
+        let resA = update(in: &audioTracks, matchingIds: targetIds)
+        if let newSec = resV ?? resA {
             onModelChanged?()
             return newSec
         }
@@ -1715,28 +2789,36 @@ public final class TimelineModel {
         isBeatMarker: Bool,
         nearSourceSec: Double
     ) -> Bool {
-        func remove(in tracks: inout [TimelineTrack]) -> Bool {
+        let targetIds: Set<UUID> = (isSelection && !isBeatMarker)
+            ? resolveSelectionCompanionClipIds(for: [clipId])
+            : [clipId]
+
+        func remove(in tracks: inout [TimelineTrack], matchingIds: Set<UUID>) -> Bool {
+            var didRemove = false
             for tIdx in 0..<tracks.count where !tracks[tIdx].isLocked {
-                guard let cIdx = tracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) else { continue }
-                var clip = tracks[tIdx].clips[cIdx]
-                var arr = isBeatMarker ? clip.beatMarkers : clip.markers
-                guard let matchIdx = arr.enumerated().min(by: { abs($0.element - nearSourceSec) < abs($1.element - nearSourceSec) })?.offset,
-                      abs(arr[matchIdx] - nearSourceSec) <= 0.25 else {
-                    return false
+                for cIdx in 0..<tracks[tIdx].clips.count where matchingIds.contains(tracks[tIdx].clips[cIdx].id) {
+                    var clip = tracks[tIdx].clips[cIdx]
+                    var arr = isBeatMarker ? clip.beatMarkers : clip.markers
+                    guard let matchIdx = arr.enumerated().min(by: { abs($0.element - nearSourceSec) < abs($1.element - nearSourceSec) })?.offset,
+                          abs(arr[matchIdx] - nearSourceSec) <= 0.25 else {
+                        continue
+                    }
+                    arr.remove(at: matchIdx)
+                    if isBeatMarker {
+                        clip.beatMarkers = arr
+                    } else {
+                        clip.markers = arr
+                    }
+                    tracks[tIdx].clips[cIdx] = clip
+                    didRemove = true
                 }
-                arr.remove(at: matchIdx)
-                if isBeatMarker {
-                    clip.beatMarkers = arr
-                } else {
-                    clip.markers = arr
-                }
-                tracks[tIdx].clips[cIdx] = clip
-                return true
             }
-            return false
+            return didRemove
         }
 
-        if remove(in: &videoTracks) || remove(in: &audioTracks) {
+        let didV = remove(in: &videoTracks, matchingIds: targetIds)
+        let didA = remove(in: &audioTracks, matchingIds: targetIds)
+        if didV || didA {
             onModelChanged?()
             return true
         }
@@ -1811,13 +2893,17 @@ public final class TimelineModel {
             }
         }
         rhythmicCages = rebuilt
+        if isSelection {
+            repackSelectionContiguously()
+        }
         onModelChanged?()
         return true
     }
 
     // MARK: - Selection Priority Tagging & Per-Clip Lock
     private func resolveTargetClipIds(at time: CMTime) -> Set<UUID> {
-        let timeSec = CMTimeGetSeconds(time)
+        let effectiveTime = isSmartFilterActive ? realTimelineTime(forDisplayedTime: time) : time
+        let timeSec = CMTimeGetSeconds(effectiveTime)
         let selectedIds = selectedClipIds
 
         var hasSelectedUnderPlayhead = false
@@ -2079,7 +3165,9 @@ public final class TimelineModel {
     }
 
     /// Restituisce le gabbie attive in questo momento guardando la timeline e le tracce audio editate (beat + marcatori M).
+    /// Le timeline di Selezione non usano gabbie né sbarre ritmiche.
     public func activeCageIntervals() -> [RhythmicCage] {
+        guard !isSelection else { return [] }
         let clipsWithBeats = audioTracks
             .filter { $0.isEnabled }
             .flatMap(\.clips)
@@ -2223,11 +3311,29 @@ public final class TimelineModel {
     }
 
     @discardableResult
+    public func autoFillCages(
+        withSelectionTimeline selTimeline: TimelineModel,
+        targetTrackIndex: Int = 0,
+        overrideCages: [RhythmicCage]? = nil,
+        orderMode: AutoFillOrderMode = .chronological,
+        startFromPlayhead: Double? = nil
+    ) -> Int {
+        return autoFillCagesDetailed(
+            withSelectionTimeline: selTimeline,
+            targetTrackIndex: targetTrackIndex,
+            overrideCages: overrideCages,
+            orderMode: orderMode,
+            startFromPlayhead: startFromPlayhead
+        ).filledCount
+    }
+
+    @discardableResult
     public func autoFillCagesDetailed(
         withSelectionTimeline selTimeline: TimelineModel,
         targetTrackIndex: Int = 0,
         overrideCages: [RhythmicCage]? = nil,
-        orderMode: AutoFillOrderMode = .chronological
+        orderMode: AutoFillOrderMode = .chronological,
+        startFromPlayhead: Double? = nil
     ) -> AutoFillResult {
         let clips = (selTimeline.videoTracks.first?.clips ?? []).sorted {
             CMTimeCompare($0.timelineStart, $1.timelineStart) < 0
@@ -2238,7 +3344,49 @@ public final class TimelineModel {
             selectionAudioClips: selAudioClips,
             targetTrackIndex: targetTrackIndex,
             overrideCages: overrideCages,
-            orderMode: orderMode
+            orderMode: orderMode,
+            startFromPlayhead: startFromPlayhead
+        )
+    }
+
+    /// Pre-calcolo leggero (senza modificare la timeline) per mostrare conteggio gabbie vs clip prima di eseguire Auto-Fill.
+    public func previewAutoFill(
+        withSelectionTimeline selTimeline: TimelineModel,
+        targetTrackIndex: Int = 0,
+        overrideCages: [RhythmicCage]? = nil,
+        orderMode: AutoFillOrderMode = .chronological,
+        startFromPlayhead: Double? = nil
+    ) -> AutoFillForecast {
+        let selectionClips = (selTimeline.videoTracks.first?.clips ?? []).sorted {
+            CMTimeCompare($0.timelineStart, $1.timelineStart) < 0
+        }
+        let selAudioClips = selTimeline.audioTracks.first?.clips ?? []
+        let allCages = overrideCages ?? activeCageIntervals()
+        let plan = planAutoFill(
+            allCages: allCages,
+            selectionClips: selectionClips,
+            selectionAudioClips: selAudioClips,
+            targetTrackIndex: targetTrackIndex,
+            orderMode: orderMode,
+            startFromPlayhead: startFromPlayhead,
+            deterministicPreview: true
+        )
+        let p1 = selectionClips.filter { ($0.priority ?? 1) == 1 }.count
+        let p2 = selectionClips.filter { $0.priority == 2 }.count
+        let p3 = selectionClips.filter { $0.priority == 3 }.count
+        return AutoFillForecast(
+            totalTargetCages: plan.targetCages.count,
+            lockedCagesCount: plan.lockedCagesCount,
+            unlockedCagesCount: plan.unlockedCages.count,
+            selectionClipCount: selectionClips.count,
+            p1Count: p1,
+            p2Count: p2,
+            p3Count: p3,
+            predictedUniqueCount: plan.primaryUniqueCount,
+            predictedSubsegmentCount: plan.subsegmentCount,
+            predictedFilledCount: plan.assignments.count,
+            predictedEmptyCount: max(0, plan.unlockedCages.count - plan.assignments.count),
+            startingCageNumber: (plan.targetCages.first?.index ?? 0) + 1
         )
     }
 
@@ -2247,14 +3395,16 @@ public final class TimelineModel {
         withTimelineClips selectionClips: [TimelineClip],
         targetTrackIndex: Int = 0,
         overrideCages: [RhythmicCage]? = nil,
-        orderMode: AutoFillOrderMode = .chronological
+        orderMode: AutoFillOrderMode = .chronological,
+        startFromPlayhead: Double? = nil
     ) -> Int {
         return autoFillCagesCore(
             withTimelineClips: selectionClips,
             selectionAudioClips: [],
             targetTrackIndex: targetTrackIndex,
             overrideCages: overrideCages,
-            orderMode: orderMode
+            orderMode: orderMode,
+            startFromPlayhead: startFromPlayhead
         ).filledCount
     }
 
@@ -2262,9 +3412,24 @@ public final class TimelineModel {
         let clip: TimelineClip
         let effectivePriority: Int
         let hasAudio: Bool
+        let selectionOriginIn: Double
+        let selectionOriginOut: Double
         var freeRanges: [(start: Double, end: Double)]
         var pass1Used: Bool = false
         var slicesTaken: Int = 0
+    }
+
+    private struct AutoFillPlan {
+        let targetCages: [RhythmicCage]
+        let unlockedCages: [RhythmicCage]
+        let lockedCagesCount: Int
+        let startAnchorSec: Double
+        let preservedClips: [TimelineClip]
+        let replacedClips: [TimelineClip]
+        let pool: [AutoFillPoolEntry]
+        let assignments: [(cage: RhythmicCage, entryIdx: Int, effIn: Double, effOut: Double)]
+        let primaryUniqueCount: Int
+        let subsegmentCount: Int
     }
 
     private func subtractUsedRange(
@@ -2294,7 +3459,6 @@ public final class TimelineModel {
         guard neededDur > 0.02 else { return nil }
         let markers = entry.clip.markers
 
-        // Trova tutti i sotto-intervalli compatibili (>= neededDur - 0.02s, no slow-mo automatico)
         var bestRangeIdx: Int? = nil
         var bestChosenIn: Double = 0
         var bestChosenOut: Double = 0
@@ -2307,7 +3471,6 @@ public final class TimelineModel {
 
             let markersInRange = markers.filter { $0 >= r.start - 0.01 && $0 <= r.end + 0.01 }
             if !markersInRange.isEmpty {
-                // Centra il marcatore più vicino al centro dell'intervallo
                 let rMid = (r.start + r.end) * 0.5
                 let chosenMarker = markersInRange.min(by: { abs($0 - rMid) < abs($1 - rMid) }) ?? markersInRange[0]
                 let desiredIn = chosenMarker - actualDur * 0.5
@@ -2329,91 +3492,55 @@ public final class TimelineModel {
         return (bestChosenIn, bestChosenOut)
     }
 
-    private func autoFillCagesCore(
-        withTimelineClips selectionClips: [TimelineClip],
+    private func planAutoFill(
+        allCages: [RhythmicCage],
+        selectionClips: [TimelineClip],
         selectionAudioClips: [TimelineClip],
         targetTrackIndex: Int,
-        overrideCages: [RhythmicCage]?,
-        orderMode: AutoFillOrderMode
-    ) -> AutoFillResult {
-        let activeCages = overrideCages ?? activeCageIntervals()
-        guard !activeCages.isEmpty else {
-            DebugLogger.shared.log("Nessuna gabbia ritmata presente. Esegui prima l'analisi audio della traccia musicale.", level: .warning)
-            return AutoFillResult(filledCount: 0, totalUnlockedCages: 0, lockedCagesCount: 0, primaryUniqueCount: 0, subsegmentCount: 0, remainingEmptyCages: 0, movedAudioToA2: false)
-        }
-        guard !selectionClips.isEmpty else {
-            DebugLogger.shared.log("La selezione è vuota: aggiungi prima delle clip alla Selezione.", level: .warning)
-            return AutoFillResult(filledCount: 0, totalUnlockedCages: activeCages.count, lockedCagesCount: 0, primaryUniqueCount: 0, subsegmentCount: 0, remainingEmptyCages: activeCages.count, movedAudioToA2: false)
-        }
-
-        ensureVideoTrack(id: targetTrackIndex)
-        ensureAudioTrack(id: 0)
-
-        // 1. Preserva le clip bloccate su V1 e rimuovi solo le clip sbloccate + relativo audio collegato
-        let lockedVClips = videoTracks[targetTrackIndex].clips.filter { $0.isLocked }
-        let unlockedVClips = videoTracks[targetTrackIndex].clips.filter { !$0.isLocked }
-        let unlockedLinkIds = Set(unlockedVClips.compactMap { $0.linkGroupId })
-        let lockedLinkIds = Set(lockedVClips.compactMap { $0.linkGroupId })
-
-        videoTracks[targetTrackIndex].clips = lockedVClips
-
-        // Pulisci da A1 solo gli audio collegati alle clip video rimosse
-        audioTracks[0].clips.removeAll { aClip in
-            guard !aClip.isLocked else { return false }
-            if let lId = aClip.linkGroupId, unlockedLinkIds.contains(lId) {
-                return true
-            }
-            return false
+        orderMode: AutoFillOrderMode,
+        startFromPlayhead: Double?,
+        deterministicPreview: Bool
+    ) -> AutoFillPlan {
+        // Scegli gabbie bersaglio (dalla prima oppure dalla gabbia sotto la testina inclusa)
+        let targetCages: [RhythmicCage]
+        if let ph = startFromPlayhead {
+            targetCages = allCages.filter { $0.endSeconds > ph + 0.02 }
+        } else {
+            targetCages = allCages
         }
 
-        // Sposta da A1 ad A2 le tracce audio indipendenti (es. il brano musicale) così A1 resta dedicata all'audio dei video
-        var movedAudioToA2 = false
-        if targetTrackIndex == 0 {
-            var remainingA1: [TimelineClip] = []
-            var toMoveToA2: [TimelineClip] = []
-            for clip in audioTracks[0].clips {
-                let linkedToLockedV = clip.linkGroupId.map { lockedLinkIds.contains($0) } ?? false
-                if clip.isLocked || linkedToLockedV {
-                    remainingA1.append(clip)
-                } else {
-                    toMoveToA2.append(clip)
-                }
-            }
-            if !toMoveToA2.isEmpty {
-                ensureAudioTrack(id: 1)
-                audioTracks[0].clips = remainingA1
-                for var moved in toMoveToA2 {
-                    moved.trackIndex = 1
-                    overwriteAndInsert(incoming: moved, trackIndex: 1, isVideo: false)
-                }
-                audioTracks[1].clips.sort { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
-                movedAudioToA2 = true
+        let startAnchorSec = targetCages.first?.startSeconds ?? 0.0
+        let existingClips = targetTrackIndex < videoTracks.count ? videoTracks[targetTrackIndex].clips : []
+
+        var preservedClips: [TimelineClip] = []
+        var replacedClips: [TimelineClip] = []
+        for clip in existingClips {
+            let cEnd = CMTimeGetSeconds(clip.timelineEnd)
+            let isBeforeWindow = (startFromPlayhead != nil) && (cEnd <= startAnchorSec + 0.02)
+            if clip.isLocked || isBeforeWindow {
+                preservedClips.append(clip)
+            } else {
+                replacedClips.append(clip)
             }
         }
 
-        // 2. Identifica le gabbie già occupate da clip bloccate vs gabbie libere
+        // Classifica gabbie occupate da clip preservate (bloccate o prima della testina) vs libere
         var unlockedCages: [RhythmicCage] = []
         var lockedCagesCount = 0
-        for cage in activeCages {
-            let isCoveredByLocked = lockedVClips.contains { locked in
-                let lStart = CMTimeGetSeconds(locked.timelineStart)
-                let lEnd = CMTimeGetSeconds(locked.timelineEnd)
-                let overlap = min(lEnd, cage.endSeconds) - max(lStart, cage.startSeconds)
-                return overlap > 0.02
+        for cage in targetCages {
+            let isOccupied = preservedClips.contains { preserved in
+                let pStart = CMTimeGetSeconds(preserved.timelineStart)
+                let pEnd = CMTimeGetSeconds(preserved.timelineEnd)
+                return min(pEnd, cage.endSeconds) - max(pStart, cage.startSeconds) > 0.02
             }
-            if isCoveredByLocked {
+            if isOccupied {
                 lockedCagesCount += 1
             } else {
                 unlockedCages.append(cage)
             }
         }
 
-        guard !unlockedCages.isEmpty else {
-            onModelChanged?()
-            return AutoFillResult(filledCount: 0, totalUnlockedCages: 0, lockedCagesCount: lockedCagesCount, primaryUniqueCount: 0, subsegmentCount: 0, remainingEmptyCages: 0, movedAudioToA2: movedAudioToA2)
-        }
-
-        // 3. Costruisci il pool candidati dalle clip della Selezione (nessun tag = priorità 1)
+        // Costruisci pool dalle clip della Selezione, sottraendo gli spezzoni già presenti/bloccati su timeline
         var pool: [AutoFillPoolEntry] = []
         for sClip in selectionClips {
             let maxDur = CMTimeGetSeconds(sClip.mediaItem.duration)
@@ -2423,14 +3550,14 @@ public final class TimelineModel {
             guard origOut - origIn > 0.05 else { continue }
 
             var freeRanges: [(start: Double, end: Double)] = [(origIn, origOut)]
-            var lockedOverlapCount = 0
-            for locked in lockedVClips where locked.mediaItem.id == sClip.mediaItem.id {
-                let lIn = CMTimeGetSeconds(locked.sourceIn)
-                let lOut = CMTimeGetSeconds(locked.sourceOut)
-                if min(lOut, origOut) - max(lIn, origIn) > 0.02 {
-                    lockedOverlapCount += 1
+            var usedBeforeOrLockedCount = 0
+            for preserved in preservedClips where preserved.mediaItem.id == sClip.mediaItem.id {
+                let pIn = CMTimeGetSeconds(preserved.sourceIn)
+                let pOut = CMTimeGetSeconds(preserved.sourceOut)
+                if min(pOut, origOut) - max(pIn, origIn) > 0.02 {
+                    usedBeforeOrLockedCount += 1
                 }
-                freeRanges = subtractUsedRange((lIn, lOut), from: freeRanges)
+                freeRanges = subtractUsedRange((pIn, pOut), from: freeRanges)
             }
             guard !freeRanges.isEmpty else { continue }
 
@@ -2450,23 +3577,34 @@ public final class TimelineModel {
                 clip: sClip,
                 effectivePriority: prio,
                 hasAudio: hasAudioInSel,
+                selectionOriginIn: origIn,
+                selectionOriginOut: origOut,
                 freeRanges: freeRanges,
-                pass1Used: lockedOverlapCount > 0,
-                slicesTaken: lockedOverlapCount
+                pass1Used: usedBeforeOrLockedCount > 0,
+                slicesTaken: usedBeforeOrLockedCount
             ))
         }
 
-        guard !pool.isEmpty else {
-            onModelChanged?()
-            return AutoFillResult(filledCount: 0, totalUnlockedCages: unlockedCages.count, lockedCagesCount: lockedCagesCount, primaryUniqueCount: 0, subsegmentCount: 0, remainingEmptyCages: unlockedCages.count, movedAudioToA2: movedAudioToA2)
+        guard !unlockedCages.isEmpty && !pool.isEmpty else {
+            return AutoFillPlan(
+                targetCages: targetCages,
+                unlockedCages: unlockedCages,
+                lockedCagesCount: lockedCagesCount,
+                startAnchorSec: startAnchorSec,
+                preservedClips: preservedClips,
+                replacedClips: replacedClips,
+                pool: pool,
+                assignments: [],
+                primaryUniqueCount: 0,
+                subsegmentCount: 0
+            )
         }
 
-        // Ordine di scansione (Cronologia Elastica vs Casuale entro ogni livello)
         let workingOrder: [Int]
-        switch orderMode {
-        case .chronological:
+        switch (orderMode, deterministicPreview) {
+        case (.chronological, _), (.random, true):
             workingOrder = Array(0..<pool.count)
-        case .random:
+        case (.random, false):
             let p1 = (0..<pool.count).filter { pool[$0].effectivePriority == 1 }.shuffled()
             let p2 = (0..<pool.count).filter { pool[$0].effectivePriority == 2 }.shuffled()
             let p3 = (0..<pool.count).filter { pool[$0].effectivePriority == 3 }.shuffled()
@@ -2486,7 +3624,7 @@ public final class TimelineModel {
             }
         }
 
-        // PASS 1: 1 solo spezzone per clip (nessuna ripetizione), priorità 1 -> 2 -> 3 + preferenza clip con marcatori + cronologia elastica
+        // PASS 1: 1 spezzone per clip (nessuna ripetizione), priorità 1 -> 2 -> 3 + marcatori
         for (slotIdx, cage) in unlockedCages.enumerated() {
             let neededDur = cage.durationSeconds
             var matched = false
@@ -2515,7 +3653,7 @@ public final class TimelineModel {
             }
         }
 
-        // PASS 2: Solo se restano gabbie vuote, prendi sottospezzoni non sovrapposti dagli intervalli liberi residui (prediligendo quelli con altri marcatori)
+        // PASS 2: Sottospezzoni non sovrapposti se restano gabbie vuote
         if !unfilledSlotIndices.isEmpty {
             for slotIdx in unfilledSlotIndices {
                 let cage = unlockedCages[slotIdx]
@@ -2548,30 +3686,134 @@ public final class TimelineModel {
             }
         }
 
-        // 4. Scrivi le clip piazzate su V1 (+ audio collegato su A1)
+        var assignments: [(cage: RhythmicCage, entryIdx: Int, effIn: Double, effOut: Double)] = []
         for (slotIdx, cage) in unlockedCages.enumerated() {
-            guard let match = assignedPerCage[slotIdx] else { continue }
-            let entry = pool[match.entryIdx]
+            if let match = assignedPerCage[slotIdx] {
+                assignments.append((cage, match.entryIdx, match.effIn, match.effOut))
+            }
+        }
+
+        return AutoFillPlan(
+            targetCages: targetCages,
+            unlockedCages: unlockedCages,
+            lockedCagesCount: lockedCagesCount,
+            startAnchorSec: startAnchorSec,
+            preservedClips: preservedClips,
+            replacedClips: replacedClips,
+            pool: pool,
+            assignments: assignments,
+            primaryUniqueCount: primaryUniqueCount,
+            subsegmentCount: subsegmentCount
+        )
+    }
+
+    private func autoFillCagesCore(
+        withTimelineClips selectionClips: [TimelineClip],
+        selectionAudioClips: [TimelineClip],
+        targetTrackIndex: Int,
+        overrideCages: [RhythmicCage]?,
+        orderMode: AutoFillOrderMode,
+        startFromPlayhead: Double?
+    ) -> AutoFillResult {
+        let allCages = overrideCages ?? activeCageIntervals()
+        guard !allCages.isEmpty else {
+            DebugLogger.shared.log("Nessuna gabbia ritmata presente. Esegui prima Beat Finder su una traccia audio.", level: .warning)
+            return AutoFillResult(filledCount: 0, totalUnlockedCages: 0, lockedCagesCount: 0, primaryUniqueCount: 0, subsegmentCount: 0, remainingEmptyCages: 0, movedAudioToA2: false)
+        }
+        guard !selectionClips.isEmpty else {
+            DebugLogger.shared.log("La selezione è vuota: aggiungi prima delle clip alla Selezione.", level: .warning)
+            return AutoFillResult(filledCount: 0, totalUnlockedCages: allCages.count, lockedCagesCount: 0, primaryUniqueCount: 0, subsegmentCount: 0, remainingEmptyCages: allCages.count, movedAudioToA2: false)
+        }
+
+        ensureVideoTrack(id: targetTrackIndex)
+        ensureAudioTrack(id: 0)
+
+        let plan = planAutoFill(
+            allCages: allCages,
+            selectionClips: selectionClips,
+            selectionAudioClips: selectionAudioClips,
+            targetTrackIndex: targetTrackIndex,
+            orderMode: orderMode,
+            startFromPlayhead: startFromPlayhead,
+            deterministicPreview: false
+        )
+
+        // Preserva clip bloccate o precedenti alla gabbia di partenza; rimuovi solo le sbloccate nel range
+        let replacedLinkIds = Set(plan.replacedClips.compactMap { $0.linkGroupId })
+        let preservedLinkIds = Set(plan.preservedClips.compactMap { $0.linkGroupId })
+
+        videoTracks[targetTrackIndex].clips = plan.preservedClips
+
+        audioTracks[0].clips.removeAll { aClip in
+            guard !aClip.isLocked else { return false }
+            if let lId = aClip.linkGroupId, replacedLinkIds.contains(lId) {
+                return true
+            }
+            return false
+        }
+
+        // Sposta su A2 le tracce audio indipendenti (es. la musica) così A1 resta libera per audio video
+        var movedAudioToA2 = false
+        if targetTrackIndex == 0 {
+            var remainingA1: [TimelineClip] = []
+            var toMoveToA2: [TimelineClip] = []
+            for clip in audioTracks[0].clips {
+                let linkedToPreservedV = clip.linkGroupId.map { preservedLinkIds.contains($0) } ?? false
+                if clip.isLocked || linkedToPreservedV {
+                    remainingA1.append(clip)
+                } else {
+                    toMoveToA2.append(clip)
+                }
+            }
+            if !toMoveToA2.isEmpty {
+                ensureAudioTrack(id: 1)
+                audioTracks[0].clips = remainingA1
+                for var moved in toMoveToA2 {
+                    moved.trackIndex = 1
+                    overwriteAndInsert(incoming: moved, trackIndex: 1, isVideo: false)
+                }
+                audioTracks[1].clips.sort { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
+                movedAudioToA2 = true
+            }
+        }
+
+        guard !plan.assignments.isEmpty else {
+            onModelChanged?()
+            return AutoFillResult(
+                filledCount: 0,
+                totalUnlockedCages: plan.unlockedCages.count,
+                lockedCagesCount: plan.lockedCagesCount,
+                primaryUniqueCount: 0,
+                subsegmentCount: 0,
+                remainingEmptyCages: plan.unlockedCages.count,
+                movedAudioToA2: movedAudioToA2
+            )
+        }
+
+        for item in plan.assignments {
+            let entry = plan.pool[item.entryIdx]
             let sClip = entry.clip
-            let effIn = CMTime(seconds: match.effIn, preferredTimescale: 600)
-            let effOut = CMTime(seconds: match.effOut, preferredTimescale: 600)
+            let effIn = CMTime(seconds: item.effIn, preferredTimescale: 600)
+            let effOut = CMTime(seconds: item.effOut, preferredTimescale: 600)
             let linkId = (targetTrackIndex == 0 && entry.hasAudio) ? UUID() : nil
 
             let vClip = TimelineClip(
                 mediaItem: sClip.mediaItem,
                 sourceIn: effIn,
                 sourceOut: effOut,
-                timelineStart: cage.startTime,
+                timelineStart: item.cage.startTime,
                 trackIndex: targetTrackIndex,
                 mediaType: .video,
                 orientation: sClip.orientation,
                 linkGroupId: linkId,
                 speed: 1.0,
-                cageIndex: cage.index,
+                cageIndex: item.cage.index,
                 span: 1,
                 markers: sClip.markers,
                 priority: sClip.priority,
-                isLocked: false
+                isLocked: false,
+                selectionSourceIn: entry.selectionOriginIn,
+                selectionSourceOut: entry.selectionOriginOut
             )
             videoTracks[targetTrackIndex].clips.append(vClip)
 
@@ -2580,17 +3822,19 @@ public final class TimelineModel {
                     mediaItem: sClip.mediaItem,
                     sourceIn: effIn,
                     sourceOut: effOut,
-                    timelineStart: cage.startTime,
+                    timelineStart: item.cage.startTime,
                     trackIndex: 0,
                     mediaType: .audio,
                     orientation: .normal,
                     linkGroupId: linkId,
                     speed: 1.0,
-                    cageIndex: cage.index,
+                    cageIndex: item.cage.index,
                     span: 1,
                     markers: sClip.markers,
                     priority: sClip.priority,
-                    isLocked: false
+                    isLocked: false,
+                    selectionSourceIn: entry.selectionOriginIn,
+                    selectionSourceOut: entry.selectionOriginOut
                 )
                 audioTracks[0].clips.append(aClip)
             }
@@ -2599,31 +3843,174 @@ public final class TimelineModel {
         videoTracks[targetTrackIndex].clips.sort { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
         audioTracks[0].clips.sort { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
 
-        let filledCount = assignedPerCage.count
-        let remainingEmpty = unlockedCages.count - filledCount
+        // Attiva automaticamente Modalità Montaggio a Gabbie dopo Auto-Fill
+        isCageLockActive = true
+
+        let filledCount = plan.assignments.count
+        let remainingEmpty = max(0, plan.unlockedCages.count - filledCount)
         DebugLogger.shared.log(
-            "Auto-Fill (\(orderMode == .chronological ? "Cronologia" : "Random")): \(filledCount)/\(unlockedCages.count) gabbie riempite (\(primaryUniqueCount) uniche, \(subsegmentCount) sottospezzoni, \(lockedCagesCount) bloccate\(movedAudioToA2 ? ", audio spostato su A2" : "")).",
+            "Auto-Fill (\(orderMode == .chronological ? "Cronologia" : "Random")): \(filledCount)/\(plan.unlockedCages.count) gabbie riempite (\(plan.primaryUniqueCount) uniche, \(plan.subsegmentCount) sottospezzoni, \(plan.lockedCagesCount) bloccate\(movedAudioToA2 ? ", audio spostato su A2" : "")). Modalità Gabbie ATTIVA.",
             level: .info
         )
         onModelChanged?()
 
         return AutoFillResult(
             filledCount: filledCount,
-            totalUnlockedCages: unlockedCages.count,
-            lockedCagesCount: lockedCagesCount,
-            primaryUniqueCount: primaryUniqueCount,
-            subsegmentCount: subsegmentCount,
+            totalUnlockedCages: plan.unlockedCages.count,
+            lockedCagesCount: plan.lockedCagesCount,
+            primaryUniqueCount: plan.primaryUniqueCount,
+            subsegmentCount: plan.subsegmentCount,
             remainingEmptyCages: remainingEmpty,
             movedAudioToA2: movedAudioToA2
         )
     }
 
+    // MARK: - Modalità Montaggio Gabbie (Reordering, Slip, Slow-Mo 1x/2x Cage, Ripple & Roll)
+
+    private func isCageOccupied(_ cage: RhythmicCage, by clips: [TimelineClip]) -> Bool {
+        clips.contains { c in
+            let s = CMTimeGetSeconds(c.timelineStart)
+            let e = CMTimeGetSeconds(c.timelineEnd)
+            return min(e, cage.endSeconds) - max(s, cage.startSeconds) > 0.02
+        }
+    }
+
+    private func syncLinkedAudioClip(for vClip: TimelineClip, startTime: CMTime, sourceIn: CMTime, sourceOut: CMTime, speed: Double, cageIndex: Int?, span: Int) {
+        guard isLinkActive, let lId = vClip.linkGroupId else { return }
+        for aIdx in 0..<audioTracks.count where !audioTracks[aIdx].isLocked {
+            if let acIdx = audioTracks[aIdx].clips.firstIndex(where: { $0.linkGroupId == lId && !$0.isLocked }) {
+                audioTracks[aIdx].clips[acIdx].timelineStart = startTime
+                audioTracks[aIdx].clips[acIdx].sourceIn = sourceIn
+                audioTracks[aIdx].clips[acIdx].sourceOut = sourceOut
+                audioTracks[aIdx].clips[acIdx].speed = speed
+                audioTracks[aIdx].clips[acIdx].cageIndex = cageIndex
+                audioTracks[aIdx].clips[acIdx].span = span
+            }
+        }
+    }
+
+    /// Riordina le clip dentro le gabbie senza mai sovrascrivere: `(C1)(C2)(C3)` con `C3` -> `C2` diventa `(C1)(C3)(C2)`.
+    /// Le clip `isLocked` restano inchiodate; quelle sbloccate le scavalcano.
+    @discardableResult
+    public func reorderClipInCages(clipId: UUID, toCageIndex targetCageIndex: Int) -> Bool {
+        let activeCages = activeCageIntervals()
+        guard !activeCages.isEmpty, targetCageIndex >= 0 && targetCageIndex < activeCages.count else { return false }
+
+        guard let tIdx = videoTracks.firstIndex(where: { $0.clips.contains(where: { $0.id == clipId }) }),
+              !videoTracks[tIdx].isLocked else { return false }
+
+        videoTracks[tIdx].clips.sort { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
+        guard let draggedArrIdx = videoTracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) else { return false }
+        let draggedClip = videoTracks[tIdx].clips[draggedArrIdx]
+        guard !draggedClip.isLocked else { return false }
+
+        let targetCage = activeCages[targetCageIndex]
+        let lockedClips = videoTracks[tIdx].clips.filter { $0.isLocked }
+        if isCageOccupied(targetCage, by: lockedClips) {
+            DebugLogger.shared.log("Impossibile spostare nella gabbia \(targetCageIndex + 1): gabbia bloccata 🔒.", level: .warning)
+            return false
+        }
+
+        var unlockedClips = videoTracks[tIdx].clips.filter { !$0.isLocked }
+        guard let draggedUnlockedIdx = unlockedClips.firstIndex(where: { $0.id == clipId }) else { return false }
+
+        let freeCages = activeCages.filter { !isCageOccupied($0, by: lockedClips) }
+        guard !freeCages.isEmpty else { return false }
+
+        // Trova lo slot nella sequenza di clip sbloccate corrispondente a `targetCageIndex`
+        let targetSlotInUnlocked: Int
+        if let freeIdx = freeCages.firstIndex(where: { $0.index == targetCageIndex }) {
+            // Se esiste una clip sbloccata che occupa targetCage, prendi il suo indice ordinale
+            if let occIdx = unlockedClips.firstIndex(where: { c in
+                let s = CMTimeGetSeconds(c.timelineStart)
+                let e = CMTimeGetSeconds(c.timelineEnd)
+                return min(e, targetCage.endSeconds) - max(s, targetCage.startSeconds) > 0.02
+            }) {
+                targetSlotInUnlocked = occIdx
+            } else {
+                targetSlotInUnlocked = min(freeIdx, max(0, unlockedClips.count - 1))
+            }
+        } else {
+            return false
+        }
+
+        if targetSlotInUnlocked == draggedUnlockedIdx {
+            return false
+        }
+
+        let moved = unlockedClips.remove(at: draggedUnlockedIdx)
+        unlockedClips.insert(moved, at: min(targetSlotInUnlocked, unlockedClips.count))
+
+        // Riposiziona le clip sbloccate sequenzialmente sulle gabbie libere, saltando eventuali gabbie Lock
+        var freeCursor = 0
+        for i in 0..<unlockedClips.count {
+            var clip = unlockedClips[i]
+            let spanCount = max(1, clip.span)
+            guard freeCursor < freeCages.count else { break }
+
+            // Per multi-span assicuriamo gabbie fisicamente contigue se disponibili
+            var startFreeIdx = freeCursor
+            if spanCount > 1 {
+                while startFreeIdx + spanCount <= freeCages.count {
+                    let firstRealIdx = freeCages[startFreeIdx].index
+                    let lastRealIdx = freeCages[startFreeIdx + spanCount - 1].index
+                    if lastRealIdx - firstRealIdx == spanCount - 1 {
+                        break
+                    }
+                    startFreeIdx += 1
+                }
+            }
+            guard startFreeIdx < freeCages.count else { break }
+
+            let startCage = freeCages[startFreeIdx]
+            let endFreeIdx = min(freeCages.count - 1, startFreeIdx + spanCount - 1)
+            let actualSpan: Int
+            let combinedDur: Double
+            if spanCount > 1 && freeCages[endFreeIdx].index - startCage.index == endFreeIdx - startFreeIdx {
+                actualSpan = endFreeIdx - startFreeIdx + 1
+                combinedDur = freeCages[endFreeIdx].endSeconds - startCage.startSeconds
+            } else {
+                actualSpan = 1
+                combinedDur = startCage.durationSeconds
+            }
+
+            let spd = clip.speed > 0 ? clip.speed : 1.0
+            let neededSource = combinedDur * spd
+            let bounds = clip.effectiveSourceBounds
+            var newSrcIn = max(bounds.minSec, min(CMTimeGetSeconds(clip.sourceIn), bounds.maxSec))
+            var newSrcOut = newSrcIn + neededSource
+            if newSrcOut > bounds.maxSec {
+                newSrcOut = bounds.maxSec
+                newSrcIn = max(bounds.minSec, newSrcOut - neededSource)
+            }
+
+            clip.cageIndex = startCage.index
+            clip.span = actualSpan
+            clip.timelineStart = startCage.startTime
+            clip.sourceIn = CMTime(seconds: newSrcIn, preferredTimescale: 600)
+            clip.sourceOut = CMTime(seconds: newSrcOut, preferredTimescale: 600)
+            unlockedClips[i] = clip
+            syncLinkedAudioClip(for: clip, startTime: clip.timelineStart, sourceIn: clip.sourceIn, sourceOut: clip.sourceOut, speed: spd, cageIndex: clip.cageIndex, span: actualSpan)
+            freeCursor = startFreeIdx + actualSpan
+        }
+
+        videoTracks[tIdx].clips = (lockedClips + unlockedClips).sorted { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
+        audioTracks.indices.forEach { aIdx in
+            audioTracks[aIdx].clips.sort { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
+        }
+        onModelChanged?()
+        DebugLogger.shared.log("Clip '\(draggedClip.mediaItem.name)' riordinata nella gabbia #\(targetCageIndex + 1).", level: .info)
+        return true
+    }
+
     /// Cancellazione di una clip con adattamento a cascata delle gabbie sbloccate (Slot Ripple)
     @discardableResult
     public func slotRippleDelete(clipId: UUID) -> Bool {
-        guard let tIdx = videoTracks.firstIndex(where: { $0.clips.contains(where: { $0.id == clipId }) }) else {
+        guard let tIdx = videoTracks.firstIndex(where: { $0.clips.contains(where: { $0.id == clipId }) }),
+              !videoTracks[tIdx].isLocked else {
             return false
         }
+        videoTracks[tIdx].clips.sort { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
         guard let cIdx = videoTracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) else {
             return false
         }
@@ -2639,82 +4026,103 @@ public final class TimelineModel {
             }
         }
 
-        // Se ci sono gabbie ritmate attive, sposta indietro di 1 slot libero le clip sbloccate successive
         let activeCages = activeCageIntervals()
         if !activeCages.isEmpty {
-            let deletedCageIdx = removedClip.cageIndex ?? cageIndex(at: removedClip.timelineStart) ?? cIdx
-            var availableCageIndices: [Int] = []
-            for cage in activeCages where cage.index >= deletedCageIdx {
-                let occupiedByLocked = videoTracks[tIdx].clips.contains { locked in
-                    guard locked.isLocked else { return false }
-                    let lStart = CMTimeGetSeconds(locked.timelineStart)
-                    let lEnd = CMTimeGetSeconds(locked.timelineEnd)
-                    return min(lEnd, cage.endSeconds) - max(lStart, cage.startSeconds) > 0.02
-                }
-                if !occupiedByLocked {
-                    availableCageIndices.append(cage.index)
-                }
-            }
+            let deletedStartCage = removedClip.cageIndex ?? cageIndex(at: removedClip.timelineStart) ?? cIdx
+            let lockedClips = videoTracks[tIdx].clips.filter { $0.isLocked }
+            let freeCagesAfter = activeCages.filter { $0.index >= deletedStartCage && !isCageOccupied($0, by: lockedClips) }
 
-            var slotCursor = 0
+            var freeCursor = 0
             for i in 0..<videoTracks[tIdx].clips.count {
                 var vClip = videoTracks[tIdx].clips[i]
                 guard !vClip.isLocked else { continue }
                 let oldCageIdx = vClip.cageIndex ?? cageIndex(at: vClip.timelineStart) ?? i
-                guard oldCageIdx > deletedCageIdx, slotCursor < availableCageIndices.count else { continue }
+                guard oldCageIdx > deletedStartCage, freeCursor < freeCagesAfter.count else { continue }
 
-                let targetCageIdx = availableCageIndices[slotCursor]
-                slotCursor += 1
-                let targetCage = activeCages[targetCageIdx]
+                let spanCount = max(1, vClip.span)
+                let startCage = freeCagesAfter[freeCursor]
+                let endIdx = min(freeCagesAfter.count - 1, freeCursor + spanCount - 1)
+                let actualSpan: Int
+                let combinedDur: Double
+                if spanCount > 1 && freeCagesAfter[endIdx].index - startCage.index == endIdx - freeCursor {
+                    actualSpan = endIdx - freeCursor + 1
+                    combinedDur = freeCagesAfter[endIdx].endSeconds - startCage.startSeconds
+                } else {
+                    actualSpan = 1
+                    combinedDur = startCage.durationSeconds
+                }
 
-                vClip.cageIndex = targetCageIdx
-                vClip.timelineStart = targetCage.startTime
-                let dur = targetCage.durationTime
-                let scaledDur = vClip.speed > 0 ? CMTime(seconds: CMTimeGetSeconds(dur) * vClip.speed, preferredTimescale: 600) : dur
-                let maxMediaOut = vClip.mediaItem.duration
-                vClip.sourceOut = CMTimeMinimum(CMTimeAdd(vClip.sourceIn, scaledDur), maxMediaOut)
+                let spd = vClip.speed > 0 ? vClip.speed : 1.0
+                let scaledSec = combinedDur * spd
+                let bounds = vClip.effectiveSourceBounds
+                let sIn = max(bounds.minSec, min(CMTimeGetSeconds(vClip.sourceIn), bounds.maxSec))
+                let sOut = min(bounds.maxSec, sIn + scaledSec)
+
+                vClip.cageIndex = startCage.index
+                vClip.span = actualSpan
+                vClip.timelineStart = startCage.startTime
+                vClip.sourceIn = CMTime(seconds: sIn, preferredTimescale: 600)
+                vClip.sourceOut = CMTime(seconds: sOut, preferredTimescale: 600)
                 videoTracks[tIdx].clips[i] = vClip
 
-                if let lId = vClip.linkGroupId, isLinkActive {
-                    for aIdx in 0..<audioTracks.count where !audioTracks[aIdx].isLocked {
-                        if let acIdx = audioTracks[aIdx].clips.firstIndex(where: { $0.linkGroupId == lId && !$0.isLocked }) {
-                            audioTracks[aIdx].clips[acIdx].cageIndex = targetCageIdx
-                            audioTracks[aIdx].clips[acIdx].timelineStart = targetCage.startTime
-                            audioTracks[aIdx].clips[acIdx].sourceOut = CMTimeMinimum(CMTimeAdd(audioTracks[aIdx].clips[acIdx].sourceIn, scaledDur), maxMediaOut)
-                        }
-                    }
-                }
+                syncLinkedAudioClip(for: vClip, startTime: vClip.timelineStart, sourceIn: vClip.sourceIn, sourceOut: vClip.sourceOut, speed: spd, cageIndex: vClip.cageIndex, span: actualSpan)
+                freeCursor += actualSpan
             }
         }
 
         selectedClipIds.remove(clipId)
-        DebugLogger.shared.log("Clip rimossa con Slot Ripple: le clip successive sbloccate hanno preso il posto mantenendo la griglia ritmica.", level: .info)
+        DebugLogger.shared.log("Clip rimossa con Slot Ripple: le clip successive sbloccate hanno preso il posto lasciando nessuno spazio.", level: .info)
+        if isSelection {
+            repackSelectionContiguously()
+        }
         onModelChanged?()
         return true
     }
 
-    /// Slip Tool: fa scorrere il contenuto interno (sourceIn/Out) senza modificare i punti di taglio sulla timeline
-    @discardableResult
-    public func slipClip(clipId: UUID, deltaSeconds: Double) -> Bool {
-        for tIdx in 0..<videoTracks.count {
-            if let cIdx = videoTracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) {
-                var clip = videoTracks[tIdx].clips[cIdx]
-                let sourceDurSec = CMTimeGetSeconds(clip.sourceDuration)
-                let maxMediaDurSec = CMTimeGetSeconds(clip.mediaItem.duration)
-                let currentInSec = CMTimeGetSeconds(clip.sourceIn)
-
-                let maxAllowedIn = max(0, maxMediaDurSec - sourceDurSec)
-                let newInSec = min(maxAllowedIn, max(0, currentInSec + deltaSeconds))
-
-                clip.sourceIn = CMTime(seconds: newInSec, preferredTimescale: 600)
-                clip.sourceOut = CMTime(seconds: newInSec + sourceDurSec, preferredTimescale: 600)
-                videoTracks[tIdx].clips[cIdx] = clip
-
-                onModelChanged?()
-                return true
+    /// Restituisce bounds e finestre correnti per la barra flottante Slip (`Tab+Drag`).
+    public func slipClipSelectionBounds(clipId: UUID) -> (sourceIn: Double, sourceOut: Double, sourceDur: Double, boundsMin: Double, boundsMax: Double, markers: [Double])? {
+        for track in videoTracks {
+            if let clip = track.clips.first(where: { $0.id == clipId }) {
+                let b = clip.effectiveSourceBounds
+                let sIn = max(b.minSec, min(b.maxSec, CMTimeGetSeconds(clip.sourceIn)))
+                let sDur = max(0.05, min(b.maxSec - b.minSec, CMTimeGetSeconds(clip.sourceDuration)))
+                let markersInRange = clip.markers.filter { $0 >= b.minSec - 0.01 && $0 <= b.maxSec + 0.01 }
+                return (sIn, sIn + sDur, sDur, b.minSec, b.maxSec, markersInRange)
             }
         }
-        return false
+        return nil
+    }
+
+    /// Scorre il frammento interno (`Tab+Drag`) strettamente dentro l'estratto dalla Selezione senza straripare dalla gabbia.
+    @discardableResult
+    public func slipClipWithinSelection(clipId: UUID, newSourceIn: Double) -> (newIn: Double, newOut: Double)? {
+        for tIdx in 0..<videoTracks.count where !videoTracks[tIdx].isLocked {
+            if let cIdx = videoTracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) {
+                var clip = videoTracks[tIdx].clips[cIdx]
+                guard !clip.isLocked else { return nil }
+                let b = clip.effectiveSourceBounds
+                let sourceDurSec = min(b.maxSec - b.minSec, max(0.05, CMTimeGetSeconds(clip.sourceDuration)))
+                let maxAllowedIn = max(b.minSec, b.maxSec - sourceDurSec)
+                let clampedIn = min(maxAllowedIn, max(b.minSec, newSourceIn))
+                let clampedOut = clampedIn + sourceDurSec
+
+                clip.sourceIn = CMTime(seconds: clampedIn, preferredTimescale: 600)
+                clip.sourceOut = CMTime(seconds: clampedOut, preferredTimescale: 600)
+                videoTracks[tIdx].clips[cIdx] = clip
+
+                syncLinkedAudioClip(for: clip, startTime: clip.timelineStart, sourceIn: clip.sourceIn, sourceOut: clip.sourceOut, speed: clip.speed, cageIndex: clip.cageIndex, span: clip.span)
+                onModelChanged?()
+                return (clampedIn, clampedOut)
+            }
+        }
+        return nil
+    }
+
+    /// Slip Tool: fa scorrere il contenuto interno (`sourceIn`/`Out`) senza modificare i tagli sulla timeline (rispettando eventuali bounds Selezione).
+    @discardableResult
+    public func slipClip(clipId: UUID, deltaSeconds: Double) -> Bool {
+        guard let info = slipClipSelectionBounds(clipId: clipId) else { return false }
+        return slipClipWithinSelection(clipId: clipId, newSourceIn: info.sourceIn + deltaSeconds) != nil
     }
 
     /// Estende o riduce la copertura di una clip su 1, 2 o più gabbie consecutive
@@ -2737,7 +4145,6 @@ public final class TimelineModel {
             clip.sourceOut = CMTimeAdd(clip.sourceIn, scaledDur)
             videoTracks[tIdx].clips[cIdx] = clip
 
-            // Sposta le clip successive avanti per fare spazio alla gabbia allargata
             var nextCageIdx = endCageIdx + 1
             for nextIdx in (cIdx + 1)..<videoTracks[tIdx].clips.count {
                 if nextCageIdx < activeCages.count {
@@ -2758,22 +4165,38 @@ public final class TimelineModel {
         return false
     }
 
-    /// Alterna la velocità della clip (100% -> 50% slow-mo -> 100%)
+    /// Alterna la velocità della clip (`100% <-> 50%`) restando **dentro la gabbia attuale** (`R` / `⌥S`).
     @discardableResult
     public func toggleClipSpeed(clipId: UUID) -> Double? {
-        for tIdx in 0..<videoTracks.count {
+        for tIdx in 0..<videoTracks.count where !videoTracks[tIdx].isLocked {
             if let cIdx = videoTracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) {
                 var clip = videoTracks[tIdx].clips[cIdx]
-                let newSpeed: Double = (clip.speed == 1.0) ? 0.5 : 1.0
-                clip.speed = newSpeed
-
-                // Mantieni la stessa durata sulla timeline ricalcolando la porzione sorgente
+                guard !clip.isLocked else { return nil }
+                let newSpeed: Double = (abs(clip.speed - 1.0) < 0.01) ? 0.5 : 1.0
                 let timelineDur = CMTimeGetSeconds(clip.duration)
                 let newSourceDur = timelineDur * newSpeed
-                clip.sourceOut = CMTimeAdd(clip.sourceIn, CMTime(seconds: newSourceDur, preferredTimescale: 600))
+                let b = clip.effectiveSourceBounds
+                var newIn = max(b.minSec, min(b.maxSec, CMTimeGetSeconds(clip.sourceIn)))
+                var newOut = newIn + newSourceDur
+
+                if newOut > b.maxSec {
+                    let maxShift = max(b.minSec, b.maxSec - newSourceDur)
+                    if newSourceDur <= (b.maxSec - b.minSec) + 0.01 {
+                        newIn = maxShift
+                        newOut = min(b.maxSec, newIn + newSourceDur)
+                    } else {
+                        DebugLogger.shared.log("Clip troppo corta per velocità \(Int(newSpeed * 100))% in questa gabbia.", level: .warning)
+                        return nil
+                    }
+                }
+
+                clip.speed = newSpeed
+                clip.sourceIn = CMTime(seconds: newIn, preferredTimescale: 600)
+                clip.sourceOut = CMTime(seconds: newOut, preferredTimescale: 600)
                 videoTracks[tIdx].clips[cIdx] = clip
 
-                DebugLogger.shared.log("Velocità clip '\(clip.mediaItem.name)' impostata a \(Int(newSpeed * 100))%.", level: .info)
+                syncLinkedAudioClip(for: clip, startTime: clip.timelineStart, sourceIn: clip.sourceIn, sourceOut: clip.sourceOut, speed: newSpeed, cageIndex: clip.cageIndex, span: clip.span)
+                DebugLogger.shared.log("Velocità clip '\(clip.mediaItem.name)' in gabbia impostata a \(Int(newSpeed * 100))%.", level: .info)
                 onModelChanged?()
                 return newSpeed
             }
@@ -2781,32 +4204,292 @@ public final class TimelineModel {
         return nil
     }
 
+    /// Alterna Slow-Mo 50% **straripando alla gabbia successiva (2 gabbie)** oppure riducendo a 1 gabbia a 100% (`⌘R`).
+    /// - Rifiuta sempre se una qualsiasi clip successiva è `isLocked`.
+    /// - Verifica che la clip sorgente abbia abbastanza frame per coprire `gabbia[i] + gabbia[i+1]` al 50%.
+    /// - Sposta in avanti / indietro le clip successive con Ripple Forward/Back dentro le gabbie.
+    @discardableResult
+    public func toggleSlowMoMultiCage(clipId: UUID) -> (didChange: Bool, newSpeed: Double, newSpan: Int, errorMessage: String?) {
+        let activeCages = activeCageIntervals()
+        guard !activeCages.isEmpty else {
+            return (false, 1.0, 1, "Nessuna gabbia ritmata attiva.")
+        }
+
+        for tIdx in 0..<videoTracks.count where !videoTracks[tIdx].isLocked {
+            videoTracks[tIdx].clips.sort { CMTimeCompare($0.timelineStart, $1.timelineStart) < 0 }
+            guard let cIdx = videoTracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) else { continue }
+            var clip = videoTracks[tIdx].clips[cIdx]
+            guard !clip.isLocked else {
+                return (false, clip.speed, clip.span, "Clip bloccata 🔒.")
+            }
+
+            // Blocco severo se esiste ANY clip successiva bloccata
+            if (cIdx + 1) < videoTracks[tIdx].clips.count {
+                let hasLaterLocked = videoTracks[tIdx].clips[(cIdx + 1)...].contains(where: { $0.isLocked })
+                if hasLaterLocked {
+                    let msg = "Slow-Mo multi-gabbia bloccato: presente una clip bloccata 🔒 successivamente."
+                    DebugLogger.shared.log(msg, level: .warning)
+                    return (false, clip.speed, clip.span, msg)
+                }
+            }
+
+            let startCageIdx = clip.cageIndex ?? cageIndex(at: clip.timelineStart) ?? cIdx
+            guard startCageIdx >= 0 && startCageIdx < activeCages.count else {
+                return (false, clip.speed, clip.span, "Clip fuori dalle gabbie.")
+            }
+
+            if clip.span <= 1 {
+                // ESPANDI a 2 gabbie in Slow-Mo 50%
+                let nextCageIdx = startCageIdx + 1
+                guard nextCageIdx < activeCages.count else {
+                    let msg = "Nessuna gabbia successiva disponibile per estendere lo Slow-Mo."
+                    DebugLogger.shared.log(msg, level: .warning)
+                    return (false, clip.speed, clip.span, msg)
+                }
+
+                let combinedDur = activeCages[nextCageIdx].endSeconds - activeCages[startCageIdx].startSeconds
+                let newSpeed = 0.5
+                let neededSource = combinedDur * newSpeed
+                let b = clip.effectiveSourceBounds
+                let sIn = max(b.minSec, min(b.maxSec, CMTimeGetSeconds(clip.sourceIn)))
+                let availAfterIn = max(0.0, b.maxSec - sIn)
+
+                guard availAfterIn >= neededSource - 0.01 else {
+                    let msg = String(format: "Materiale clip insufficiente: servono %.1fs originali (%.1fs al 50%%), disponibili %.1fs.", neededSource, combinedDur, availAfterIn)
+                    DebugLogger.shared.log(msg, level: .warning)
+                    return (false, clip.speed, clip.span, msg)
+                }
+
+                clip.speed = newSpeed
+                clip.span = 2
+                clip.cageIndex = startCageIdx
+                clip.timelineStart = activeCages[startCageIdx].startTime
+                clip.sourceIn = CMTime(seconds: sIn, preferredTimescale: 600)
+                clip.sourceOut = CMTime(seconds: min(b.maxSec, sIn + neededSource), preferredTimescale: 600)
+                videoTracks[tIdx].clips[cIdx] = clip
+                syncLinkedAudioClip(for: clip, startTime: clip.timelineStart, sourceIn: clip.sourceIn, sourceOut: clip.sourceOut, speed: newSpeed, cageIndex: startCageIdx, span: 2)
+
+                // Ripple forward di tutte le clip successive dentro le gabbie successive
+                var cursorCage = startCageIdx + 2
+                var overflowStart = activeCages.last!.endSeconds
+                for i in (cIdx + 1)..<videoTracks[tIdx].clips.count {
+                    var nextClip = videoTracks[tIdx].clips[i]
+                    let nSpan = max(1, nextClip.span)
+                    let nSpd = nextClip.speed > 0 ? nextClip.speed : 1.0
+                    let nb = nextClip.effectiveSourceBounds
+                    let nIn = max(nb.minSec, min(nb.maxSec, CMTimeGetSeconds(nextClip.sourceIn)))
+
+                    if cursorCage < activeCages.count {
+                        let endCage = min(activeCages.count - 1, cursorCage + nSpan - 1)
+                        let actualSpan = endCage - cursorCage + 1
+                        let cDur = activeCages[endCage].endSeconds - activeCages[cursorCage].startSeconds
+                        let nOut = min(nb.maxSec, nIn + cDur * nSpd)
+
+                        nextClip.cageIndex = cursorCage
+                        nextClip.span = actualSpan
+                        nextClip.timelineStart = activeCages[cursorCage].startTime
+                        nextClip.sourceIn = CMTime(seconds: nIn, preferredTimescale: 600)
+                        nextClip.sourceOut = CMTime(seconds: nOut, preferredTimescale: 600)
+                        videoTracks[tIdx].clips[i] = nextClip
+                        syncLinkedAudioClip(for: nextClip, startTime: nextClip.timelineStart, sourceIn: nextClip.sourceIn, sourceOut: nextClip.sourceOut, speed: nSpd, cageIndex: cursorCage, span: actualSpan)
+
+                        cursorCage = endCage + 1
+                        overflowStart = activeCages[endCage].endSeconds
+                    } else {
+                        nextClip.cageIndex = nil
+                        nextClip.timelineStart = CMTime(seconds: overflowStart, preferredTimescale: 600)
+                        videoTracks[tIdx].clips[i] = nextClip
+                        syncLinkedAudioClip(for: nextClip, startTime: nextClip.timelineStart, sourceIn: nextClip.sourceIn, sourceOut: nextClip.sourceOut, speed: nSpd, cageIndex: nil, span: nSpan)
+                        overflowStart += CMTimeGetSeconds(nextClip.duration)
+                    }
+                }
+
+                onModelChanged?()
+                DebugLogger.shared.log("Slow-Mo 50% esteso su 2 gabbie (Ripple avanti applicato).", level: .info)
+                return (true, 0.5, 2, nil)
+            } else {
+                // RIDUCI a 1 gabbia a velocità 100%
+                let singleDur = activeCages[startCageIdx].durationSeconds
+                let newSpeed = 1.0
+                let neededSource = singleDur * newSpeed
+                let b = clip.effectiveSourceBounds
+                var sIn = max(b.minSec, min(b.maxSec, CMTimeGetSeconds(clip.sourceIn)))
+                var sOut = sIn + neededSource
+                if sOut > b.maxSec {
+                    sOut = b.maxSec
+                    sIn = max(b.minSec, sOut - neededSource)
+                }
+
+                clip.speed = newSpeed
+                clip.span = 1
+                clip.cageIndex = startCageIdx
+                clip.timelineStart = activeCages[startCageIdx].startTime
+                clip.sourceIn = CMTime(seconds: sIn, preferredTimescale: 600)
+                clip.sourceOut = CMTime(seconds: sOut, preferredTimescale: 600)
+                videoTracks[tIdx].clips[cIdx] = clip
+                syncLinkedAudioClip(for: clip, startTime: clip.timelineStart, sourceIn: clip.sourceIn, sourceOut: clip.sourceOut, speed: newSpeed, cageIndex: startCageIdx, span: 1)
+
+                // Ripple backward delle clip successive
+                var cursorCage = startCageIdx + 1
+                for i in (cIdx + 1)..<videoTracks[tIdx].clips.count {
+                    var nextClip = videoTracks[tIdx].clips[i]
+                    guard cursorCage < activeCages.count else { break }
+                    let nSpan = max(1, nextClip.span)
+                    let nSpd = nextClip.speed > 0 ? nextClip.speed : 1.0
+                    let endCage = min(activeCages.count - 1, cursorCage + nSpan - 1)
+                    let actualSpan = endCage - cursorCage + 1
+                    let cDur = activeCages[endCage].endSeconds - activeCages[cursorCage].startSeconds
+                    let nb = nextClip.effectiveSourceBounds
+                    let nIn = max(nb.minSec, min(nb.maxSec, CMTimeGetSeconds(nextClip.sourceIn)))
+                    let nOut = min(nb.maxSec, nIn + cDur * nSpd)
+
+                    nextClip.cageIndex = cursorCage
+                    nextClip.span = actualSpan
+                    nextClip.timelineStart = activeCages[cursorCage].startTime
+                    nextClip.sourceIn = CMTime(seconds: nIn, preferredTimescale: 600)
+                    nextClip.sourceOut = CMTime(seconds: nOut, preferredTimescale: 600)
+                    videoTracks[tIdx].clips[i] = nextClip
+                    syncLinkedAudioClip(for: nextClip, startTime: nextClip.timelineStart, sourceIn: nextClip.sourceIn, sourceOut: nextClip.sourceOut, speed: nSpd, cageIndex: cursorCage, span: actualSpan)
+
+                    cursorCage = endCage + 1
+                }
+
+                onModelChanged?()
+                DebugLogger.shared.log("Slow-Mo multi-gabbia disattivato: clip ridotta a 1 gabbia (100%).", level: .info)
+                return (true, 1.0, 1, nil)
+            }
+        }
+        return (false, 1.0, 1, nil)
+    }
+
+    /// Spostamento sbarra in Modalità Gabbie (Rolling Edit): sposta il marcatore/sbarra della gabbia e riadatta insieme
+    /// la fine della clip sinistra (`leftClip`) e l'inizio della clip destra (`rightClip`) con il loro audio linkato (mai la musica).
+    @discardableResult
+    public func rollCageBoundaryWithAdjacentClips(
+        oldSeconds: Double,
+        newSeconds: Double,
+        audioClipId: UUID?,
+        isBeatMarker: Bool,
+        markerSourceSec: Double?
+    ) -> (newTimelineSec: Double, newMarkerSourceSec: Double?)? {
+        var minAllowed = 0.0
+        var maxAllowed = Double.greatestFiniteMagnitude
+        let minClipDur = 0.15
+
+        // Limite dalle sbarre adiacenti così nessuna sbarra scavalca un'altra
+        let boundaries = activeCageBoundaries()
+        if let bIdx = boundaries.enumerated().min(by: { abs($0.element - oldSeconds) < abs($1.element - oldSeconds) })?.offset {
+            if bIdx > 0 { minAllowed = max(minAllowed, boundaries[bIdx - 1] + minClipDur) }
+            if bIdx + 1 < boundaries.count { maxAllowed = min(maxAllowed, boundaries[bIdx + 1] - minClipDur) }
+        }
+
+        // Trova le clip video adiacenti su V1 (o altre tracce non bloccate) attorno a `oldSeconds`
+        ensureVideoTrack(id: 0)
+        var leftMatch: (tIdx: Int, cIdx: Int, clip: TimelineClip)? = nil
+        var rightMatch: (tIdx: Int, cIdx: Int, clip: TimelineClip)? = nil
+
+        for tIdx in 0..<videoTracks.count where !videoTracks[tIdx].isLocked {
+            for (cIdx, clip) in videoTracks[tIdx].clips.enumerated() {
+                let cStart = CMTimeGetSeconds(clip.timelineStart)
+                let cEnd = CMTimeGetSeconds(clip.timelineEnd)
+                if leftMatch == nil && abs(cEnd - oldSeconds) <= 0.12 {
+                    leftMatch = (tIdx, cIdx, clip)
+                }
+                if rightMatch == nil && abs(cStart - oldSeconds) <= 0.12 {
+                    rightMatch = (tIdx, cIdx, clip)
+                }
+            }
+        }
+
+        // Se una delle due clip adiacenti è bloccata (Lock), la sbarra non si muove!
+        if let l = leftMatch, l.clip.isLocked { return nil }
+        if let r = rightMatch, r.clip.isLocked { return nil }
+
+        // Clamp ai limiti fisici/Selezione delle due clip adiacenti
+        if let l = leftMatch {
+            let lStart = CMTimeGetSeconds(l.clip.timelineStart)
+            let lSrcIn = CMTimeGetSeconds(l.clip.sourceIn)
+            let lSpd = l.clip.speed > 0 ? l.clip.speed : 1.0
+            let lBounds = l.clip.effectiveSourceBounds
+            minAllowed = max(minAllowed, lStart + minClipDur)
+            let maxTimelineEndFromSource = lStart + max(minClipDur, (lBounds.maxSec - lSrcIn) / lSpd)
+            maxAllowed = min(maxAllowed, maxTimelineEndFromSource)
+        }
+        if let r = rightMatch {
+            let rEnd = CMTimeGetSeconds(r.clip.timelineEnd)
+            let rSrcOut = CMTimeGetSeconds(r.clip.sourceOut)
+            let rSpd = r.clip.speed > 0 ? r.clip.speed : 1.0
+            let rBounds = r.clip.effectiveSourceBounds
+            maxAllowed = min(maxAllowed, rEnd - minClipDur)
+            let minTimelineStartFromSource = rEnd - max(minClipDur, (rSrcOut - rBounds.minSec) / rSpd)
+            minAllowed = max(minAllowed, minTimelineStartFromSource)
+        }
+
+        guard minAllowed <= maxAllowed + 0.001 else { return nil }
+        let clampedTimelineSec = max(minAllowed, min(maxAllowed, newSeconds))
+        if abs(clampedTimelineSec - oldSeconds) < 0.0005 {
+            return nil
+        }
+
+        // 1. Sposta la sbarra ritmica sottostante
+        var updatedMarkerSource: Double? = nil
+        var finalTimelineSec = clampedTimelineSec
+        if let aId = audioClipId, let oldSrc = markerSourceSec,
+           let aClip = audioTracks.flatMap(\.clips).first(where: { $0.id == aId }) {
+            let aStart = CMTimeGetSeconds(aClip.timelineStart)
+            let aSpd = aClip.speed > 0 ? aClip.speed : 1.0
+            let targetSrc = CMTimeGetSeconds(aClip.sourceIn) + (clampedTimelineSec - aStart) * aSpd
+            guard let movedSrc = moveClipMarker(clipId: aId, isBeatMarker: isBeatMarker, fromSourceSec: oldSrc, toSourceSec: targetSrc) else {
+                return nil
+            }
+            updatedMarkerSource = movedSrc
+            finalTimelineSec = aStart + (movedSrc - CMTimeGetSeconds(aClip.sourceIn)) / aSpd
+        } else {
+            guard let movedStatic = moveTimelineCageBoundary(from: oldSeconds, to: clampedTimelineSec) else {
+                return nil
+            }
+            finalTimelineSec = movedStatic
+        }
+
+        // 2. Aggiorna i bordi delle clip video (e relativo audio linkato dello stesso file)
+        if let l = leftMatch {
+            var updatedLeft = l.clip
+            let lStart = CMTimeGetSeconds(updatedLeft.timelineStart)
+            let lSpd = updatedLeft.speed > 0 ? updatedLeft.speed : 1.0
+            let newDur = max(minClipDur, finalTimelineSec - lStart)
+            let newOutSec = min(updatedLeft.effectiveSourceBounds.maxSec, CMTimeGetSeconds(updatedLeft.sourceIn) + newDur * lSpd)
+            updatedLeft.sourceOut = CMTime(seconds: newOutSec, preferredTimescale: 600)
+            videoTracks[l.tIdx].clips[l.cIdx] = updatedLeft
+            syncLinkedAudioClip(for: updatedLeft, startTime: updatedLeft.timelineStart, sourceIn: updatedLeft.sourceIn, sourceOut: updatedLeft.sourceOut, speed: updatedLeft.speed, cageIndex: updatedLeft.cageIndex, span: updatedLeft.span)
+        }
+
+        if let r = rightMatch {
+            var updatedRight = r.clip
+            let rStart = CMTimeGetSeconds(updatedRight.timelineStart)
+            let rSpd = updatedRight.speed > 0 ? updatedRight.speed : 1.0
+            let deltaTL = finalTimelineSec - rStart
+            let newSrcIn = max(updatedRight.effectiveSourceBounds.minSec, CMTimeGetSeconds(updatedRight.sourceIn) + deltaTL * rSpd)
+            updatedRight.timelineStart = CMTime(seconds: finalTimelineSec, preferredTimescale: 600)
+            updatedRight.sourceIn = CMTime(seconds: newSrcIn, preferredTimescale: 600)
+            videoTracks[r.tIdx].clips[r.cIdx] = updatedRight
+            syncLinkedAudioClip(for: updatedRight, startTime: updatedRight.timelineStart, sourceIn: updatedRight.sourceIn, sourceOut: updatedRight.sourceOut, speed: updatedRight.speed, cageIndex: updatedRight.cageIndex, span: updatedRight.span)
+        }
+
+        onModelChanged?()
+        return (finalTimelineSec, updatedMarkerSource)
+    }
+
     /// Scambia di posto la clip con quella nella gabbia adiacente (sinistra -1, destra +1)
     @discardableResult
     public func swapAdjacentCages(clipId: UUID, direction: Int) -> Bool {
-        let activeCages = activeCageIntervals()
         for tIdx in 0..<videoTracks.count {
             guard let cIdx = videoTracks[tIdx].clips.firstIndex(where: { $0.id == clipId }) else { continue }
             let targetIdx = cIdx + direction
             guard targetIdx >= 0 && targetIdx < videoTracks[tIdx].clips.count else { continue }
+            guard !videoTracks[tIdx].clips[cIdx].isLocked && !videoTracks[tIdx].clips[targetIdx].isLocked else { return false }
 
-            videoTracks[tIdx].clips.swapAt(cIdx, targetIdx)
-
-            // Riassegna le gabbie ritmate
-            for i in min(cIdx, targetIdx)...max(cIdx, targetIdx) {
-                if i < activeCages.count {
-                    let cage = activeCages[i]
-                    videoTracks[tIdx].clips[i].cageIndex = i
-                    videoTracks[tIdx].clips[i].timelineStart = cage.startTime
-                    let dur = cage.durationTime
-                    let scaled = videoTracks[tIdx].clips[i].speed > 0 ? CMTime(seconds: CMTimeGetSeconds(dur) * videoTracks[tIdx].clips[i].speed, preferredTimescale: 600) : dur
-                    videoTracks[tIdx].clips[i].sourceOut = CMTimeAdd(videoTracks[tIdx].clips[i].sourceIn, scaled)
-                }
-            }
-
-            DebugLogger.shared.log("Clip scambiata di gabbia (\(direction > 0 ? "avanti" : "indietro")).", level: .info)
-            onModelChanged?()
-            return true
+            let targetCage = videoTracks[tIdx].clips[targetIdx].cageIndex ?? targetIdx
+            return reorderClipInCages(clipId: clipId, toCageIndex: targetCage)
         }
         return false
     }

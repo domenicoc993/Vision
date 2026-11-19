@@ -3,32 +3,23 @@ import Foundation
 import CoreMedia
 import AVFoundation
 
-/// Modal studio for Beat & Rhythmic Cages generation (Timeline or Audio Clip target) and Auto-Fill from Selection.
+/// Modal studio separato per Beat Finder (su clip audio da context menu) e Auto-Fill (dalla toolbar).
 public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
-    private enum TargetMode: Int {
-        case timeline = 0
-        case trackClip = 1
+    public enum StudioMode {
+        case beatFinder(targetClip: TimelineClip?)
+        case autoFillOnly
     }
 
     private let model: TimelineModel
+    private let studioMode: StudioMode
+    private let currentPlayheadSeconds: Double
     private let targetAudioClip: TimelineClip?
-    private let hasSelectedAudioClip: Bool
     private weak var modalPanel: NSPanel?
     private var onModified: (() -> Void)?
 
-    private var targetMode: TargetMode
     private var analysisResult: BeatAnalysisResult?
     private var isAnalyzing: Bool = false
     private var lastFeedbackStatus: (text: String, color: NSColor)?
-
-    private let targetSegmented = NSSegmentedControl(
-        labels: ["Timeline Globale", "Sul Brano"],
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
-    )
-    private let modeBannerView = NSView()
-    private let modeBannerLabel = NSTextField(labelWithString: "")
 
     private let trackLabel = NSTextField(labelWithString: "")
     private let analyzeBtn = FlatButton(title: "Analizza Audio")
@@ -41,30 +32,101 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
     private let sensitivityValueLabel = NSTextField(labelWithString: "Bilanciato (45%)")
     private let cagesPreviewLabel = NSTextField(labelWithString: "")
 
-    private let clearTimelineBtn = FlatButton(title: "Pulisci Timeline")
-    private let clearClipBtn = FlatButton(title: "Pulisci Brano")
-    private let generateBtn = FlatButton(title: "Applica Gabbie")
+    private let clearBeatBtn = FlatButton(title: "Pulisci Beat")
+    private let clearAllBtn = FlatButton(title: "Pulisci Tutto")
+    private let applyBeatsBtn = FlatButton(title: "Segna Beat")
 
     private let selectionPopUp = VisionDropdownButton()
     private let orderModePopUp = VisionDropdownButton()
+    private let startModeSegmented = NSSegmentedControl(
+        labels: ["Dalla prima gabbia", "Dalla testina in poi"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
     private let autoFillStatusLabel = NSTextField(labelWithString: "")
+    private let autoFillForecastLabel = NSTextField(labelWithString: "")
     private let autoFillBtn = FlatButton(title: "Esegui Auto-Fill su V1")
+
+    /// Apre Beat Finder su una specifica traccia audio già su timeline (dal menu contestuale).
+    public static func showBeatFinderModal(
+        for model: TimelineModel,
+        audioClip: TimelineClip,
+        relativeTo parentWindow: NSWindow? = nil,
+        onModified: (() -> Void)? = nil
+    ) {
+        presentPanel(
+            model: model,
+            mode: .beatFinder(targetClip: audioClip),
+            playheadSeconds: 0.0,
+            title: audioClip.mediaItem.name,
+            size: NSSize(width: 510, height: 266),
+            relativeTo: parentWindow,
+            onModified: onModified
+        )
+    }
+
+    /// Apre Auto-Fill Ritmico (rimane accessibile dalla toolbar timeline / Speed Editor).
+    public static func showAutoFillModal(
+        for model: TimelineModel,
+        playheadSeconds: Double = 0.0,
+        relativeTo parentWindow: NSWindow? = nil,
+        onModified: (() -> Void)? = nil
+    ) {
+        presentPanel(
+            model: model,
+            mode: .autoFillOnly,
+            playheadSeconds: playheadSeconds,
+            title: "Auto-Fill Ritmico",
+            size: NSSize(width: 525, height: 345),
+            relativeTo: parentWindow,
+            onModified: onModified
+        )
+    }
 
     public static func showModal(
         for model: TimelineModel,
         relativeTo parentWindow: NSWindow? = nil,
         onModified: (() -> Void)? = nil
     ) {
+        showAutoFillModal(for: model, playheadSeconds: model.playheadSeconds, relativeTo: parentWindow, onModified: onModified)
+    }
+
+    private static var activeBeatFinderPanel: NSPanel?
+    private static var activeBeatFinderController: BeatAnalysisDialog?
+
+    private static func presentPanel(
+        model: TimelineModel,
+        mode: StudioMode,
+        playheadSeconds: Double,
+        title: String,
+        size: NSSize,
+        relativeTo parentWindow: NSWindow?,
+        onModified: (() -> Void)?
+    ) {
+        let isModalSession: Bool
+        switch mode {
+        case .beatFinder:
+            isModalSession = false
+            activeBeatFinderPanel?.close()
+            activeBeatFinderPanel = nil
+            activeBeatFinderController = nil
+        case .autoFillOnly:
+            isModalSession = true
+        }
+
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 540, height: 615),
+            contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
-        panel.title = "Montaggio Ritmico & Auto-Fill"
+        panel.title = title
         panel.appearance = NSAppearance(named: .darkAqua)
         panel.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0)
         panel.isFloatingPanel = true
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.isReleasedWhenClosed = false
 
         if let parent = parentWindow {
             let pf = parent.frame
@@ -76,40 +138,69 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
             panel.center()
         }
 
-        let controller = BeatAnalysisDialog(model: model, panel: panel, onModified: onModified)
+        let controller = BeatAnalysisDialog(
+            model: model,
+            studioMode: mode,
+            playheadSeconds: playheadSeconds,
+            panel: panel,
+            isModalSession: isModalSession,
+            onModified: onModified
+        )
         panel.delegate = controller
         panel.contentViewController = controller
-        NSApp.runModal(for: panel)
-        panel.orderOut(nil)
+
+        if isModalSession {
+            NSApp.runModal(for: panel)
+            panel.orderOut(nil)
+        } else {
+            activeBeatFinderPanel = panel
+            activeBeatFinderController = controller
+            panel.makeKeyAndOrderFront(nil)
+        }
     }
 
-    private init(model: TimelineModel, panel: NSPanel, onModified: (() -> Void)?) {
+    public static func makeBeatFinderController(
+        for model: TimelineModel,
+        audioClip: TimelineClip,
+        onModified: (() -> Void)? = nil
+    ) -> BeatAnalysisDialog {
+        BeatAnalysisDialog(
+            model: model,
+            studioMode: .beatFinder(targetClip: audioClip),
+            playheadSeconds: 0.0,
+            panel: nil,
+            isModalSession: false,
+            onModified: onModified
+        )
+    }
+
+    private let isModalSession: Bool
+
+    private init(model: TimelineModel, studioMode: StudioMode, playheadSeconds: Double, panel: NSPanel?, isModalSession: Bool, onModified: (() -> Void)?) {
         self.model = model
+        self.studioMode = studioMode
+        self.currentPlayheadSeconds = max(0.0, playheadSeconds)
         self.modalPanel = panel
+        self.isModalSession = isModalSession
         self.onModified = onModified
 
-        var selectedAudio: TimelineClip? = nil
-        for track in model.audioTracks {
-            if let selected = track.clips.first(where: { model.selectedClipIds.contains($0.id) }) {
-                selectedAudio = selected
-                break
-            }
+        switch studioMode {
+        case .beatFinder(let explicitClip):
+            self.targetAudioClip = explicitClip
+        case .autoFillOnly:
+            self.targetAudioClip = nil
         }
-
-        var fallbackAudio: TimelineClip? = nil
-        if selectedAudio == nil {
-            let allAudio = model.audioTracks.flatMap(\.clips)
-            fallbackAudio =
-                allAudio.first(where: { !$0.beatMarkers.isEmpty || !$0.markers.isEmpty }) ??
-                allAudio.first(where: { !$0.mediaItem.hasVideo || $0.linkGroupId == nil }) ??
-                allAudio.first
-        }
-
-        self.hasSelectedAudioClip = (selectedAudio != nil)
-        self.targetAudioClip = selectedAudio ?? fallbackAudio
-        self.targetMode = (self.targetAudioClip != nil) ? .trackClip : .timeline
 
         super.init(nibName: nil, bundle: nil)
+
+        if let target = self.targetAudioClip, let saved = target.mediaItem.beatAnalysis {
+            self.analysisResult = saved.toBeatAnalysisResult(
+                audioURL: target.mediaItem.effectiveURL,
+                sourceStart: CMTimeGetSeconds(target.sourceIn),
+                sourceDuration: CMTimeGetSeconds(target.sourceDuration)
+            )
+            self.lastFeedbackStatus = ("Analisi pronta", .systemCyan)
+        }
     }
 
     public required init?(coder: NSCoder) { fatalError() }
@@ -120,206 +211,15 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
     }
 
     public override func loadView() {
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: 530, height: 575))
+        let initialSize: NSSize
+        switch studioMode {
+        case .beatFinder: initialSize = NSSize(width: 510, height: 266)
+        case .autoFillOnly: initialSize = NSSize(width: 525, height: 345)
+        }
+        let root = NSView(frame: NSRect(origin: .zero, size: initialSize))
         root.wantsLayer = true
         root.layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0).cgColor
         self.view = root
-
-        // Header
-        let header = NSView()
-        header.translatesAutoresizingMaskIntoConstraints = false
-        header.wantsLayer = true
-        header.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
-        root.addSubview(header)
-
-        let headerIcon = NSImageView()
-        headerIcon.translatesAutoresizingMaskIntoConstraints = false
-        headerIcon.image = Lucide.image(.wandSparkles, size: 18, color: .systemCyan)
-        header.addSubview(headerIcon)
-
-        let titleLabel = NSTextField(labelWithString: "Montaggio Ritmico Guidato dalla Musica")
-        titleLabel.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
-        titleLabel.textColor = .white
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        header.addSubview(titleLabel)
-
-        let headerDivider = NSBox()
-        headerDivider.boxType = .separator
-        headerDivider.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(headerDivider)
-
-        // Section 1: Beat & Gabbie Card
-        let beatCard = makeCard()
-        root.addSubview(beatCard)
-
-        let beatSecTitle = NSTextField(labelWithString: "1. ANALISI BEAT & DESTINAZIONE GABBIE")
-        beatSecTitle.font = NSFont.systemFont(ofSize: 10, weight: .bold)
-        beatSecTitle.textColor = .systemCyan
-        beatSecTitle.translatesAutoresizingMaskIntoConstraints = false
-        beatCard.addSubview(beatSecTitle)
-
-        let destLabel = NSTextField(labelWithString: "Destinazione:")
-        destLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        destLabel.textColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
-        destLabel.translatesAutoresizingMaskIntoConstraints = false
-        beatCard.addSubview(destLabel)
-
-        targetSegmented.translatesAutoresizingMaskIntoConstraints = false
-        targetSegmented.target = self
-        targetSegmented.action = #selector(onTargetModeChanged)
-        targetSegmented.setEnabled(targetAudioClip != nil, forSegment: TargetMode.trackClip.rawValue)
-        targetSegmented.selectedSegment = targetMode.rawValue
-        beatCard.addSubview(targetSegmented)
-
-        modeBannerView.translatesAutoresizingMaskIntoConstraints = false
-        modeBannerView.wantsLayer = true
-        modeBannerView.layer?.cornerRadius = 6
-        modeBannerView.layer?.borderWidth = 1.0
-        beatCard.addSubview(modeBannerView)
-
-        modeBannerLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
-        modeBannerLabel.lineBreakMode = .byWordWrapping
-        modeBannerLabel.maximumNumberOfLines = 2
-        modeBannerLabel.translatesAutoresizingMaskIntoConstraints = false
-        modeBannerView.addSubview(modeBannerLabel)
-
-        trackLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        trackLabel.textColor = NSColor(calibratedWhite: 0.85, alpha: 1.0)
-        trackLabel.lineBreakMode = .byTruncatingMiddle
-        trackLabel.translatesAutoresizingMaskIntoConstraints = false
-        beatCard.addSubview(trackLabel)
-
-        analyzeBtn.translatesAutoresizingMaskIntoConstraints = false
-        analyzeBtn.isAccentActive = true
-        analyzeBtn.target = self
-        analyzeBtn.action = #selector(onAnalyzeClicked)
-        beatCard.addSubview(analyzeBtn)
-
-        statusIndicator.style = .spinning
-        statusIndicator.controlSize = .small
-        statusIndicator.isHidden = true
-        statusIndicator.translatesAutoresizingMaskIntoConstraints = false
-        beatCard.addSubview(statusIndicator)
-
-        statusLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        statusLabel.textColor = NSColor(calibratedWhite: 0.65, alpha: 1.0)
-        statusLabel.lineBreakMode = .byTruncatingTail
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        beatCard.addSubview(statusLabel)
-
-        bpmResultLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold)
-        bpmResultLabel.textColor = .white
-        bpmResultLabel.translatesAutoresizingMaskIntoConstraints = false
-        beatCard.addSubview(bpmResultLabel)
-
-        let modeLabel = NSTextField(labelWithString: "Ritmo di taglio:")
-        modeLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        modeLabel.textColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
-        modeLabel.translatesAutoresizingMaskIntoConstraints = false
-        beatCard.addSubview(modeLabel)
-
-        modePopUp.translatesAutoresizingMaskIntoConstraints = false
-        modePopUp.target = self
-        modePopUp.action = #selector(onModeChanged)
-        for mode in BeatIntervalMode.allCases {
-            modePopUp.addItem(withTitle: mode.rawValue)
-        }
-        if let savedIdx = BeatIntervalMode.allCases.firstIndex(of: model.beatIntervalMode) {
-            modePopUp.selectItem(at: savedIdx)
-        } else {
-            modePopUp.selectItem(at: BeatIntervalMode.allCases.count - 1)
-        }
-        modePopUp.isEnabled = false
-        beatCard.addSubview(modePopUp)
-
-        sensitivityLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        sensitivityLabel.textColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
-        sensitivityLabel.translatesAutoresizingMaskIntoConstraints = false
-        beatCard.addSubview(sensitivityLabel)
-
-        sensitivitySlider.doubleValue = model.peakSensitivity
-        sensitivitySlider.isContinuous = true
-        sensitivitySlider.translatesAutoresizingMaskIntoConstraints = false
-        sensitivitySlider.target = self
-        sensitivitySlider.action = #selector(onSensitivityChanged)
-        sensitivitySlider.isEnabled = false
-        beatCard.addSubview(sensitivitySlider)
-
-        sensitivityValueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        sensitivityValueLabel.textColor = NSColor(calibratedWhite: 0.78, alpha: 1.0)
-        sensitivityValueLabel.alignment = .right
-        sensitivityValueLabel.translatesAutoresizingMaskIntoConstraints = false
-        beatCard.addSubview(sensitivityValueLabel)
-
-        cagesPreviewLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        cagesPreviewLabel.textColor = NSColor(calibratedWhite: 0.62, alpha: 1.0)
-        cagesPreviewLabel.lineBreakMode = .byWordWrapping
-        cagesPreviewLabel.maximumNumberOfLines = 2
-        cagesPreviewLabel.translatesAutoresizingMaskIntoConstraints = false
-        beatCard.addSubview(cagesPreviewLabel)
-
-        clearTimelineBtn.translatesAutoresizingMaskIntoConstraints = false
-        clearTimelineBtn.target = self
-        clearTimelineBtn.action = #selector(onClearTimelineClicked)
-        beatCard.addSubview(clearTimelineBtn)
-
-        clearClipBtn.translatesAutoresizingMaskIntoConstraints = false
-        clearClipBtn.target = self
-        clearClipBtn.action = #selector(onClearClipClicked)
-        beatCard.addSubview(clearClipBtn)
-
-        generateBtn.translatesAutoresizingMaskIntoConstraints = false
-        generateBtn.target = self
-        generateBtn.action = #selector(onGenerateClicked)
-        generateBtn.isEnabled = false
-        beatCard.addSubview(generateBtn)
-
-        // Section 2: Auto-Fill Card
-        let autoFillCard = makeCard()
-        root.addSubview(autoFillCard)
-
-        let afSecTitle = NSTextField(labelWithString: "2. AUTO-FILL DA SELEZIONE")
-        afSecTitle.font = NSFont.systemFont(ofSize: 10, weight: .bold)
-        afSecTitle.textColor = .systemCyan
-        afSecTitle.translatesAutoresizingMaskIntoConstraints = false
-        autoFillCard.addSubview(afSecTitle)
-
-        let selLabel = NSTextField(labelWithString: "Sorgente:")
-        selLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        selLabel.textColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
-        selLabel.translatesAutoresizingMaskIntoConstraints = false
-        autoFillCard.addSubview(selLabel)
-
-        selectionPopUp.translatesAutoresizingMaskIntoConstraints = false
-        selectionPopUp.target = self
-        selectionPopUp.action = #selector(onSelectionChanged)
-        autoFillCard.addSubview(selectionPopUp)
-
-        let orderLabel = NSTextField(labelWithString: "Ordine:")
-        orderLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        orderLabel.textColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
-        orderLabel.translatesAutoresizingMaskIntoConstraints = false
-        autoFillCard.addSubview(orderLabel)
-
-        orderModePopUp.translatesAutoresizingMaskIntoConstraints = false
-        for mode in AutoFillOrderMode.allCases {
-            orderModePopUp.addItem(withTitle: mode.rawValue)
-        }
-        orderModePopUp.selectItem(at: 0)
-        autoFillCard.addSubview(orderModePopUp)
-
-        autoFillStatusLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        autoFillStatusLabel.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
-        autoFillStatusLabel.lineBreakMode = .byWordWrapping
-        autoFillStatusLabel.maximumNumberOfLines = 2
-        autoFillStatusLabel.translatesAutoresizingMaskIntoConstraints = false
-        autoFillCard.addSubview(autoFillStatusLabel)
-
-        autoFillBtn.translatesAutoresizingMaskIntoConstraints = false
-        autoFillBtn.isAccentActive = true
-        autoFillBtn.target = self
-        autoFillBtn.action = #selector(onAutoFillClicked)
-        autoFillCard.addSubview(autoFillBtn)
 
         // Footer
         let footer = NSView()
@@ -338,139 +238,7 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
         closeBtn.translatesAutoresizingMaskIntoConstraints = false
         footer.addSubview(closeBtn)
 
-        NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: root.topAnchor),
-            header.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            header.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            header.heightAnchor.constraint(equalToConstant: 46),
-
-            headerIcon.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
-            headerIcon.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-            headerIcon.widthAnchor.constraint(equalToConstant: 18),
-            headerIcon.heightAnchor.constraint(equalToConstant: 18),
-
-            titleLabel.leadingAnchor.constraint(equalTo: headerIcon.trailingAnchor, constant: 8),
-            titleLabel.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-
-            headerDivider.topAnchor.constraint(equalTo: header.bottomAnchor),
-            headerDivider.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            headerDivider.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-
-            // Card 1
-            beatCard.topAnchor.constraint(equalTo: headerDivider.bottomAnchor, constant: 14),
-            beatCard.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-            beatCard.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
-
-            beatSecTitle.topAnchor.constraint(equalTo: beatCard.topAnchor, constant: 12),
-            beatSecTitle.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
-
-            destLabel.topAnchor.constraint(equalTo: beatSecTitle.bottomAnchor, constant: 10),
-            destLabel.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
-
-            targetSegmented.centerYAnchor.constraint(equalTo: destLabel.centerYAnchor),
-            targetSegmented.leadingAnchor.constraint(equalTo: destLabel.trailingAnchor, constant: 10),
-            targetSegmented.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
-
-            modeBannerView.topAnchor.constraint(equalTo: targetSegmented.bottomAnchor, constant: 10),
-            modeBannerView.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
-            modeBannerView.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
-
-            modeBannerLabel.topAnchor.constraint(equalTo: modeBannerView.topAnchor, constant: 7),
-            modeBannerLabel.bottomAnchor.constraint(equalTo: modeBannerView.bottomAnchor, constant: -7),
-            modeBannerLabel.leadingAnchor.constraint(equalTo: modeBannerView.leadingAnchor, constant: 10),
-            modeBannerLabel.trailingAnchor.constraint(equalTo: modeBannerView.trailingAnchor, constant: -10),
-
-            trackLabel.topAnchor.constraint(equalTo: modeBannerView.bottomAnchor, constant: 10),
-            trackLabel.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
-            trackLabel.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
-
-            analyzeBtn.topAnchor.constraint(equalTo: trackLabel.bottomAnchor, constant: 8),
-            analyzeBtn.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
-            analyzeBtn.widthAnchor.constraint(equalToConstant: 128),
-            analyzeBtn.heightAnchor.constraint(equalToConstant: 24),
-
-            statusIndicator.centerYAnchor.constraint(equalTo: analyzeBtn.centerYAnchor),
-            statusIndicator.leadingAnchor.constraint(equalTo: analyzeBtn.trailingAnchor, constant: 10),
-
-            statusLabel.centerYAnchor.constraint(equalTo: analyzeBtn.centerYAnchor),
-            statusLabel.leadingAnchor.constraint(equalTo: statusIndicator.trailingAnchor, constant: 6),
-            statusLabel.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
-
-            bpmResultLabel.topAnchor.constraint(equalTo: analyzeBtn.bottomAnchor, constant: 10),
-            bpmResultLabel.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
-            bpmResultLabel.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
-
-            modeLabel.topAnchor.constraint(equalTo: bpmResultLabel.bottomAnchor, constant: 10),
-            modeLabel.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
-
-            modePopUp.centerYAnchor.constraint(equalTo: modeLabel.centerYAnchor),
-            modePopUp.leadingAnchor.constraint(equalTo: modeLabel.trailingAnchor, constant: 10),
-            modePopUp.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
-
-            sensitivityLabel.topAnchor.constraint(equalTo: modePopUp.bottomAnchor, constant: 10),
-            sensitivityLabel.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
-
-            sensitivitySlider.centerYAnchor.constraint(equalTo: sensitivityLabel.centerYAnchor),
-            sensitivitySlider.leadingAnchor.constraint(equalTo: sensitivityLabel.trailingAnchor, constant: 10),
-
-            sensitivityValueLabel.centerYAnchor.constraint(equalTo: sensitivityLabel.centerYAnchor),
-            sensitivityValueLabel.leadingAnchor.constraint(equalTo: sensitivitySlider.trailingAnchor, constant: 8),
-            sensitivityValueLabel.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
-            sensitivityValueLabel.widthAnchor.constraint(equalToConstant: 110),
-
-            cagesPreviewLabel.topAnchor.constraint(equalTo: sensitivityLabel.bottomAnchor, constant: 10),
-            cagesPreviewLabel.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
-            cagesPreviewLabel.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
-
-            clearTimelineBtn.topAnchor.constraint(equalTo: cagesPreviewLabel.bottomAnchor, constant: 12),
-            clearTimelineBtn.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
-            clearTimelineBtn.bottomAnchor.constraint(equalTo: beatCard.bottomAnchor, constant: -12),
-            clearTimelineBtn.widthAnchor.constraint(equalToConstant: 122),
-            clearTimelineBtn.heightAnchor.constraint(equalToConstant: 26),
-
-            clearClipBtn.centerYAnchor.constraint(equalTo: clearTimelineBtn.centerYAnchor),
-            clearClipBtn.leadingAnchor.constraint(equalTo: clearTimelineBtn.trailingAnchor, constant: 8),
-            clearClipBtn.widthAnchor.constraint(equalToConstant: 108),
-            clearClipBtn.heightAnchor.constraint(equalToConstant: 26),
-
-            generateBtn.centerYAnchor.constraint(equalTo: clearTimelineBtn.centerYAnchor),
-            generateBtn.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
-            generateBtn.widthAnchor.constraint(equalToConstant: 176),
-            generateBtn.heightAnchor.constraint(equalToConstant: 26),
-
-            // Card 2
-            autoFillCard.topAnchor.constraint(equalTo: beatCard.bottomAnchor, constant: 12),
-            autoFillCard.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-            autoFillCard.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
-
-            afSecTitle.topAnchor.constraint(equalTo: autoFillCard.topAnchor, constant: 12),
-            afSecTitle.leadingAnchor.constraint(equalTo: autoFillCard.leadingAnchor, constant: 14),
-
-            selLabel.topAnchor.constraint(equalTo: afSecTitle.bottomAnchor, constant: 10),
-            selLabel.leadingAnchor.constraint(equalTo: autoFillCard.leadingAnchor, constant: 14),
-
-            selectionPopUp.centerYAnchor.constraint(equalTo: selLabel.centerYAnchor),
-            selectionPopUp.leadingAnchor.constraint(equalTo: selLabel.trailingAnchor, constant: 10),
-            selectionPopUp.trailingAnchor.constraint(equalTo: autoFillCard.trailingAnchor, constant: -14),
-
-            orderLabel.topAnchor.constraint(equalTo: selectionPopUp.bottomAnchor, constant: 10),
-            orderLabel.leadingAnchor.constraint(equalTo: autoFillCard.leadingAnchor, constant: 14),
-
-            orderModePopUp.centerYAnchor.constraint(equalTo: orderLabel.centerYAnchor),
-            orderModePopUp.leadingAnchor.constraint(equalTo: selectionPopUp.leadingAnchor),
-            orderModePopUp.trailingAnchor.constraint(equalTo: autoFillCard.trailingAnchor, constant: -14),
-
-            autoFillStatusLabel.topAnchor.constraint(equalTo: orderModePopUp.bottomAnchor, constant: 8),
-            autoFillStatusLabel.leadingAnchor.constraint(equalTo: autoFillCard.leadingAnchor, constant: 14),
-            autoFillStatusLabel.trailingAnchor.constraint(equalTo: autoFillCard.trailingAnchor, constant: -14),
-
-            autoFillBtn.topAnchor.constraint(equalTo: autoFillStatusLabel.bottomAnchor, constant: 10),
-            autoFillBtn.trailingAnchor.constraint(equalTo: autoFillCard.trailingAnchor, constant: -14),
-            autoFillBtn.bottomAnchor.constraint(equalTo: autoFillCard.bottomAnchor, constant: -12),
-            autoFillBtn.widthAnchor.constraint(equalToConstant: 168),
-            autoFillBtn.heightAnchor.constraint(equalToConstant: 26),
-
-            // Footer
+        var constraints: [NSLayoutConstraint] = [
             footer.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             footer.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             footer.bottomAnchor.constraint(equalTo: root.bottomAnchor),
@@ -480,14 +248,340 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
             footerDivider.leadingAnchor.constraint(equalTo: footer.leadingAnchor),
             footerDivider.trailingAnchor.constraint(equalTo: footer.trailingAnchor),
 
-            closeBtn.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -16),
+            closeBtn.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -14),
             closeBtn.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
-            closeBtn.widthAnchor.constraint(equalToConstant: 84),
+            closeBtn.widthAnchor.constraint(equalToConstant: 74),
             closeBtn.heightAnchor.constraint(equalToConstant: 26)
-        ])
+        ]
 
-        populateSelectionPopUp()
-        refreshUIState()
+        let headerDivider = NSBox()
+        if case .autoFillOnly = studioMode {
+            let header = NSView()
+            header.translatesAutoresizingMaskIntoConstraints = false
+            header.wantsLayer = true
+            header.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
+            root.addSubview(header)
+
+            let headerIcon = NSImageView()
+            headerIcon.translatesAutoresizingMaskIntoConstraints = false
+            headerIcon.image = Lucide.image(.sparkles, size: 18, color: .systemCyan)
+            header.addSubview(headerIcon)
+
+            let titleLabel = NSTextField(labelWithString: "Auto-Fill Ritmico da Selezione")
+            titleLabel.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+            titleLabel.textColor = .white
+            titleLabel.translatesAutoresizingMaskIntoConstraints = false
+            header.addSubview(titleLabel)
+
+            headerDivider.boxType = .separator
+            headerDivider.translatesAutoresizingMaskIntoConstraints = false
+            root.addSubview(headerDivider)
+
+            constraints.append(contentsOf: [
+                header.topAnchor.constraint(equalTo: root.topAnchor),
+                header.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                header.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+                header.heightAnchor.constraint(equalToConstant: 46),
+
+                headerIcon.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                headerIcon.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+                headerIcon.widthAnchor.constraint(equalToConstant: 18),
+                headerIcon.heightAnchor.constraint(equalToConstant: 18),
+
+                titleLabel.leadingAnchor.constraint(equalTo: headerIcon.trailingAnchor, constant: 8),
+                titleLabel.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+
+                headerDivider.topAnchor.constraint(equalTo: header.bottomAnchor),
+                headerDivider.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                headerDivider.trailingAnchor.constraint(equalTo: root.trailingAnchor)
+            ])
+        }
+
+        switch studioMode {
+        case .beatFinder:
+            let beatCard = makeCard()
+            root.addSubview(beatCard)
+
+            trackLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+            trackLabel.textColor = NSColor(calibratedWhite: 0.90, alpha: 1.0)
+            trackLabel.lineBreakMode = .byTruncatingMiddle
+            trackLabel.translatesAutoresizingMaskIntoConstraints = false
+            beatCard.addSubview(trackLabel)
+
+            analyzeBtn.translatesAutoresizingMaskIntoConstraints = false
+            analyzeBtn.isAccentActive = true
+            analyzeBtn.target = self
+            analyzeBtn.action = #selector(onAnalyzeClicked)
+            beatCard.addSubview(analyzeBtn)
+
+            statusIndicator.style = .spinning
+            statusIndicator.controlSize = .small
+            statusIndicator.isHidden = true
+            statusIndicator.translatesAutoresizingMaskIntoConstraints = false
+            beatCard.addSubview(statusIndicator)
+
+            statusLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+            statusLabel.textColor = NSColor(calibratedWhite: 0.65, alpha: 1.0)
+            statusLabel.lineBreakMode = .byTruncatingTail
+            statusLabel.translatesAutoresizingMaskIntoConstraints = false
+            beatCard.addSubview(statusLabel)
+
+            bpmResultLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold)
+            bpmResultLabel.textColor = .white
+            bpmResultLabel.translatesAutoresizingMaskIntoConstraints = false
+            beatCard.addSubview(bpmResultLabel)
+
+            let modeLabel = NSTextField(labelWithString: "Ritmo di taglio:")
+            modeLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+            modeLabel.textColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
+            modeLabel.translatesAutoresizingMaskIntoConstraints = false
+            beatCard.addSubview(modeLabel)
+
+            modePopUp.translatesAutoresizingMaskIntoConstraints = false
+            modePopUp.target = self
+            modePopUp.action = #selector(onModeChanged)
+            for mode in BeatIntervalMode.allCases {
+                modePopUp.addItem(withTitle: mode.rawValue)
+            }
+            if let savedIdx = BeatIntervalMode.allCases.firstIndex(of: model.beatIntervalMode) {
+                modePopUp.selectItem(at: savedIdx)
+            } else {
+                modePopUp.selectItem(at: BeatIntervalMode.allCases.count - 1)
+            }
+            modePopUp.isEnabled = false
+            beatCard.addSubview(modePopUp)
+
+            sensitivityLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+            sensitivityLabel.textColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
+            sensitivityLabel.translatesAutoresizingMaskIntoConstraints = false
+            beatCard.addSubview(sensitivityLabel)
+
+            sensitivitySlider.doubleValue = model.peakSensitivity
+            sensitivitySlider.isContinuous = true
+            sensitivitySlider.translatesAutoresizingMaskIntoConstraints = false
+            sensitivitySlider.target = self
+            sensitivitySlider.action = #selector(onSensitivityChanged)
+            sensitivitySlider.isEnabled = false
+            beatCard.addSubview(sensitivitySlider)
+
+            sensitivityValueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+            sensitivityValueLabel.textColor = NSColor(calibratedWhite: 0.78, alpha: 1.0)
+            sensitivityValueLabel.alignment = .right
+            sensitivityValueLabel.translatesAutoresizingMaskIntoConstraints = false
+            beatCard.addSubview(sensitivityValueLabel)
+
+            cagesPreviewLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+            cagesPreviewLabel.textColor = NSColor(calibratedWhite: 0.62, alpha: 1.0)
+            cagesPreviewLabel.lineBreakMode = .byTruncatingTail
+            cagesPreviewLabel.maximumNumberOfLines = 1
+            cagesPreviewLabel.translatesAutoresizingMaskIntoConstraints = false
+            beatCard.addSubview(cagesPreviewLabel)
+
+            clearBeatBtn.translatesAutoresizingMaskIntoConstraints = false
+            clearBeatBtn.target = self
+            clearBeatBtn.action = #selector(onClearBeatClicked)
+            footer.addSubview(clearBeatBtn)
+
+            clearAllBtn.translatesAutoresizingMaskIntoConstraints = false
+            clearAllBtn.target = self
+            clearAllBtn.action = #selector(onClearAllClicked)
+            footer.addSubview(clearAllBtn)
+
+            applyBeatsBtn.translatesAutoresizingMaskIntoConstraints = false
+            applyBeatsBtn.target = self
+            applyBeatsBtn.action = #selector(onGenerateClicked)
+            applyBeatsBtn.isEnabled = false
+            footer.addSubview(applyBeatsBtn)
+
+            constraints.append(contentsOf: [
+                beatCard.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
+                beatCard.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+                beatCard.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+
+                trackLabel.topAnchor.constraint(equalTo: beatCard.topAnchor, constant: 12),
+                trackLabel.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
+                trackLabel.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
+
+                analyzeBtn.topAnchor.constraint(equalTo: trackLabel.bottomAnchor, constant: 8),
+                analyzeBtn.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
+                analyzeBtn.widthAnchor.constraint(equalToConstant: 124),
+                analyzeBtn.heightAnchor.constraint(equalToConstant: 24),
+
+                statusIndicator.centerYAnchor.constraint(equalTo: analyzeBtn.centerYAnchor),
+                statusIndicator.leadingAnchor.constraint(equalTo: analyzeBtn.trailingAnchor, constant: 10),
+
+                statusLabel.centerYAnchor.constraint(equalTo: analyzeBtn.centerYAnchor),
+                statusLabel.leadingAnchor.constraint(equalTo: statusIndicator.trailingAnchor, constant: 6),
+                statusLabel.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
+
+                bpmResultLabel.topAnchor.constraint(equalTo: analyzeBtn.bottomAnchor, constant: 10),
+                bpmResultLabel.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
+                bpmResultLabel.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
+
+                modeLabel.topAnchor.constraint(equalTo: bpmResultLabel.bottomAnchor, constant: 10),
+                modeLabel.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
+
+                modePopUp.centerYAnchor.constraint(equalTo: modeLabel.centerYAnchor),
+                modePopUp.leadingAnchor.constraint(equalTo: modeLabel.trailingAnchor, constant: 10),
+                modePopUp.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
+
+                sensitivityLabel.topAnchor.constraint(equalTo: modePopUp.bottomAnchor, constant: 10),
+                sensitivityLabel.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
+
+                sensitivitySlider.centerYAnchor.constraint(equalTo: sensitivityLabel.centerYAnchor),
+                sensitivitySlider.leadingAnchor.constraint(equalTo: sensitivityLabel.trailingAnchor, constant: 10),
+
+                sensitivityValueLabel.centerYAnchor.constraint(equalTo: sensitivityLabel.centerYAnchor),
+                sensitivityValueLabel.leadingAnchor.constraint(equalTo: sensitivitySlider.trailingAnchor, constant: 8),
+                sensitivityValueLabel.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
+                sensitivityValueLabel.widthAnchor.constraint(equalToConstant: 110),
+
+                cagesPreviewLabel.topAnchor.constraint(equalTo: sensitivityLabel.bottomAnchor, constant: 10),
+                cagesPreviewLabel.leadingAnchor.constraint(equalTo: beatCard.leadingAnchor, constant: 14),
+                cagesPreviewLabel.trailingAnchor.constraint(equalTo: beatCard.trailingAnchor, constant: -14),
+                cagesPreviewLabel.bottomAnchor.constraint(equalTo: beatCard.bottomAnchor, constant: -12),
+
+                clearBeatBtn.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 14),
+                clearBeatBtn.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+                clearBeatBtn.widthAnchor.constraint(equalToConstant: 96),
+                clearBeatBtn.heightAnchor.constraint(equalToConstant: 26),
+
+                clearAllBtn.leadingAnchor.constraint(equalTo: clearBeatBtn.trailingAnchor, constant: 8),
+                clearAllBtn.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+                clearAllBtn.widthAnchor.constraint(equalToConstant: 100),
+                clearAllBtn.heightAnchor.constraint(equalToConstant: 26),
+
+                applyBeatsBtn.trailingAnchor.constraint(equalTo: closeBtn.leadingAnchor, constant: -8),
+                applyBeatsBtn.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+                applyBeatsBtn.widthAnchor.constraint(equalToConstant: 104),
+                applyBeatsBtn.heightAnchor.constraint(equalToConstant: 26)
+            ])
+
+        case .autoFillOnly:
+            let autoFillCard = makeCard()
+            root.addSubview(autoFillCard)
+
+            let afSecTitle = NSTextField(labelWithString: "AUTO-FILL DA SELEZIONE SU V1")
+            afSecTitle.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+            afSecTitle.textColor = .systemCyan
+            afSecTitle.translatesAutoresizingMaskIntoConstraints = false
+            autoFillCard.addSubview(afSecTitle)
+
+            let selLabel = NSTextField(labelWithString: "Sorgente:")
+            selLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+            selLabel.textColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
+            selLabel.translatesAutoresizingMaskIntoConstraints = false
+            autoFillCard.addSubview(selLabel)
+
+            selectionPopUp.translatesAutoresizingMaskIntoConstraints = false
+            selectionPopUp.target = self
+            selectionPopUp.action = #selector(onSelectionChanged)
+            autoFillCard.addSubview(selectionPopUp)
+
+            let orderLabel = NSTextField(labelWithString: "Ordine:")
+            orderLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+            orderLabel.textColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
+            orderLabel.translatesAutoresizingMaskIntoConstraints = false
+            autoFillCard.addSubview(orderLabel)
+
+            orderModePopUp.translatesAutoresizingMaskIntoConstraints = false
+            orderModePopUp.target = self
+            orderModePopUp.action = #selector(onOrderModeChanged)
+            for mode in AutoFillOrderMode.allCases {
+                orderModePopUp.addItem(withTitle: mode.rawValue)
+            }
+            orderModePopUp.selectItem(at: 0)
+            autoFillCard.addSubview(orderModePopUp)
+
+            let startLabel = NSTextField(labelWithString: "Inizio:")
+            startLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+            startLabel.textColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
+            startLabel.translatesAutoresizingMaskIntoConstraints = false
+            autoFillCard.addSubview(startLabel)
+
+            let mins = Int(currentPlayheadSeconds) / 60
+            let secs = Int(currentPlayheadSeconds) % 60
+            startModeSegmented.setLabel("Dalla prima gabbia", forSegment: 0)
+            startModeSegmented.setLabel(String(format: "Dalla testina (%02d:%02d)", mins, secs), forSegment: 1)
+            startModeSegmented.selectedSegment = 0
+            startModeSegmented.translatesAutoresizingMaskIntoConstraints = false
+            startModeSegmented.target = self
+            startModeSegmented.action = #selector(onStartModeChanged)
+            autoFillCard.addSubview(startModeSegmented)
+
+            autoFillStatusLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+            autoFillStatusLabel.textColor = NSColor(calibratedWhite: 0.82, alpha: 1.0)
+            autoFillStatusLabel.lineBreakMode = .byWordWrapping
+            autoFillStatusLabel.maximumNumberOfLines = 2
+            autoFillStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+            autoFillCard.addSubview(autoFillStatusLabel)
+
+            autoFillForecastLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+            autoFillForecastLabel.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
+            autoFillForecastLabel.lineBreakMode = .byWordWrapping
+            autoFillForecastLabel.maximumNumberOfLines = 2
+            autoFillForecastLabel.translatesAutoresizingMaskIntoConstraints = false
+            autoFillCard.addSubview(autoFillForecastLabel)
+
+            autoFillBtn.translatesAutoresizingMaskIntoConstraints = false
+            autoFillBtn.isAccentActive = true
+            autoFillBtn.target = self
+            autoFillBtn.action = #selector(onAutoFillClicked)
+            autoFillCard.addSubview(autoFillBtn)
+
+            constraints.append(contentsOf: [
+                autoFillCard.topAnchor.constraint(equalTo: headerDivider.bottomAnchor, constant: 14),
+                autoFillCard.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+                autoFillCard.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+
+                afSecTitle.topAnchor.constraint(equalTo: autoFillCard.topAnchor, constant: 12),
+                afSecTitle.leadingAnchor.constraint(equalTo: autoFillCard.leadingAnchor, constant: 14),
+
+                selLabel.topAnchor.constraint(equalTo: afSecTitle.bottomAnchor, constant: 12),
+                selLabel.leadingAnchor.constraint(equalTo: autoFillCard.leadingAnchor, constant: 14),
+
+                selectionPopUp.centerYAnchor.constraint(equalTo: selLabel.centerYAnchor),
+                selectionPopUp.leadingAnchor.constraint(equalTo: selLabel.trailingAnchor, constant: 10),
+                selectionPopUp.trailingAnchor.constraint(equalTo: autoFillCard.trailingAnchor, constant: -14),
+
+                orderLabel.topAnchor.constraint(equalTo: selectionPopUp.bottomAnchor, constant: 10),
+                orderLabel.leadingAnchor.constraint(equalTo: autoFillCard.leadingAnchor, constant: 14),
+
+                orderModePopUp.centerYAnchor.constraint(equalTo: orderLabel.centerYAnchor),
+                orderModePopUp.leadingAnchor.constraint(equalTo: selectionPopUp.leadingAnchor),
+                orderModePopUp.trailingAnchor.constraint(equalTo: autoFillCard.trailingAnchor, constant: -14),
+
+                startLabel.topAnchor.constraint(equalTo: orderModePopUp.bottomAnchor, constant: 10),
+                startLabel.leadingAnchor.constraint(equalTo: autoFillCard.leadingAnchor, constant: 14),
+
+                startModeSegmented.centerYAnchor.constraint(equalTo: startLabel.centerYAnchor),
+                startModeSegmented.leadingAnchor.constraint(equalTo: selectionPopUp.leadingAnchor),
+                startModeSegmented.trailingAnchor.constraint(equalTo: autoFillCard.trailingAnchor, constant: -14),
+
+                autoFillStatusLabel.topAnchor.constraint(equalTo: startModeSegmented.bottomAnchor, constant: 12),
+                autoFillStatusLabel.leadingAnchor.constraint(equalTo: autoFillCard.leadingAnchor, constant: 14),
+                autoFillStatusLabel.trailingAnchor.constraint(equalTo: autoFillCard.trailingAnchor, constant: -14),
+
+                autoFillForecastLabel.topAnchor.constraint(equalTo: autoFillStatusLabel.bottomAnchor, constant: 4),
+                autoFillForecastLabel.leadingAnchor.constraint(equalTo: autoFillCard.leadingAnchor, constant: 14),
+                autoFillForecastLabel.trailingAnchor.constraint(equalTo: autoFillCard.trailingAnchor, constant: -14),
+
+                autoFillBtn.topAnchor.constraint(equalTo: autoFillForecastLabel.bottomAnchor, constant: 12),
+                autoFillBtn.trailingAnchor.constraint(equalTo: autoFillCard.trailingAnchor, constant: -14),
+                autoFillBtn.bottomAnchor.constraint(equalTo: autoFillCard.bottomAnchor, constant: -12),
+                autoFillBtn.widthAnchor.constraint(equalToConstant: 176),
+                autoFillBtn.heightAnchor.constraint(equalToConstant: 26)
+            ])
+        }
+
+        NSLayoutConstraint.activate(constraints)
+
+        if case .autoFillOnly = studioMode {
+            populateSelectionPopUp()
+            updateAutoFillState()
+        } else {
+            refreshUIState()
+        }
     }
 
     private func makeCard() -> NSView {
@@ -504,41 +598,19 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
     private func refreshUIState() {
         let clip = currentTargetClip
 
-        // 1. Mode warning banner
-        switch targetMode {
-        case .trackClip:
-            modeBannerView.layer?.backgroundColor = NSColor(calibratedRed: 0.24, green: 0.15, blue: 0.04, alpha: 1.0).cgColor
-            modeBannerView.layer?.borderColor = NSColor.systemOrange.withAlphaComponent(0.75).cgColor
-            modeBannerLabel.textColor = .systemOrange
-            if let clip = clip {
-                let prefix = hasSelectedAudioClip
-                    ? "MODALITÀ BRANO ATTIVA (clip selezionata)"
-                    : "MODALITÀ BRANO ATTIVA"
-                modeBannerLabel.stringValue = "\(prefix): segnerai i beat direttamente su '\(clip.mediaItem.name)'. Si sposteranno e taglieranno con il brano."
-            } else {
-                modeBannerLabel.stringValue = "MODALITÀ BRANO: nessun brano audio trovato in timeline."
-            }
-            generateBtn.title = "Segna Beat sul Brano"
-
-        case .timeline:
-            modeBannerView.layer?.backgroundColor = NSColor(calibratedRed: 0.05, green: 0.15, blue: 0.22, alpha: 1.0).cgColor
-            modeBannerView.layer?.borderColor = NSColor.systemCyan.withAlphaComponent(0.65).cgColor
-            modeBannerLabel.textColor = .systemCyan
-            modeBannerLabel.stringValue = "MODALITÀ TIMELINE ATTIVA: le gabbie verranno create sulla griglia globale della timeline."
-            generateBtn.title = "Applica Gabbie su Timeline"
-        }
-
-        // 2. Target clip & scan status
         if let clip = clip {
-            trackLabel.stringValue = "Brano audio: \(clip.mediaItem.name) (\(String(format: "%.1f", CMTimeGetSeconds(clip.duration)))s)"
+            trackLabel.stringValue = "\(clip.mediaItem.name) (\(String(format: "%.1f", CMTimeGetSeconds(clip.duration)))s)"
         } else {
             trackLabel.stringValue = "Nessuna traccia audio in timeline"
         }
 
+        analyzeBtn.title = (analysisResult != nil) ? "Rianalizza Audio" : "Analizza Audio"
         analyzeBtn.isEnabled = (clip != nil && !isAnalyzing)
-        clearTimelineBtn.isEnabled = !model.rhythmicCages.isEmpty
-        clearClipBtn.isEnabled = (clip.map { !$0.beatMarkers.isEmpty } ?? false)
-        clearClipBtn.isHidden = (clip == nil)
+
+        let hasBeats = (clip.map { !$0.beatMarkers.isEmpty } ?? false) || !model.rhythmicCages.isEmpty
+        let hasAnyMarkers = hasBeats || (clip.map { !$0.markers.isEmpty } ?? false)
+        clearBeatBtn.isEnabled = hasBeats && !isAnalyzing
+        clearAllBtn.isEnabled = hasAnyMarkers && !isAnalyzing
 
         if !isAnalyzing {
             if let feedback = lastFeedbackStatus {
@@ -558,79 +630,105 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
                 }
                 bpmResultLabel.stringValue = "\(Int(res.bpm.rounded())) BPM  •  \(res.beatTimes.count) battiti\(dbPart)\(countPart)"
                 modePopUp.isEnabled = true
-                generateBtn.isEnabled = (clip != nil)
+                applyBeatsBtn.isEnabled = (clip != nil)
+                applyBeatsBtn.isAccentActive = applyBeatsBtn.isEnabled
                 updateSensitivityUI()
                 updateCagesPreview()
             } else {
                 if lastFeedbackStatus == nil {
                     if clip == nil {
-                        statusLabel.stringValue = "Inserisci prima un file audio su una traccia audio (A1)."
+                        statusLabel.stringValue = "Inserisci prima un brano su timeline."
                         statusLabel.textColor = NSColor(calibratedWhite: 0.58, alpha: 1.0)
                     } else {
-                        statusLabel.stringValue = "Scansione manuale: premi «Analizza Audio» per avviare Beat This!."
-                        statusLabel.textColor = NSColor(calibratedWhite: 0.72, alpha: 1.0)
+                        statusLabel.stringValue = "Premi «Analizza Audio» per rilevare i beat."
+                        statusLabel.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
                     }
                 }
 
                 var parts: [String] = []
-                let liveCages = model.activeCageIntervals()
-                if !liveCages.isEmpty {
-                    let bpmStr = model.effectiveDetectedBPM.map { " (\(Int($0.rounded())) BPM)" } ?? ""
-                    parts.append("Attive in timeline: \(liveCages.count) gabbie\(bpmStr)")
+                if let clip = clip {
+                    if !clip.beatMarkers.isEmpty {
+                        let bpmStr = clip.beatBPM.map { " (\(Int($0.rounded())) BPM)" } ?? ""
+                        parts.append("\(clip.beatMarkers.count) beat salvati\(bpmStr)")
+                    }
+                    if !clip.markers.isEmpty {
+                        parts.append("\(clip.markers.count) marcatori M")
+                    }
                 }
-                if let clip = clip, (!clip.beatMarkers.isEmpty || !clip.markers.isEmpty) {
-                    let customStr = clip.markers.isEmpty ? "" : ", \(clip.markers.count) M"
-                    parts.append("Brano: \(clip.beatMarkers.count) beat\(customStr)")
-                }
-                bpmResultLabel.stringValue = parts.isEmpty ? "Stato attuale: nessuna gabbia o sbarra attiva" : parts.joined(separator: "  •  ")
+                bpmResultLabel.stringValue = parts.isEmpty ? "Nessun beat salvato sul brano" : "Sul brano: \(parts.joined(separator: "  •  "))"
                 modePopUp.isEnabled = false
                 sensitivitySlider.isEnabled = false
                 updateSensitivityUI()
-                generateBtn.isEnabled = false
+                applyBeatsBtn.isEnabled = false
+                applyBeatsBtn.isAccentActive = false
                 cagesPreviewLabel.stringValue = clip != nil
-                    ? "L'analisi neurale non parte automaticamente all'apertura. Avviala quando sei pronto."
-                    : "Trascina una traccia musicale su A1, poi premi «Analizza Audio»."
+                    ? "I beat verranno salvati direttamente sulla clip audio."
+                    : "Seleziona una clip audio su timeline."
             }
+        } else {
+            applyBeatsBtn.isEnabled = false
+            applyBeatsBtn.isAccentActive = false
         }
-
-        updateAutoFillState()
     }
 
     private func runNeuralAnalysis() {
         guard let clip = currentTargetClip, !isAnalyzing else { return }
         isAnalyzing = true
         analyzeBtn.isEnabled = false
-        generateBtn.isEnabled = false
+        applyBeatsBtn.isEnabled = false
+        applyBeatsBtn.isAccentActive = false
+        clearBeatBtn.isEnabled = false
+        clearAllBtn.isEnabled = false
         modePopUp.isEnabled = false
-        statusLabel.stringValue = "Analisi neurale Beat This! in corso..."
+        sensitivitySlider.isEnabled = false
+        statusLabel.stringValue = "Analisi Beat This! in corso..."
         statusLabel.textColor = .systemYellow
         statusIndicator.isHidden = false
         statusIndicator.startAnimation(nil)
+        view.needsDisplay = true
+        modalPanel?.displayIfNeeded()
 
-        let sourceRange = CMTimeRange(start: clip.sourceIn, duration: clip.sourceDuration)
-        Task { [weak self] in
-            guard let self = self else { return }
+        let mediaItemId = clip.mediaItem.id
+        let effectiveURL = clip.mediaItem.effectiveURL
+        let clipSourceIn = CMTimeGetSeconds(clip.sourceIn)
+        let clipSourceDur = CMTimeGetSeconds(clip.sourceDuration)
+
+        Task { @MainActor [weak self] in
             do {
-                let result = try await AudioBeatDetector.shared.analyze(
-                    url: clip.mediaItem.effectiveURL,
-                    timeRange: sourceRange
+                let saved = try await Task.detached(priority: .userInitiated) {
+                    let fullResult = try await AudioBeatDetector.shared.analyze(
+                        url: effectiveURL,
+                        timeRange: nil
+                    )
+                    return fullResult.toSavedBeatAnalysis()
+                }.value
+                EditorProject.shared.setBeatAnalysis(saved, forMediaItemId: mediaItemId)
+                guard let self = self else { return }
+                self.isAnalyzing = false
+                self.analysisResult = saved.toBeatAnalysisResult(
+                    audioURL: effectiveURL,
+                    sourceStart: clipSourceIn,
+                    sourceDuration: clipSourceDur
                 )
-                DispatchQueue.main.async {
-                    self.isAnalyzing = false
-                    self.analysisResult = result
-                    self.statusIndicator.stopAnimation(nil)
-                    self.statusIndicator.isHidden = true
-                    self.lastFeedbackStatus = ("Analisi completata", .systemGreen)
-                    self.refreshUIState()
-                }
+                self.statusIndicator.stopAnimation(nil)
+                self.statusIndicator.isHidden = true
+                self.lastFeedbackStatus = ("Analisi completata e salvata", .systemGreen)
+                self.refreshUIState()
+                self.view.needsLayout = true
+                self.view.layoutSubtreeIfNeeded()
+                self.view.needsDisplay = true
+                self.modalPanel?.displayIfNeeded()
             } catch {
-                DispatchQueue.main.async {
-                    self.isAnalyzing = false
-                    self.statusIndicator.stopAnimation(nil)
-                    self.statusIndicator.isHidden = true
-                    self.lastFeedbackStatus = ("Errore analisi: \(error.localizedDescription)", .systemRed)
-                    self.refreshUIState()
-                }
+                guard let self = self else { return }
+                self.isAnalyzing = false
+                self.statusIndicator.stopAnimation(nil)
+                self.statusIndicator.isHidden = true
+                self.lastFeedbackStatus = ("Errore analisi: \(error.localizedDescription)", .systemRed)
+                self.refreshUIState()
+                self.view.needsLayout = true
+                self.view.layoutSubtreeIfNeeded()
+                self.view.needsDisplay = true
+                self.modalPanel?.displayIfNeeded()
             }
         }
     }
@@ -676,34 +774,66 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
         return ([], "0 gabbie disponibili")
     }
 
+    private var activeStartPlayhead: Double? {
+        startModeSegmented.selectedSegment == 1 ? currentPlayheadSeconds : nil
+    }
+
     private func updateAutoFillState() {
         let effective = effectiveAutoFillCages()
         guard let sel = selectedSelectionTimeline else {
             autoFillStatusLabel.stringValue = "Crea una Selezione dal Media Pool (o converti una timeline 1V+1A) prima di usare Auto-Fill."
             autoFillStatusLabel.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
+            autoFillForecastLabel.stringValue = ""
             autoFillBtn.isEnabled = false
             return
         }
 
         let videoClips = sel.videoTracks.first?.clips ?? []
-        let p1Count = videoClips.filter { ($0.priority ?? 1) == 1 }.count
-        let p2Count = videoClips.filter { $0.priority == 2 }.count
-        let p3Count = videoClips.filter { $0.priority == 3 }.count
-        let prioInfo = (p2Count > 0 || p3Count > 0)
-            ? " [P1:\(p1Count) • P2:\(p2Count) • P3:\(p3Count)]"
-            : ""
-
         if effective.cages.isEmpty {
-            autoFillStatusLabel.stringValue = "Nessuna gabbia pronta • \(videoClips.count) clip\(prioInfo) in '\(sel.name)'. Analizza il brano sopra o premi M su una traccia audio per aggiungere sbarre."
+            autoFillStatusLabel.stringValue = "Nessuna gabbia pronta • \(videoClips.count) clip in '\(sel.name)'."
             autoFillStatusLabel.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
+            autoFillForecastLabel.stringValue = "Fai clic destro su una traccia audio in timeline -> Beat Finder, o premi M per creare sbarre."
+            autoFillForecastLabel.textColor = NSColor(calibratedWhite: 0.58, alpha: 1.0)
             autoFillBtn.isEnabled = false
-        } else if videoClips.isEmpty {
-            autoFillStatusLabel.stringValue = "\(effective.description) • nessuna clip video nella selezione '\(sel.name)'."
-            autoFillStatusLabel.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
+            return
+        }
+
+        let forecast = model.previewAutoFill(
+            withSelectionTimeline: sel,
+            targetTrackIndex: 0,
+            overrideCages: effective.cages,
+            orderMode: currentOrderMode,
+            startFromPlayhead: activeStartPlayhead
+        )
+        let prioInfo = (forecast.p2Count > 0 || forecast.p3Count > 0)
+            ? " [P1:\(forecast.p1Count) • P2:\(forecast.p2Count) • P3:\(forecast.p3Count)]"
+            : ""
+        let startTag = activeStartPlayhead != nil ? " (da gabbia #\(forecast.startingCageNumber))" : ""
+        let lockTag = forecast.lockedCagesCount > 0 ? ", \(forecast.lockedCagesCount) protette" : ""
+
+        autoFillStatusLabel.stringValue = "Gabbie da riempire\(startTag): \(forecast.unlockedCagesCount) libere su \(forecast.totalTargetCages)\(lockTag)  •  Clip Selezione: \(forecast.selectionClipCount)\(prioInfo)"
+        autoFillStatusLabel.textColor = .white
+
+        if videoClips.isEmpty || forecast.unlockedCagesCount == 0 {
+            autoFillForecastLabel.stringValue = videoClips.isEmpty
+                ? "Nessuna clip video nella selezione '\(sel.name)'."
+                : "Nessuna gabbia libera nel range selezionato."
+            autoFillForecastLabel.textColor = .systemOrange
             autoFillBtn.isEnabled = false
         } else {
-            autoFillStatusLabel.stringValue = "\(effective.description) • \(videoClips.count) clip\(prioInfo) pronte da '\(sel.name)'."
-            autoFillStatusLabel.textColor = NSColor(calibratedWhite: 0.68, alpha: 1.0)
+            var parts: [String] = []
+            parts.append("\(forecast.predictedUniqueCount) uniche")
+            if forecast.predictedSubsegmentCount > 0 {
+                parts.append("\(forecast.predictedSubsegmentCount) sottospezzoni (Pass 2)")
+            }
+            if forecast.predictedEmptyCount > 0 {
+                parts.append("\(forecast.predictedEmptyCount) resteranno vuote")
+            }
+            let summaryPrefix = forecast.predictedFilledCount == forecast.unlockedCagesCount
+                ? "Copertura prevista: \(forecast.predictedFilledCount)/\(forecast.unlockedCagesCount) gabbie"
+                : "Copertura parziale: \(forecast.predictedFilledCount)/\(forecast.unlockedCagesCount) gabbie"
+            autoFillForecastLabel.stringValue = "\(summaryPrefix) (\(parts.joined(separator: " + ")))."
+            autoFillForecastLabel.textColor = forecast.predictedEmptyCount > 0 ? .systemOrange : .systemCyan
             autoFillBtn.isEnabled = true
         }
     }
@@ -728,8 +858,10 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
             tier = isAdaptive ? "Disteso" : "Solo Clou"
         } else if sens < 0.68 {
             tier = "Bilanciato"
-        } else {
+        } else if sens < 0.88 {
             tier = isAdaptive ? "Incisivo" : "Reattivo"
+        } else {
+            tier = isAdaptive ? "Frenetico" : "Massimo"
         }
         sensitivityValueLabel.stringValue = "\(tier) (\(pct)%)"
 
@@ -741,33 +873,6 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
         sensitivityValueLabel.textColor = active
             ? .systemOrange
             : NSColor(calibratedWhite: 0.45, alpha: 1.0)
-    }
-
-    private func buildTimelineCages(result: BeatAnalysisResult, clip: TimelineClip, mode: BeatIntervalMode) -> [RhythmicCage] {
-        let sens = model.peakSensitivity
-        let spd = clip.speed > 0 ? clip.speed : 1.0
-        if abs(spd - 1.0) < 0.0001 {
-            return AudioBeatDetector.shared.generateCages(
-                from: result,
-                mode: mode,
-                startTimeOffset: clip.timelineStart,
-                peakSensitivity: sens
-            )
-        }
-        let base = AudioBeatDetector.shared.generateCages(
-            from: result,
-            mode: mode,
-            startTimeOffset: .zero,
-            peakSensitivity: sens
-        )
-        let tStart = CMTimeGetSeconds(clip.timelineStart)
-        return base.map { cage in
-            RhythmicCage(
-                index: cage.index,
-                startSeconds: tStart + cage.startSeconds / spd,
-                durationSeconds: cage.durationSeconds / spd
-            )
-        }
     }
 
     private func updateCagesPreview() {
@@ -786,40 +891,21 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
             }
         }
 
-        switch targetMode {
-        case .timeline:
-            let cages = buildTimelineCages(result: res, clip: clip, mode: mode)
-            let avg = CMTimeGetSeconds(clip.duration) / Double(max(1, cages.count))
-            cagesPreviewLabel.stringValue = "Verranno create \(cages.count) gabbie sulla timeline (durata media ~\(String(format: "%.2f", avg))s)."
-        case .trackClip:
-            let cages = AudioBeatDetector.shared.generateCages(
-                from: res,
-                mode: mode,
-                startTimeOffset: clip.sourceIn,
-                peakSensitivity: model.peakSensitivity
-            )
-            let markerCount = cages.isEmpty ? 0 : cages.count + 1
-            let avg = CMTimeGetSeconds(clip.duration) / Double(max(1, cages.count))
-            let unit: String
-            switch mode {
-            case .dynamicTransients: unit = "picchi forti"
-            case .adaptiveDirector: unit = "tagli adattivi"
-            default: unit = "punti beat"
-            }
-            cagesPreviewLabel.stringValue = "Verranno segnati \(markerCount) \(unit) (\(cages.count) intervalli, ~\(String(format: "%.2f", avg))s) sul brano."
+        let cages = AudioBeatDetector.shared.generateCages(
+            from: res,
+            mode: mode,
+            startTimeOffset: clip.sourceIn,
+            peakSensitivity: model.peakSensitivity
+        )
+        let markerCount = cages.isEmpty ? 0 : cages.count + 1
+        let avg = CMTimeGetSeconds(clip.duration) / Double(max(1, cages.count))
+        let unit: String
+        switch mode {
+        case .dynamicTransients: unit = "picchi forti"
+        case .adaptiveDirector: unit = "tagli adattivi"
+        default: unit = "punti beat"
         }
-    }
-
-    @objc private func onTargetModeChanged() {
-        if let selected = TargetMode(rawValue: targetSegmented.selectedSegment) {
-            if selected == .trackClip && targetAudioClip == nil {
-                targetSegmented.selectedSegment = TargetMode.timeline.rawValue
-                targetMode = .timeline
-            } else {
-                targetMode = selected
-            }
-        }
-        refreshUIState()
+        cagesPreviewLabel.stringValue = "Segnerà \(markerCount) \(unit) (\(cages.count) intervalli, ~\(String(format: "%.2f", avg))s) sul brano."
     }
 
     @objc private func onAnalyzeClicked() {
@@ -841,20 +927,38 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
         updateAutoFillState()
     }
 
-    @objc private func onClearTimelineClicked() {
-        model.clearTimelineCages()
+    @objc private func onOrderModeChanged() {
+        updateAutoFillState()
+    }
+
+    @objc private func onStartModeChanged() {
+        updateAutoFillState()
+    }
+
+    @objc private func onClearBeatClicked() {
+        if let clip = currentTargetClip, !clip.beatMarkers.isEmpty {
+            model.setAudioClipBeatMarkers(clipId: clip.id, markers: [], bpm: nil)
+        }
+        if !model.rhythmicCages.isEmpty {
+            model.clearTimelineCages()
+        }
         onModified?()
-        lastFeedbackStatus = ("Gabbie sulla timeline rimosse.", .systemCyan)
-        DebugLogger.shared.log("Gabbie ritmate sulla timeline pulite dal pannello Montaggio Ritmico.", level: .info)
+        lastFeedbackStatus = ("Beat rimossi dal brano.", .systemOrange)
+        DebugLogger.shared.log("Beat automatici rimossi dal brano '\(currentTargetClip?.mediaItem.name ?? "-")'.", level: .info)
         refreshUIState()
     }
 
-    @objc private func onClearClipClicked() {
-        guard let clip = currentTargetClip else { return }
-        model.setAudioClipBeatMarkers(clipId: clip.id, markers: [], bpm: nil)
+    @objc private func onClearAllClicked() {
+        if let clip = currentTargetClip {
+            model.setAudioClipBeatMarkers(clipId: clip.id, markers: [], bpm: nil)
+            _ = model.clearMarkers(clipId: clip.id)
+        }
+        if !model.rhythmicCages.isEmpty {
+            model.clearTimelineCages()
+        }
         onModified?()
-        lastFeedbackStatus = ("Segni beat rimossi dal brano '\(clip.mediaItem.name)'.", .systemOrange)
-        DebugLogger.shared.log("Segni beat rimossi dal brano '\(clip.mediaItem.name)'.", level: .info)
+        lastFeedbackStatus = ("Beat e marcatori rimossi dal brano.", .systemOrange)
+        DebugLogger.shared.log("Pulizia completa beat e marcatori M su '\(currentTargetClip?.mediaItem.name ?? "-")'.", level: .info)
         refreshUIState()
     }
 
@@ -864,35 +968,23 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
         model.beatIntervalMode = mode
         model.peakSensitivity = max(0.0, min(1.0, sensitivitySlider.doubleValue))
 
-        switch targetMode {
-        case .timeline:
-            let cages = buildTimelineCages(result: res, clip: clip, mode: mode)
-            model.rhythmicCages = cages
-            model.detectedBPM = res.bpm
-            model.onModelChanged?()
-            onModified?()
-            lastFeedbackStatus = ("Applicate \(cages.count) gabbie sulla timeline.", .systemGreen)
-            DebugLogger.shared.log("Struttura musicale creata sulla timeline: \(cages.count) gabbie a \(Int(res.bpm.rounded())) BPM.", level: .info)
-
-        case .trackClip:
-            let sourceCages = AudioBeatDetector.shared.generateCages(
-                from: res,
-                mode: mode,
-                startTimeOffset: clip.sourceIn,
-                peakSensitivity: model.peakSensitivity
-            )
-            let sOut = CMTimeGetSeconds(clip.sourceOut)
-            var markers: [Double] = sourceCages.map { min($0.startSeconds, sOut) }
-            if let last = sourceCages.last {
-                markers.append(min(last.endSeconds, sOut))
-            }
-            model.rhythmicCages = []
-            model.detectedBPM = nil
-            model.setAudioClipBeatMarkers(clipId: clip.id, markers: markers, bpm: res.bpm)
-            onModified?()
-            lastFeedbackStatus = ("Segnati \(markers.count) punti su '\(clip.mediaItem.name)'.", .systemGreen)
-            DebugLogger.shared.log("Segnati \(markers.count) punti sul brano '\(clip.mediaItem.name)' (\(Int(res.bpm.rounded())) BPM).", level: .info)
+        let sourceCages = AudioBeatDetector.shared.generateCages(
+            from: res,
+            mode: mode,
+            startTimeOffset: clip.sourceIn,
+            peakSensitivity: model.peakSensitivity
+        )
+        let sOut = CMTimeGetSeconds(clip.sourceOut)
+        var markers: [Double] = sourceCages.map { min($0.startSeconds, sOut) }
+        if let last = sourceCages.last {
+            markers.append(min(last.endSeconds, sOut))
         }
+        model.rhythmicCages = []
+        model.detectedBPM = nil
+        model.setAudioClipBeatMarkers(clipId: clip.id, markers: markers, bpm: res.bpm)
+        onModified?()
+        lastFeedbackStatus = ("Segnati \(markers.count) punti su '\(clip.mediaItem.name)'.", .systemGreen)
+        DebugLogger.shared.log("Segnati \(markers.count) punti sul brano '\(clip.mediaItem.name)' (\(Int(res.bpm.rounded())) BPM).", level: .info)
 
         refreshUIState()
     }
@@ -912,7 +1004,8 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
             withSelectionTimeline: sel,
             targetTrackIndex: 0,
             overrideCages: effective.cages,
-            orderMode: currentOrderMode
+            orderMode: currentOrderMode,
+            startFromPlayhead: activeStartPlayhead
         )
         onModified?()
         var detailParts = ["\(result.primaryUniqueCount) uniche"]
@@ -920,8 +1013,10 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
         if result.lockedCagesCount > 0 { detailParts.append("\(result.lockedCagesCount) bloccate") }
         if result.movedAudioToA2 { detailParts.append("traccia audio -> A2") }
         if result.remainingEmptyCages > 0 { detailParts.append("\(result.remainingEmptyCages) vuote") }
-        autoFillStatusLabel.stringValue = "Auto-Fill: \(result.filledCount)/\(result.totalUnlockedCages) gabbie (\(detailParts.joined(separator: ", ")))."
+        autoFillStatusLabel.stringValue = "Applicato: \(result.filledCount)/\(result.totalUnlockedCages) gabbie (\(detailParts.joined(separator: ", ")))."
         autoFillStatusLabel.textColor = result.filledCount > 0 ? .systemGreen : .systemOrange
+        autoFillForecastLabel.stringValue = "Modalità Montaggio Gabbie ATTIVA in timeline (Riordina, Tab+Drag Slip, R / ⌘R Slow-Mo, E / ⌫ Scarto)."
+        autoFillForecastLabel.textColor = .systemCyan
     }
 
     @objc private func onCloseClicked() {
@@ -929,6 +1024,12 @@ public final class BeatAnalysisDialog: NSViewController, NSWindowDelegate {
     }
 
     public func windowWillClose(_ notification: Notification) {
-        NSApp.stopModal()
+        if let closedPanel = notification.object as? NSPanel, closedPanel === BeatAnalysisDialog.activeBeatFinderPanel {
+            BeatAnalysisDialog.activeBeatFinderPanel = nil
+            BeatAnalysisDialog.activeBeatFinderController = nil
+        }
+        if isModalSession {
+            NSApp.stopModal()
+        }
     }
 }

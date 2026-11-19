@@ -34,8 +34,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func openEditor(with doc: ProjectDocumentData) {
         let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let targetW = min(1440, max(950, floor(visibleFrame.width * 0.88)))
-        let targetH = min(900, max(600, floor(visibleFrame.height * 0.86)))
 
         let win: NSWindow
         if let existingWin = self.window, let editorVC = existingWin.contentViewController as? MainEditorViewController {
@@ -43,7 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             editorVC.restoreProjectFromSnapshot(doc)
         } else {
             win = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: targetW, height: targetH),
+                contentRect: visibleFrame,
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
                 defer: false
@@ -57,14 +55,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             win.contentViewController = editorVC
             self.window = win
 
-            let clampedW = min(targetW, visibleFrame.width)
-            let clampedH = min(targetH, visibleFrame.height)
-            win.setFrame(NSRect(
-                x: visibleFrame.origin.x + floor((visibleFrame.width - clampedW) / 2.0),
-                y: visibleFrame.origin.y + floor((visibleFrame.height - clampedH) / 2.0),
-                width: clampedW,
-                height: clampedH
-            ), display: true)
+            // Apri a finestra massimizzata ("pieno schermo" senza entrare in Space fullscreen)
+            win.setFrame(visibleFrame, display: true)
         }
 
         win.makeKeyAndOrderFront(nil)
@@ -86,6 +78,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let editor = window?.contentViewController as? MainEditorViewController {
+            editor.saveCurrentStateImmediately()
+        }
     }
 
     @objc func menuOpenProjectManager() {
@@ -117,6 +115,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func menuToggleHistory() {
         if let editor = window?.contentViewController as? MainEditorViewController {
             editor.toggleHistoryPopover()
+        }
+    }
+
+    @objc func menuCut() {
+        if NSApp.keyWindow?.firstResponder is NSTextView {
+            NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: nil)
+            return
+        }
+        if let editor = window?.contentViewController as? MainEditorViewController {
+            editor.performCut()
+        }
+    }
+
+    @objc func menuCopy() {
+        if NSApp.keyWindow?.firstResponder is NSTextView {
+            NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil)
+            return
+        }
+        if let editor = window?.contentViewController as? MainEditorViewController {
+            editor.performCopy()
+        }
+    }
+
+    @objc func menuPaste() {
+        if NSApp.keyWindow?.firstResponder is NSTextView {
+            NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
+            return
+        }
+        if let editor = window?.contentViewController as? MainEditorViewController {
+            editor.performPaste()
         }
     }
 
@@ -157,9 +185,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(redoItem)
         editMenu.addItem(withTitle: "Cronologia Azioni...", action: #selector(menuToggleHistory), keyEquivalent: "y")
         editMenu.addItem(NSMenuItem.separator())
-        editMenu.addItem(withTitle: "Taglia", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-        editMenu.addItem(withTitle: "Copia", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        editMenu.addItem(withTitle: "Incolla", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Taglia", action: #selector(menuCut), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copia", action: #selector(menuCopy), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Incolla", action: #selector(menuPaste), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Elimina", action: #selector(NSText.delete(_:)), keyEquivalent: "")
         editMenuItem.submenu = editMenu
 

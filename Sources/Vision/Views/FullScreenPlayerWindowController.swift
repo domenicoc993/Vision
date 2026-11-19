@@ -172,7 +172,10 @@ public final class FullScreenPlayerWindowController: NSWindowController {
     private func setupBindings() {
         playbackController.addTimeObserver(self) { [weak self] time in
             guard let self = self, !self.isScrubbing else { return }
-            self.timecodeLabel.stringValue = self.playbackController.formattedCurrentTime
+            let formatted = self.playbackController.formattedCurrentTime
+            if self.timecodeLabel.stringValue != formatted {
+                self.timecodeLabel.stringValue = formatted
+            }
             self.timeSlider.doubleValue = CMTimeGetSeconds(time)
         }
 
@@ -182,17 +185,17 @@ public final class FullScreenPlayerWindowController: NSWindowController {
         }
 
         updateLUTFilter()
-        LUTEngine.shared.onLUTStateChanged = { [weak self] in
-            DispatchQueue.main.async {
-                self?.updateLUTFilter()
-            }
+        NotificationCenter.default.addObserver(
+            forName: LUTEngine.stateChangedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateLUTFilter()
         }
     }
 
     private func updateLUTFilter() {
-        if let filter = LUTEngine.shared.activeFilter() {
-            playerView.layer?.filters = [filter]
-        } else {
+        if !(playerView.layer?.filters?.isEmpty ?? true) {
             playerView.layer?.filters = []
         }
         lutButton.isToggleActive = LUTEngine.shared.isEnabled

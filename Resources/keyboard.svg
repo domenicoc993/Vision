@@ -1,0 +1,470 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="100%" height="100%" viewBox="0 0 1644 474" version="1.1" xmlns="http://www.w3.org/2000/svg">
+    <rect id="keyboard-chassis" x="4" y="4" width="1636" height="466" rx="22" ry="22" fill="#1F232B" stroke="#353B48" stroke-width="1.8"/>
+    <rect id="tray-kbd-main" x="15" y="19" width="1038.5" height="434" rx="10" ry="10" fill="#101217" stroke="#272C36" stroke-width="1.5"/>
+    <rect id="tray-kbd-nav-top" x="1089.5" y="19" width="216" height="70" rx="10" ry="10" fill="#101217" stroke="#272C36" stroke-width="1.5"/>
+    <rect id="tray-kbd-nav-mid" x="1089.5" y="97" width="216" height="146" rx="10" ry="10" fill="#101217" stroke="#272C36" stroke-width="1.5"/>
+    <rect id="tray-kbd-numpad" x="1341.5" y="97" width="286" height="356" rx="10" ry="10" fill="#101217" stroke="#272C36" stroke-width="1.5"/>
+    <g id="key-esc">
+        <rect x="22" y="26" width="72" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="58" y="46.72" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="15" font-weight="600" fill="#D8DFE9">⎋</text>
+        <text x="58" y="67.44" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">esc</text>
+    </g>
+    <g id="key-f1">
+        <rect x="122.5" y="26" width="64" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="154.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14.5" font-weight="600" fill="#D8DFE9">F1</text>
+    </g>
+    <g id="key-f2">
+        <rect x="194.5" y="26" width="64" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="226.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14.5" font-weight="600" fill="#D8DFE9">F2</text>
+    </g>
+    <g id="key-f3">
+        <rect x="266.5" y="26" width="64" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="298.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14.5" font-weight="600" fill="#D8DFE9">F3</text>
+    </g>
+    <g id="key-f4">
+        <rect x="338.5" y="26" width="64" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="370.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14.5" font-weight="600" fill="#D8DFE9">F4</text>
+    </g>
+    <g id="key-f5">
+        <rect x="444.5" y="26" width="64" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="476.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14.5" font-weight="600" fill="#D8DFE9">F5</text>
+    </g>
+    <g id="key-f6">
+        <rect x="516.5" y="26" width="64" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="548.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14.5" font-weight="600" fill="#D8DFE9">F6</text>
+    </g>
+    <g id="key-f7">
+        <rect x="588.5" y="26" width="64" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="620.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14.5" font-weight="600" fill="#D8DFE9">F7</text>
+    </g>
+    <g id="key-f8">
+        <rect x="660.5" y="26" width="64" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="692.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14.5" font-weight="600" fill="#D8DFE9">F8</text>
+    </g>
+    <g id="key-f9">
+        <rect x="766.5" y="26" width="64" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="798.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14.5" font-weight="600" fill="#D8DFE9">F9</text>
+    </g>
+    <g id="key-f10">
+        <rect x="838.5" y="26" width="64" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="870.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14.5" font-weight="600" fill="#D8DFE9">F10</text>
+    </g>
+    <g id="key-f11">
+        <rect x="910.5" y="26" width="64" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="942.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14.5" font-weight="600" fill="#D8DFE9">F11</text>
+    </g>
+    <g id="key-f12">
+        <rect x="982.5" y="26" width="64" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1014.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14.5" font-weight="600" fill="#D8DFE9">F12</text>
+    </g>
+    <g id="key-backslash">
+        <rect x="22" y="104" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="53" y="123.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">|</text>
+        <text x="53" y="146.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">\</text>
+    </g>
+    <g id="key-1">
+        <rect x="92" y="104" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="123" y="123.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">!</text>
+        <text x="123" y="146.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">1</text>
+    </g>
+    <g id="key-2">
+        <rect x="162" y="104" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="193" y="123.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">&quot;</text>
+        <text x="193" y="146.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">2</text>
+    </g>
+    <g id="key-3">
+        <rect x="232" y="104" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="263" y="123.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">£</text>
+        <text x="263" y="146.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">3</text>
+    </g>
+    <g id="key-4">
+        <rect x="302" y="104" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="333" y="123.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">$</text>
+        <text x="333" y="146.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">4</text>
+    </g>
+    <g id="key-5">
+        <rect x="372" y="104" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="403" y="123.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">%</text>
+        <text x="403" y="146.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">5</text>
+    </g>
+    <g id="key-6">
+        <rect x="442" y="104" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="473" y="123.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">&amp;</text>
+        <text x="473" y="146.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">6</text>
+    </g>
+    <g id="key-7">
+        <rect x="512" y="104" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="543" y="123.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">/</text>
+        <text x="543" y="146.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">7</text>
+    </g>
+    <g id="key-8">
+        <rect x="582" y="104" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="613" y="123.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">(</text>
+        <text x="613" y="146.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">8</text>
+    </g>
+    <g id="key-9">
+        <rect x="652" y="104" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="683" y="123.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">)</text>
+        <text x="683" y="146.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">9</text>
+    </g>
+    <g id="key-0">
+        <rect x="722" y="104" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="753" y="123.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">=</text>
+        <text x="753" y="146.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">0</text>
+    </g>
+    <g id="key-apostrophe">
+        <rect x="792" y="104" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="823" y="123.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">?</text>
+        <text x="823" y="146.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">&#x27;</text>
+    </g>
+    <g id="key-i-grave">
+        <rect x="862" y="104" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="893" y="123.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">^</text>
+        <text x="893" y="146.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">ì</text>
+    </g>
+    <g id="key-backspace">
+        <rect x="932" y="104" width="114.5" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="989.25" y="126.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#D8DFE9">⌫</text>
+        <text x="989.25" y="149.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">delete</text>
+    </g>
+    <g id="key-tab">
+        <rect x="22" y="174" width="96" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="70" y="196.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#D8DFE9">⇥</text>
+        <text x="70" y="219.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">tab</text>
+    </g>
+    <g id="key-q">
+        <rect x="126" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="157" y="205" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">Q</text>
+    </g>
+    <g id="key-w">
+        <rect x="196" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="227" y="205" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">W</text>
+    </g>
+    <g id="key-e">
+        <rect x="266" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="297" y="205" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">E</text>
+    </g>
+    <g id="key-r">
+        <rect x="336" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="367" y="205" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">R</text>
+    </g>
+    <g id="key-t">
+        <rect x="406" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="437" y="205" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">T</text>
+    </g>
+    <g id="key-y">
+        <rect x="476" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="507" y="205" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">Y</text>
+    </g>
+    <g id="key-u">
+        <rect x="546" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="577" y="205" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">U</text>
+    </g>
+    <g id="key-i">
+        <rect x="616" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="647" y="205" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">I</text>
+    </g>
+    <g id="key-o">
+        <rect x="686" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="717" y="205" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">O</text>
+    </g>
+    <g id="key-p">
+        <rect x="756" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="787" y="205" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">P</text>
+    </g>
+    <g id="key-e-grave">
+        <rect x="826" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="857" y="193.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">é</text>
+        <text x="857" y="216.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">è</text>
+    </g>
+    <g id="key-plus">
+        <rect x="896" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="927" y="193.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">*</text>
+        <text x="927" y="216.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">+</text>
+    </g>
+    <g id="key-caps-lock">
+        <rect x="22" y="244" width="114" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="79" y="266.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#D8DFE9">⇪</text>
+        <text x="79" y="289.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">caps lock</text>
+    </g>
+    <g id="key-a">
+        <rect x="144" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="175" y="275" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">A</text>
+    </g>
+    <g id="key-s">
+        <rect x="214" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="245" y="275" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">S</text>
+    </g>
+    <g id="key-d">
+        <rect x="284" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="315" y="275" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">D</text>
+    </g>
+    <g id="key-f">
+        <rect x="354" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="385" y="275" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">F</text>
+    </g>
+    <g id="key-g">
+        <rect x="424" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="455" y="275" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">G</text>
+    </g>
+    <g id="key-h">
+        <rect x="494" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="525" y="275" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">H</text>
+    </g>
+    <g id="key-j">
+        <rect x="564" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="595" y="275" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">J</text>
+    </g>
+    <g id="key-k">
+        <rect x="634" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="665" y="275" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">K</text>
+    </g>
+    <g id="key-l">
+        <rect x="704" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="735" y="275" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">L</text>
+    </g>
+    <g id="key-o-grave">
+        <rect x="774" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="805" y="263.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">ç</text>
+        <text x="805" y="286.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">ò</text>
+    </g>
+    <g id="key-a-grave">
+        <rect x="844" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="875" y="263.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">°</text>
+        <text x="875" y="286.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">à</text>
+    </g>
+    <g id="key-u-grave">
+        <rect x="914" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="945" y="263.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">§</text>
+        <text x="945" y="286.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">ù</text>
+    </g>
+    <g id="key-enter-main">
+        <path d="M 973,174 L 1039.5,174 Q 1046.5,174 1046.5,181 L 1046.5,299 Q 1046.5,306 1039.5,306 L 991,306 Q 984,306 984,299 L 984,243 Q 984,236 977,236 L 973,236 Q 966,236 966,229 L 966,181 Q 966,174 973,174 Z" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1015.25" y="228" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#D8DFE9">↩</text>
+        <text x="1015.25" y="253" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">invio</text>
+    </g>
+    <g id="key-shift-left">
+        <rect x="22" y="314" width="96" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="70" y="336.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#D8DFE9">⇧</text>
+        <text x="70" y="359.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">shift</text>
+    </g>
+    <g id="key-iso-extra">
+        <rect x="126" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="157" y="333.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">&gt;</text>
+        <text x="157" y="356.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">&lt;</text>
+    </g>
+    <g id="key-z">
+        <rect x="196" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="227" y="345" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">Z</text>
+    </g>
+    <g id="key-x">
+        <rect x="266" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="297" y="345" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">X</text>
+    </g>
+    <g id="key-c">
+        <rect x="336" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="367" y="345" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">C</text>
+    </g>
+    <g id="key-v">
+        <rect x="406" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="437" y="345" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">V</text>
+    </g>
+    <g id="key-b">
+        <rect x="476" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="507" y="345" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">B</text>
+    </g>
+    <g id="key-n">
+        <rect x="546" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="577" y="345" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">N</text>
+    </g>
+    <g id="key-m">
+        <rect x="616" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="647" y="345" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">M</text>
+    </g>
+    <g id="key-comma">
+        <rect x="686" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="717" y="333.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">;</text>
+        <text x="717" y="356.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">,</text>
+    </g>
+    <g id="key-period">
+        <rect x="756" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="787" y="333.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">:</text>
+        <text x="787" y="356.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">.</text>
+    </g>
+    <g id="key-minus">
+        <rect x="826" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="857" y="333.22" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="11.5" font-weight="600" fill="#949EB0">_</text>
+        <text x="857" y="356.78" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">-</text>
+    </g>
+    <g id="key-shift-right">
+        <rect x="896" y="314" width="150.5" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="971.25" y="336.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#D8DFE9">⇧</text>
+        <text x="971.25" y="359.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">shift</text>
+    </g>
+    <g id="key-fn">
+        <rect x="22" y="384" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="53" y="415" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14" font-weight="600" fill="#D8DFE9">fn</text>
+    </g>
+    <g id="key-ctrl-left">
+        <rect x="92" y="384" width="72" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="128" y="406.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="15.5" font-weight="600" fill="#D8DFE9">⌃</text>
+        <text x="128" y="429.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">control</text>
+    </g>
+    <g id="key-opt-left">
+        <rect x="172" y="384" width="72" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="208" y="406.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="15.5" font-weight="600" fill="#D8DFE9">⌥</text>
+        <text x="208" y="429.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">option</text>
+    </g>
+    <g id="key-cmd-left">
+        <rect x="252" y="384" width="85" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="294.5" y="406.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="15.5" font-weight="600" fill="#D8DFE9">⌘</text>
+        <text x="294.5" y="429.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">command</text>
+    </g>
+    <g id="key-space">
+        <rect x="345" y="384" width="440" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="565" y="415" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="12" font-weight="600" fill="#EEF2F8">spazio</text>
+    </g>
+    <g id="key-cmd-right">
+        <rect x="793" y="384" width="85" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="835.5" y="406.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="15.5" font-weight="600" fill="#D8DFE9">⌘</text>
+        <text x="835.5" y="429.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">command</text>
+    </g>
+    <g id="key-opt-right">
+        <rect x="886" y="384" width="76" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="924" y="406.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="15.5" font-weight="600" fill="#D8DFE9">⌥</text>
+        <text x="924" y="429.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">option</text>
+    </g>
+    <g id="key-ctrl-right">
+        <rect x="970" y="384" width="76.5" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1008.25" y="406.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="15.5" font-weight="600" fill="#D8DFE9">⌃</text>
+        <text x="1008.25" y="429.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">control</text>
+    </g>
+    <g id="key-f13">
+        <rect x="1096.5" y="26" width="62" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1127.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14" font-weight="600" fill="#D8DFE9">F13</text>
+    </g>
+    <g id="key-f14">
+        <rect x="1166.5" y="26" width="62" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1197.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14" font-weight="600" fill="#D8DFE9">F14</text>
+    </g>
+    <g id="key-f15">
+        <rect x="1236.5" y="26" width="62" height="56" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1267.5" y="54" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="14" font-weight="600" fill="#D8DFE9">F15</text>
+    </g>
+    <g id="key-nav-ins">
+        <rect x="1096.5" y="104" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1127.5" y="135" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="13" font-weight="600" fill="#D8DFE9">ins</text>
+    </g>
+    <g id="key-home">
+        <rect x="1166.5" y="104" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1197.5" y="126.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="15" font-weight="600" fill="#D8DFE9">↖</text>
+        <text x="1197.5" y="149.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">home</text>
+    </g>
+    <g id="key-page-up">
+        <rect x="1236.5" y="104" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1267.5" y="126.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="15" font-weight="600" fill="#D8DFE9">⇞</text>
+        <text x="1267.5" y="149.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">pag ↑</text>
+    </g>
+    <g id="key-forward-delete">
+        <rect x="1096.5" y="174" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1127.5" y="196.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="15" font-weight="600" fill="#D8DFE9">⌦</text>
+        <text x="1127.5" y="219.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">canc</text>
+    </g>
+    <g id="key-end">
+        <rect x="1166.5" y="174" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1197.5" y="196.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="15" font-weight="600" fill="#D8DFE9">↘</text>
+        <text x="1197.5" y="219.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">fine</text>
+    </g>
+    <g id="key-page-down">
+        <rect x="1236.5" y="174" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1267.5" y="196.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="15" font-weight="600" fill="#D8DFE9">⇟</text>
+        <text x="1267.5" y="219.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">pag ↓</text>
+    </g>
+    <g id="key-arrow-up">
+        <rect x="1166.5" y="314" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1197.5" y="345" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="13.5" font-weight="600" fill="#D8DFE9">▲</text>
+    </g>
+    <g id="key-arrow-left">
+        <rect x="1096.5" y="384" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1127.5" y="415" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="13.5" font-weight="600" fill="#D8DFE9">◀</text>
+    </g>
+    <g id="key-arrow-down">
+        <rect x="1166.5" y="384" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1197.5" y="415" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="13.5" font-weight="600" fill="#D8DFE9">▼</text>
+    </g>
+    <g id="key-arrow-right">
+        <rect x="1236.5" y="384" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1267.5" y="415" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="13.5" font-weight="600" fill="#D8DFE9">▶</text>
+    </g>
+    <g id="key-numpad-clear">
+        <rect x="1348.5" y="104" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1379.5" y="126.94" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="15" font-weight="600" fill="#D8DFE9">⌧</text>
+        <text x="1379.5" y="149.88" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">clear</text>
+    </g>
+    <g id="key-numpad-div">
+        <rect x="1418.5" y="104" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1449.5" y="135" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="16" font-weight="600" fill="#D8DFE9">/</text>
+    </g>
+    <g id="key-numpad-mul">
+        <rect x="1488.5" y="104" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1519.5" y="135" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#D8DFE9">*</text>
+    </g>
+    <g id="key-numpad-minus">
+        <rect x="1558.5" y="104" width="62" height="62" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1589.5" y="135" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#D8DFE9">−</text>
+    </g>
+    <g id="key-numpad-7">
+        <rect x="1348.5" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="1379.5" y="205" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">7</text>
+    </g>
+    <g id="key-numpad-8">
+        <rect x="1418.5" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="1449.5" y="205" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">8</text>
+    </g>
+    <g id="key-numpad-9">
+        <rect x="1488.5" y="174" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="1519.5" y="205" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">9</text>
+    </g>
+    <g id="key-numpad-4">
+        <rect x="1348.5" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="1379.5" y="275" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">4</text>
+    </g>
+    <g id="key-numpad-5">
+        <rect x="1418.5" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="1449.5" y="275" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">5</text>
+    </g>
+    <g id="key-numpad-6">
+        <rect x="1488.5" y="244" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="1519.5" y="275" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">6</text>
+    </g>
+    <g id="key-numpad-1">
+        <rect x="1348.5" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="1379.5" y="345" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">1</text>
+    </g>
+    <g id="key-numpad-2">
+        <rect x="1418.5" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="1449.5" y="345" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">2</text>
+    </g>
+    <g id="key-numpad-3">
+        <rect x="1488.5" y="314" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="1519.5" y="345" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">3</text>
+    </g>
+    <g id="key-numpad-plus">
+        <rect x="1558.5" y="174" width="62" height="132" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1589.5" y="240" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#D8DFE9">+</text>
+    </g>
+    <g id="key-numpad-enter">
+        <rect x="1558.5" y="314" width="62" height="132" rx="7" ry="7" fill="#343A47" stroke="#4A5263" stroke-width="1.5"/>
+        <text x="1589.5" y="362.84" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17" font-weight="600" fill="#D8DFE9">⌤</text>
+        <text x="1589.5" y="411.68" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="10.5" font-weight="600" fill="#949EB0">invio</text>
+    </g>
+    <g id="key-numpad-0">
+        <rect x="1348.5" y="384" width="132" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="1414.5" y="415" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">0</text>
+    </g>
+    <g id="key-numpad-decimal">
+        <rect x="1488.5" y="384" width="62" height="62" rx="7" ry="7" fill="#242934" stroke="#3A4050" stroke-width="1.5"/>
+        <text x="1519.5" y="415" text-anchor="middle" dominant-baseline="central" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Helvetica, sans-serif" font-size="17.5" font-weight="600" fill="#EEF2F8">,</text>
+    </g>
+</svg>

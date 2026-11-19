@@ -461,6 +461,7 @@ public final class VisionMenu: NSObject {
         menuPanel.contentView = scroll
         self.panel = menuPanel
 
+        parentWindow?.addChildWindow(menuPanel, ordered: .above)
         menuPanel.orderFrontRegardless()
 
         if parentMenu == nil {
@@ -520,9 +521,7 @@ public final class VisionMenu: NSObject {
     private func handleRowActivate(_ row: VisionMenuRowView) {
         guard case .action(_, _, _, _, _, let isEnabled, _, let handler) = row.item, isEnabled else { return }
         rootMenu.dismissAll()
-        DispatchQueue.main.async {
-            handler?()
-        }
+        handler?()
     }
 
     private var rootMenu: VisionMenu {
@@ -531,10 +530,58 @@ public final class VisionMenu: NSObject {
         return cur
     }
 
+    private func menuOwning(_ window: NSWindow?) -> VisionMenu? {
+        guard let window = window else { return nil }
+        if panel === window { return self }
+        return childSubmenu?.menuOwning(window)
+    }
+
     private func ownsWindow(_ window: NSWindow?) -> Bool {
-        guard let window = window else { return false }
-        if panel === window { return true }
-        return childSubmenu?.ownsWindow(window) ?? false
+        menuOwning(window) != nil
+    }
+
+    private func hitRowView(atWindowPoint windowPoint: NSPoint) -> VisionMenuRowView? {
+        guard let contentView = panel?.contentView else { return nil }
+        // `NSView.hitTest(_:)` expects a point in `contentView.superview`'s coordinate space
+        // (matching `windowPoint` directly; converting into flipped `NSScrollView` beforehand would double-flip Y).
+        let ptInSuperview = contentView.superview?.convert(windowPoint, from: nil) ?? windowPoint
+        var hit: NSView? = contentView.hitTest(ptInSuperview)
+        while let v = hit {
+            if let rowView = v as? VisionMenuRowView {
+                return rowView
+            }
+            hit = v.superview
+        }
+        return nil
+    }
+
+    public static func testHitItemTitle(titles: [String], clickingVisualRowAt index: Int, parentWindow: NSWindow) -> String? {
+        guard index >= 0 && index < titles.count else { return nil }
+        let items: [VisionMenuItem] = titles.map { .action(title: $0) }
+        let menu = VisionMenu(items: items)
+        menu.present(
+            nearScreenRect: NSRect(x: 100, y: 500, width: 140, height: 26),
+            preferBelow: true,
+            minWidth: 140,
+            parentWindow: parentWindow,
+            onClose: nil
+        )
+        defer { menu.dismissAll() }
+        menu.panel?.contentView?.layoutSubtreeIfNeeded()
+        // Sort rowViews visually from top of screen (maxY in window coords) to bottom
+        let visualTopToBottom = menu.rowViews.sorted {
+            let y0 = $0.convert($0.bounds, to: nil).midY
+            let y1 = $1.convert($1.bounds, to: nil).midY
+            return y0 > y1
+        }
+        guard index < visualTopToBottom.count else { return nil }
+        let targetRow = visualTopToBottom[index]
+        let windowPt = targetRow.convert(NSPoint(x: targetRow.bounds.midX, y: targetRow.bounds.midY), to: nil)
+        guard let hitRow = menu.hitRowView(atWindowPoint: windowPt) else { return nil }
+        if case .action(let title, _, _, _, _, _, _, _) = hitRow.item {
+            return title
+        }
+        return nil
     }
 
     private func installDismissMonitor() {
@@ -548,7 +595,14 @@ public final class VisionMenu: NSObject {
                 }
                 return event
             }
-            if !self.ownsWindow(event.window) {
+            if let owningMenu = self.menuOwning(event.window) {
+                if NSApp.modalWindow != nil,
+                   event.type == .leftMouseDown,
+                   let rowView = owningMenu.hitRowView(atWindowPoint: event.locationInWindow) {
+                    rowView.mouseDown(with: event)
+                    return nil
+                }
+            } else {
                 self.dismissAll()
             }
             return event
@@ -565,7 +619,10 @@ public final class VisionMenu: NSObject {
     private func dismissPanelOnly() {
         childSubmenu?.dismissPanelOnly()
         childSubmenu = nil
-        panel?.orderOut(nil)
+        if let p = panel {
+            p.parent?.removeChildWindow(p)
+            p.orderOut(nil)
+        }
         panel = nil
     }
 
@@ -731,8 +788,10 @@ public final class VisionDropdownButton: NSView {
         bgButton.isEnabled = isEnabled
         titleLabel.textColor = isEnabled ? .white : NSColor(calibratedWhite: 0.45, alpha: 1.0)
         chevronView.image = Lucide.image(.chevronDown, size: 13, color: isEnabled ? NSColor(calibratedWhite: 0.68, alpha: 1.0) : NSColor(calibratedWhite: 0.35, alpha: 1.0))
+        layer?.backgroundColor = isEnabled ? NSColor(calibratedWhite: 0.145, alpha: 1.0).cgColor : NSColor(calibratedWhite: 0.11, alpha: 1.0).cgColor
         layer?.borderColor = NSColor.white.withAlphaComponent(isEnabled ? 0.14 : 0.06).cgColor
         updateLeadingIcon()
+        needsDisplay = true
     }
 
     @objc private func onClicked() {

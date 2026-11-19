@@ -3,7 +3,7 @@ import AVFoundation
 
 public struct TimelineClip: Identifiable, Hashable {
     public let id: UUID
-    public let mediaItem: MediaItem
+    public var mediaItem: MediaItem
     public var sourceIn: CMTime
     public var sourceOut: CMTime
     public var timelineStart: CMTime
@@ -20,6 +20,8 @@ public struct TimelineClip: Identifiable, Hashable {
     public var markers: [Double] // Marcatori manuali dell'utente (secondi sorgente, audio e video)
     public var priority: Int? // Priorità in Selezione: 1 = Hero, 2 = Buona, 3 = Filler, nil = nessuna
     public var isLocked: Bool // Lock manuale della clip in timeline (preservata in Auto-Fill e cancellazione)
+    public var selectionSourceIn: Double? // Limite sinistro estratto in Selezione (per Slip/Roll in Modalità Gabbie)
+    public var selectionSourceOut: Double? // Limite destro estratto in Selezione (per Slip/Roll in Modalità Gabbie)
 
     public init(
         id: UUID = UUID(),
@@ -39,7 +41,9 @@ public struct TimelineClip: Identifiable, Hashable {
         beatBPM: Double? = nil,
         markers: [Double] = [],
         priority: Int? = nil,
-        isLocked: Bool = false
+        isLocked: Bool = false,
+        selectionSourceIn: Double? = nil,
+        selectionSourceOut: Double? = nil
     ) {
         self.id = id
         self.mediaItem = mediaItem
@@ -59,6 +63,16 @@ public struct TimelineClip: Identifiable, Hashable {
         self.markers = markers
         self.priority = priority
         self.isLocked = isLocked
+        self.selectionSourceIn = selectionSourceIn
+        self.selectionSourceOut = selectionSourceOut
+    }
+
+    /// Limiti sorgente disponibili (in Selezione se tracciati, altrimenti intera durata media).
+    public var effectiveSourceBounds: (minSec: Double, maxSec: Double) {
+        let total = max(0.0, CMTimeGetSeconds(mediaItem.duration))
+        let lo = max(0.0, min(total, selectionSourceIn ?? 0.0))
+        let hi = max(lo, min(total, selectionSourceOut ?? total))
+        return (lo, hi)
     }
 
     private func mapSourceMarkersToTimeline(_ sourceMarkers: [Double]) -> [Double] {

@@ -90,6 +90,14 @@ if [[ -f "$PROJECT_DIR/Resources/AppIcon.icns" ]]; then
     cp "$PROJECT_DIR/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 fi
 
+# Diagrammi vettoriali Tastiera & Speed Editor (SVG interattivi)
+if [[ -f "$PROJECT_DIR/Resources/keyboard.svg" ]]; then
+    cp "$PROJECT_DIR/Resources/keyboard.svg" "$APP_BUNDLE/Contents/Resources/keyboard.svg"
+fi
+if [[ -f "$PROJECT_DIR/Resources/speed_editor.svg" ]]; then
+    cp "$PROJECT_DIR/Resources/speed_editor.svg" "$APP_BUNDLE/Contents/Resources/speed_editor.svg"
+fi
+
 # Modelli CoreML / risorse ML per Beat Detection
 if [[ -d "$PROJECT_DIR/Resources/Models" ]]; then
     echo "    Copia modelli ML in Contents/Resources/Models..."

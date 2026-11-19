@@ -1,9 +1,11 @@
 import AppKit
+import CoreMedia
 
 public enum GridCardItem: Equatable {
     case timeline(TimelineModel, index: Int)
     case folder(MediaFolder)
     case media(MediaItem)
+    case musicTrack(MusicLibraryTrack)
 
     public static func == (lhs: GridCardItem, rhs: GridCardItem) -> Bool {
         switch (lhs, rhs) {
@@ -13,6 +15,8 @@ public enum GridCardItem: Equatable {
             return f1.id == f2.id
         case (.media(let m1), .media(let m2)):
             return m1.id == m2.id
+        case (.musicTrack(let tr1), .musicTrack(let tr2)):
+            return tr1.id == tr2.id
         default:
             return false
         }
@@ -23,6 +27,7 @@ public enum GridCardItem: Equatable {
         case .timeline(let t, _): return t.id
         case .folder(let f): return f.id
         case .media(let m): return m.id
+        case .musicTrack(let tr): return tr.stableUUID
         }
     }
 }
@@ -45,8 +50,13 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
     public var onOrientationChanged: ((ClipOrientation) -> Void)?
     public var onMoveToFolder: ((UUID?) -> Void)?
     public var getAllSelectedItems: (() -> [MediaItem])?
+    public var getAllSelectedMusicTracks: (() -> [MusicLibraryTrack])?
     public var onInsertToTimeline: (() -> Void)?
     public var onDeleteFromPool: (() -> Void)?
+    public var getSelectedDeletableCount: (() -> Int)?
+    public var onDeleteSelectedFromPool: (() -> Void)?
+    public var onInsertMusicTrack: ((MusicLibraryTrack) -> Void)?
+    public var onAddMusicTracksToFolder: (([URL], UUID?) -> Void)?
     public var onOpenTimeline: ((TimelineModel, Int) -> Void)?
     public var onRenameTimeline: ((Int) -> Void)?
     public var onDuplicateTimeline: ((Int) -> Void)?
@@ -94,6 +104,7 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
         imageView.translatesAutoresizingMaskIntoConstraints = false
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.wantsLayer = true
+        imageView.layer?.backgroundColor = NSColor(calibratedWhite: 0.06, alpha: 1.0).cgColor
         imageView.layer?.cornerRadius = 4
         imageView.layer?.masksToBounds = true
         addSubview(imageView)
@@ -110,6 +121,7 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
         seqBadgeLabel.stringValue = "#\(sequenceNumber)"
         seqBadgeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .bold)
         seqBadgeLabel.textColor = .systemYellow
+        seqBadgeLabel.lineBreakMode = .byTruncatingTail
         seqBadgeBg.addSubview(seqBadgeLabel)
 
         // Duration / Subtitle Badge top-right
@@ -152,6 +164,7 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
 
             seqBadgeBg.leadingAnchor.constraint(equalTo: imageView.leadingAnchor, constant: 4),
             seqBadgeBg.topAnchor.constraint(equalTo: imageView.topAnchor, constant: 4),
+            seqBadgeBg.trailingAnchor.constraint(lessThanOrEqualTo: durBadgeBg.leadingAnchor, constant: -4),
             seqBadgeBg.heightAnchor.constraint(equalToConstant: 16),
 
             seqBadgeLabel.leadingAnchor.constraint(equalTo: seqBadgeBg.leadingAnchor, constant: 4),
@@ -230,11 +243,66 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
             seqBadgeLabel.stringValue = "#\(sequenceNumber)"
             proxyBadgeBg.isHidden = !m.hasProxy
 
-            if let thumb = m.thumbnail {
-                imageView.image = thumb
+            if m.hasVideo {
+                let cached = ThumbnailCache.shared.thumbnail(
+                    for: m.effectiveURL,
+                    durationSeconds: CMTimeGetSeconds(m.duration),
+                    fallbackImage: m.thumbnail
+                )
+                if let thumb = cached {
+                    imageView.image = thumb
+                } else {
+                    imageView.image = Lucide.image(.film, size: 32, color: .systemIndigo)
+                }
             } else {
-                imageView.image = Lucide.image(m.hasVideo ? .film : .music, size: 36, color: m.hasVideo ? .systemIndigo : .systemGreen)
+                imageView.image = Lucide.image(.music, size: 34, color: .systemGreen)
             }
+
+        case .musicTrack(let tr):
+            titleLabel.stringValue = tr.displayTitle
+            titleLabel.textColor = .labelColor
+            durBadgeLabel.stringValue = tr.formattedDuration
+            if let art = tr.artist, !art.isEmpty {
+                seqBadgeLabel.stringValue = art
+            } else {
+                seqBadgeLabel.stringValue = "♪"
+            }
+            proxyBadgeBg.isHidden = true
+            var tipParts = [tr.displayTitle]
+            if let art = tr.artist, !art.isEmpty { tipParts.append(art) }
+            if let alb = tr.album, !alb.isEmpty { tipParts.append(alb) }
+            if let gen = tr.genre, !gen.isEmpty { tipParts.append(gen) }
+            tipParts.append(tr.name)
+            self.toolTip = tipParts.joined(separator: "\n")
+
+            if let cover = ThumbnailCache.shared.artworkThumbnail(for: tr.url) {
+                imageView.image = cover
+            } else {
+                imageView.image = Lucide.image(.music, size: 34, color: .systemOrange)
+            }
+        }
+    }
+
+    public func refreshThumbnailIfMatches(urlPath: String) {
+        switch gridItem {
+        case .media(let m):
+            guard m.hasVideo else { return }
+            if m.effectiveURL.standardizedFileURL.path == urlPath || m.url.standardizedFileURL.path == urlPath {
+                if let thumb = ThumbnailCache.shared.thumbnail(
+                    for: m.effectiveURL,
+                    durationSeconds: CMTimeGetSeconds(m.duration),
+                    fallbackImage: m.thumbnail
+                ) {
+                    imageView.image = thumb
+                }
+            }
+        case .musicTrack(let tr):
+            if tr.url.standardizedFileURL.path == urlPath,
+               let cover = ThumbnailCache.shared.artworkThumbnail(for: tr.url) {
+                imageView.image = cover
+            }
+        default:
+            break
         }
     }
 
@@ -283,6 +351,29 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
             return
         }
 
+        if case .musicTrack(let track) = gridItem {
+            let tracksToDrag: [MusicLibraryTrack]
+            if let allSelected = getAllSelectedMusicTracks?(), !allSelected.isEmpty, allSelected.contains(where: { $0.id == track.id }) {
+                tracksToDrag = allSelected
+            } else {
+                tracksToDrag = [track]
+            }
+
+            var dragItems: [NSDraggingItem] = []
+            let dragIcon = Lucide.image(.music, size: 34, color: .systemOrange)
+            for (i, tr) in tracksToDrag.enumerated() {
+                let pbItem = NSPasteboardItem()
+                pbItem.setString(tr.url.absoluteString, forType: .fileURL)
+                pbItem.setString(tr.url.path, forType: .string)
+                let dragItem = NSDraggingItem(pasteboardWriter: pbItem)
+                let offsetOrigin = NSPoint(x: frame.origin.x + CGFloat(i * 10), y: frame.origin.y + CGFloat(i * 10))
+                dragItem.setDraggingFrame(NSRect(origin: offsetOrigin, size: NSSize(width: 56, height: 56)), contents: dragIcon)
+                dragItems.append(dragItem)
+            }
+            beginDraggingSession(with: dragItems, event: event, source: self)
+            return
+        }
+
         // Only media clips and selection timelines can be dragged out onto timeline or folders
         guard case .media(let item) = gridItem else { return }
 
@@ -302,8 +393,15 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
 
             let dragItem = NSDraggingItem(pasteboardWriter: pbItem)
             let dragImage: NSImage
-            if let thumb = dItem.thumbnail {
+            if dItem.hasVideo,
+               let thumb = ThumbnailCache.shared.thumbnail(
+                   for: dItem.effectiveURL,
+                   durationSeconds: CMTimeGetSeconds(dItem.duration),
+                   fallbackImage: dItem.thumbnail
+               ) {
                 dragImage = thumb
+            } else if !dItem.hasVideo {
+                dragImage = Lucide.image(.music, size: 42, color: .systemGreen)
             } else {
                 let img = NSImage(size: NSSize(width: 80, height: 60))
                 img.lockFocus()
@@ -322,7 +420,7 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
     }
 
     public func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
-        .copy
+        [.copy, .move]
     }
 
     // Drag-in handling for Folder Cards (Dropping clips into folder)
@@ -367,14 +465,17 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
 
     // Context Menu
     public override func rightMouseDown(with event: NSEvent) {
-        onSelected?(event.modifierFlags)
+        if !isSelected {
+            onSelected?(event.modifierFlags)
+        }
 
         var items: [VisionMenuItem] = []
 
         switch gridItem {
         case .timeline(let tl, let idx):
             let kindTitle = tl.isSelection ? "Selezione" : "Timeline"
-            items.append(.header(tl.name))
+            let multiCount = isSelected ? (getSelectedDeletableCount?() ?? 0) : 0
+            items.append(.header(multiCount > 1 ? "\(multiCount) elementi selezionati" : tl.name))
             items.append(.action(title: "Apri \(kindTitle)", icon: tl.isSelection ? .sparkles : .play, iconColor: tl.isSelection ? .systemPurple : .systemCyan) { [weak self] in
                 self?.onOpenTimeline?(tl, idx)
             })
@@ -406,15 +507,21 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
                     self?.onConvertToSelection?(idx)
                 })
             }
-            if EditorProject.shared.timelines.count > 1 {
+            if multiCount > 1 {
                 items.append(.separator)
-                items.append(.action(title: "Elimina", icon: .trash, isDestructive: true) { [weak self] in
+                items.append(.action(title: "Elimina \(multiCount) elementi dal Media Pool...", icon: .trash, isDestructive: true) { [weak self] in
+                    self?.onDeleteSelectedFromPool?()
+                })
+            } else if EditorProject.shared.timelines.count > 1 {
+                items.append(.separator)
+                items.append(.action(title: "Elimina...", icon: .trash, isDestructive: true) { [weak self] in
                     self?.onDeleteTimeline?(idx)
                 })
             }
 
         case .folder(let f):
-            items.append(.header(f.name))
+            let multiCount = isSelected ? (getSelectedDeletableCount?() ?? 0) : 0
+            items.append(.header(multiCount > 1 ? "\(multiCount) elementi selezionati" : f.name))
             items.append(.action(title: "Apri cartella", icon: .folder, iconColor: .systemOrange) { [weak self] in
                 self?.onOpenFolder?(f)
             })
@@ -422,12 +529,21 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
                 self?.onRenameFolder?(f)
             })
             items.append(.separator)
-            items.append(.action(title: "Elimina cartella", icon: .trash, isDestructive: true) { [weak self] in
-                self?.onDeleteFolder?(f)
-            })
+            if multiCount > 1 {
+                items.append(.action(title: "Elimina \(multiCount) elementi dal Media Pool...", icon: .trash, isDestructive: true) { [weak self] in
+                    self?.onDeleteSelectedFromPool?()
+                })
+            } else {
+                items.append(.action(title: "Elimina cartella...", icon: .trash, isDestructive: true) { [weak self] in
+                    self?.onDeleteFolder?(f)
+                })
+            }
 
         case .media(let item):
-            items.append(.header(item.name))
+            let selectedItems = getAllSelectedItems?() ?? []
+            let multiCount = isSelected ? (getSelectedDeletableCount?() ?? 0) : 0
+            let targetItems = (selectedItems.contains(where: { $0.id == item.id }) && selectedItems.count > 1) ? selectedItems : [item]
+            items.append(.header(multiCount > 1 ? "\(multiCount) elementi selezionati" : (targetItems.count > 1 ? "\(targetItems.count) elementi selezionati" : item.name)))
             items.append(.action(title: "Inserisci in timeline", icon: .plus, iconColor: .systemCyan) { [weak self] in
                 self?.onInsertToTimeline?()
             })
@@ -441,14 +557,15 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
                 items.append(.submenu(title: "Orientamento clip", icon: .rotateCw, items: orientChildren))
             }
 
-            if !EditorProject.shared.folders.isEmpty {
+            if !EditorProject.shared.folders.isEmpty || EditorProject.shared.activeFolderId != nil {
                 var folderChildren: [VisionMenuItem] = [
-                    .action(title: "Principale (Nessuna)", icon: .layers) { [weak self] in
+                    .action(title: "Progetto (Root)", icon: .layers) { [weak self] in
                         self?.onMoveToFolder?(nil)
                     }
                 ]
-                for f in EditorProject.shared.folders {
-                    folderChildren.append(.action(title: f.name, icon: .folder, iconColor: .systemOrange) { [weak self] in
+                for (f, depth) in EditorProject.shared.flattenedFoldersWithDepth() {
+                    let prefix = depth > 0 ? String(repeating: "  ", count: depth) + "↳ " : ""
+                    folderChildren.append(.action(title: prefix + f.name, icon: .folder, iconColor: .systemOrange) { [weak self] in
                         self?.onMoveToFolder?(f.id)
                     })
                 }
@@ -456,9 +573,42 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
             }
 
             items.append(.separator)
-            items.append(.action(title: "Elimina dal Media Pool", icon: .trash, isDestructive: true) { [weak self] in
-                self?.onDeleteFromPool?()
+            let deleteTitle = multiCount > 1
+                ? "Elimina \(multiCount) elementi dal Media Pool..."
+                : (targetItems.count > 1
+                    ? "Elimina \(targetItems.count) elementi dal Media Pool..."
+                    : "Elimina dal Media Pool...")
+            items.append(.action(title: deleteTitle, icon: .trash, isDestructive: true) { [weak self] in
+                if multiCount > 1, let batch = self?.onDeleteSelectedFromPool {
+                    batch()
+                } else {
+                    self?.onDeleteFromPool?()
+                }
             })
+
+        case .musicTrack(let tr):
+            items.append(.header(tr.displayTitle))
+            items.append(.action(title: "Inserisci in timeline", icon: .plus, iconColor: .systemCyan) { [weak self] in
+                self?.onInsertMusicTrack?(tr)
+            })
+            let selectedTracks: [URL] = { [weak self] in
+                if let all = self?.getAllSelectedMusicTracks?(), !all.isEmpty, all.contains(where: { $0.id == tr.id }) {
+                    return all.map(\.url)
+                }
+                return [tr.url]
+            }()
+            var destChildren: [VisionMenuItem] = [
+                .action(title: "Progetto (Root)", icon: .layers) { [weak self] in
+                    self?.onAddMusicTracksToFolder?(selectedTracks, nil)
+                }
+            ]
+            for (f, depth) in EditorProject.shared.flattenedFoldersWithDepth() {
+                let prefix = depth > 0 ? String(repeating: "  ", count: depth) + "↳ " : ""
+                destChildren.append(.action(title: prefix + f.name, icon: .folder, iconColor: .systemOrange) { [weak self] in
+                    self?.onAddMusicTracksToFolder?(selectedTracks, f.id)
+                })
+            }
+            items.append(.submenu(title: "Aggiungi al progetto in", icon: .folderInput, items: destChildren))
         }
 
         VisionMenu(items: items).show(for: event, in: self)
@@ -488,6 +638,13 @@ public final class MediaThumbnailGridView: NSView {
         }
     }
 
+    public var musicTracks: [MusicLibraryTrack] {
+        gridItems.compactMap {
+            if case .musicTrack(let tr) = $0 { return tr }
+            return nil
+        }
+    }
+
     public var selectedItemIds: Set<UUID> = [] {
         didSet {
             updateSelectionState()
@@ -496,10 +653,19 @@ public final class MediaThumbnailGridView: NSView {
 
     public var onClipDoubleClicked: ((MediaItem) -> Void)?
     public var onClipSelected: ((MediaItem, NSEvent.ModifierFlags) -> Void)?
+    public var onMusicTrackSelected: ((MusicLibraryTrack, NSEvent.ModifierFlags) -> Void)?
     public var onOrientationChanged: ((MediaItem, ClipOrientation) -> Void)?
     public var onMoveItemToFolder: ((UUID, UUID?) -> Void)?
+    public var onMoveItemsToFolder: (([UUID], UUID?) -> Void)?
     public var onInsertToTimeline: ((MediaItem) -> Void)?
     public var onDeleteFromPool: ((MediaItem) -> Void)?
+    public var onDeleteItemsFromPool: (([UUID]) -> Void)?
+    public var getSelectedPoolCount: (() -> Int)?
+    public var onDeleteSelectedPoolItems: (() -> Void)?
+    public var onSelectionChanged: ((Set<UUID>) -> Void)?
+    private var lastSelectedAnchorId: UUID?
+    public var onInsertMusicTrack: ((MusicLibraryTrack) -> Void)?
+    public var onAddMusicTracksToFolder: (([URL], UUID?) -> Void)?
     public var onContextMenuRequested: ((NSEvent) -> Void)?
     public var onOpenTimeline: ((TimelineModel, Int) -> Void)?
     public var onRenameTimeline: ((Int) -> Void)?
@@ -524,6 +690,7 @@ public final class MediaThumbnailGridView: NSView {
     }
 
     private var cardViews: [MediaThumbnailCardView] = []
+    private var thumbObserver: Any?
     public let minCardWidth: CGFloat = 130
     public let currentCardHeight: CGFloat = 110
     public let spacing: CGFloat = 10
@@ -532,20 +699,40 @@ public final class MediaThumbnailGridView: NSView {
     public override var isFlipped: Bool { true }
 
     public var onURLsDropped: (([URL]) -> Void)?
+    public var onDropItemsOnGrid: (([UUID]) -> Void)?
 
     public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 1.0).cgColor
         registerForDraggedTypes([.fileURL, .URL, NSPasteboard.PasteboardType("NSFilenamesPboardType"), kMediaItemPasteboardType])
+        thumbObserver = NotificationCenter.default.addObserver(
+            forName: ThumbnailCache.thumbnailReadyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notif in
+            guard let self = self, let urlPath = notif.userInfo?["urlPath"] as? String else { return }
+            for card in self.cardViews {
+                card.refreshThumbnailIfMatches(urlPath: urlPath)
+            }
+        }
+    }
+
+    deinit {
+        if let obs = thumbObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         let pboard = sender.draggingPasteboard
+        if pboard.types?.contains(kMediaItemPasteboardType) == true {
+            return .move
+        }
         let urls = MediaPoolViewController.extractFileURLs(from: pboard)
-        if !urls.isEmpty || pboard.types?.contains(.fileURL) == true || pboard.types?.contains(kMediaItemPasteboardType) == true {
+        if !urls.isEmpty || pboard.types?.contains(.fileURL) == true {
             return .copy
         }
         return []
@@ -553,8 +740,11 @@ public final class MediaThumbnailGridView: NSView {
 
     public override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
         let pboard = sender.draggingPasteboard
+        if pboard.types?.contains(kMediaItemPasteboardType) == true {
+            return .move
+        }
         let urls = MediaPoolViewController.extractFileURLs(from: pboard)
-        if !urls.isEmpty || pboard.types?.contains(.fileURL) == true || pboard.types?.contains(kMediaItemPasteboardType) == true {
+        if !urls.isEmpty || pboard.types?.contains(.fileURL) == true {
             return .copy
         }
         return []
@@ -562,6 +752,18 @@ public final class MediaThumbnailGridView: NSView {
 
     public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         let pboard = sender.draggingPasteboard
+        var ids: [UUID] = []
+        if let pbItems = pboard.pasteboardItems {
+            for item in pbItems {
+                if let str = item.string(forType: kMediaItemPasteboardType), let uuid = UUID(uuidString: str) {
+                    ids.append(uuid)
+                }
+            }
+        }
+        if !ids.isEmpty {
+            onDropItemsOnGrid?(ids)
+            return true
+        }
         let urls = MediaPoolViewController.extractFileURLs(from: pboard)
         if !urls.isEmpty {
             onURLsDropped?(urls)
@@ -625,23 +827,49 @@ public final class MediaThumbnailGridView: NSView {
             card.onSelected = { [weak self, weak card] modifiers in
                 guard let self = self, let card = card else { return }
                 let itemId = card.gridItem.id
-                if modifiers.contains(.shift) {
+                let isShift = modifiers.contains(.shift)
+                let isCmd = modifiers.contains(.command)
+
+                if isShift,
+                   let anchorId = self.lastSelectedAnchorId,
+                   let anchorIdx = self.gridItems.firstIndex(where: { $0.id == anchorId }),
+                   let targetIdx = self.gridItems.firstIndex(where: { $0.id == itemId }) {
+                    let lo = min(anchorIdx, targetIdx)
+                    let hi = max(anchorIdx, targetIdx)
+                    let rangeIds = Set(self.gridItems[lo...hi].map(\.id))
+                    if isCmd {
+                        self.selectedItemIds.formUnion(rangeIds)
+                    } else {
+                        self.selectedItemIds = rangeIds
+                    }
+                } else if isCmd || isShift {
                     if self.selectedItemIds.contains(itemId) {
                         self.selectedItemIds.remove(itemId)
                     } else {
                         self.selectedItemIds.insert(itemId)
                     }
+                    self.lastSelectedAnchorId = itemId
                 } else {
                     self.selectedItemIds = [itemId]
+                    self.lastSelectedAnchorId = itemId
                 }
+
+                self.onSelectionChanged?(self.selectedItemIds)
                 if case .media(let m) = card.gridItem {
                     self.onClipSelected?(m, modifiers)
+                } else if case .musicTrack(let tr) = card.gridItem {
+                    self.onMusicTrackSelected?(tr, modifiers)
                 }
             }
 
             card.getAllSelectedItems = { [weak self] in
                 guard let self = self else { return [] }
                 return self.mediaItems.filter { self.selectedItemIds.contains($0.id) }
+            }
+
+            card.getAllSelectedMusicTracks = { [weak self] in
+                guard let self = self else { return [] }
+                return self.musicTracks.filter { self.selectedItemIds.contains($0.stableUUID) }
             }
 
             card.onDoubleClicked = { [weak self, weak card] in
@@ -653,6 +881,8 @@ public final class MediaThumbnailGridView: NSView {
                     self.onOpenTimeline?(tl, idx)
                 case .folder(let f):
                     self.onOpenFolder?(f)
+                case .musicTrack(let tr):
+                    self.onInsertMusicTrack?(tr)
                 }
             }
 
@@ -666,8 +896,26 @@ public final class MediaThumbnailGridView: NSView {
             card.onMoveToFolder = { [weak self, weak card] targetFolderId in
                 guard let self = self, let card = card else { return }
                 if case .media(let m) = card.gridItem {
-                    self.onMoveItemToFolder?(m.id, targetFolderId)
+                    let selectedIds = self.mediaItems
+                        .filter { self.selectedItemIds.contains($0.id) }
+                        .map(\.id)
+                    let idsToMove = (selectedIds.contains(m.id) && selectedIds.count > 1) ? selectedIds : [m.id]
+                    if let moveMany = self.onMoveItemsToFolder {
+                        moveMany(idsToMove, targetFolderId)
+                    } else {
+                        for id in idsToMove {
+                            self.onMoveItemToFolder?(id, targetFolderId)
+                        }
+                    }
                 }
+            }
+
+            card.onInsertMusicTrack = { [weak self] tr in
+                self?.onInsertMusicTrack?(tr)
+            }
+
+            card.onAddMusicTracksToFolder = { [weak self] urls, folderId in
+                self?.onAddMusicTracksToFolder?(urls, folderId)
             }
 
             card.onInsertToTimeline = { [weak self, weak card] in
@@ -677,10 +925,30 @@ public final class MediaThumbnailGridView: NSView {
                 }
             }
 
+            card.getSelectedDeletableCount = { [weak self] in
+                self?.getSelectedPoolCount?() ?? 0
+            }
+
+            card.onDeleteSelectedFromPool = { [weak self] in
+                self?.onDeleteSelectedPoolItems?()
+            }
+
             card.onDeleteFromPool = { [weak self, weak card] in
                 guard let self = self, let card = card else { return }
                 if case .media(let m) = card.gridItem {
-                    self.onDeleteFromPool?(m)
+                    let selectedIds = self.mediaItems
+                        .filter { self.selectedItemIds.contains($0.id) }
+                        .map(\.id)
+                    let idsToDelete = (selectedIds.contains(m.id) && selectedIds.count > 1) ? selectedIds : [m.id]
+                    if let deleteMany = self.onDeleteItemsFromPool {
+                        deleteMany(idsToDelete)
+                    } else {
+                        for id in idsToDelete {
+                            if let item = self.mediaItems.first(where: { $0.id == id }) {
+                                self.onDeleteFromPool?(item)
+                            }
+                        }
+                    }
                 }
             }
 

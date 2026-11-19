@@ -18,6 +18,14 @@ public final class TimelineGridView: NSView {
     public var onClipSelected: ((TimelineClip) -> Void)?
     public var onReorderCommitted: (() -> Void)?
     public var onSectionActivated: (() -> Void)?
+    public var onDropMediaIdsAtSlot: (([UUID], Int, Int) -> Void)?
+    public var onDropURLsAtSlot: (([URL], Int, Int) -> Void)?
+    public var onDropSelectionAtSlot: ((UUID, Int, Int) -> Void)?
+    public var onDeleteSelectedFromGrid: (() -> Void)?
+
+    private var thumbObserver: Any?
+    private var thumbRedrawWorkItem: DispatchWorkItem?
+    private var isExternalDragOver: Bool = false
 
     private let minCardWidth: CGFloat = 115
     private let spacing: CGFloat = 10
@@ -45,6 +53,32 @@ public final class TimelineGridView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         autoresizingMask = [.width]
+        registerForDraggedTypes([
+            kMediaItemPasteboardType,
+            kSelectionPasteboardType,
+            .fileURL,
+            .URL,
+            NSPasteboard.PasteboardType("NSFilenamesPboardType")
+        ])
+        thumbObserver = NotificationCenter.default.addObserver(
+            forName: ThumbnailCache.thumbnailReadyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self, !self.isHidden else { return }
+            self.thumbRedrawWorkItem?.cancel()
+            let item = DispatchWorkItem { [weak self] in
+                self?.needsDisplay = true
+            }
+            self.thumbRedrawWorkItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: item)
+        }
+    }
+
+    deinit {
+        if let obs = thumbObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -177,8 +211,8 @@ public final class TimelineGridView: NSView {
             }
         }
 
-        // 2. Draw Glowing Vertical Insertion Slot between clips
-        if isDragging, let slot = activeInsertionSlot {
+        // 2. Draw Glowing Vertical Insertion Slot between clips (internal or external drop)
+        if (isDragging || isExternalDragOver), let slot = activeInsertionSlot {
             drawGlowingInsertionBeam(slot: slot, ctx: ctx)
         }
 
@@ -205,7 +239,11 @@ public final class TimelineGridView: NSView {
 
         // Card Container rounded rectangle
         let path = NSBezierPath(roundedRect: frame, xRadius: 7, yRadius: 7)
-        NSColor(calibratedWhite: 0.125, alpha: 1.0).setFill()
+        if clip.isOrphan {
+            NSColor(calibratedRed: 0.40, green: 0.10, blue: 0.10, alpha: 1.0).setFill()
+        } else {
+            NSColor(calibratedWhite: 0.125, alpha: 1.0).setFill()
+        }
         path.fill()
 
         if clip.isOrphan {
@@ -228,13 +266,27 @@ public final class TimelineGridView: NSView {
         let thumbPath = NSBezierPath(roundedRect: thumbRect, xRadius: 4, yRadius: 4)
         thumbPath.addClip()
 
-        if let thumb = clip.mediaItem.thumbnail {
-            thumb.draw(in: thumbRect, from: .zero, operation: .sourceOver, fraction: 1.0)
+        if clip.mediaItem.hasVideo {
+            let captureSec = CMTimeGetSeconds(clip.sourceIn) + min(1.2, CMTimeGetSeconds(clip.duration) * 0.25)
+            let cachedThumb = ThumbnailCache.shared.thumbnail(
+                for: clip.mediaItem.effectiveURL,
+                atSeconds: captureSec,
+                durationSeconds: CMTimeGetSeconds(clip.mediaItem.duration),
+                fallbackImage: clip.mediaItem.thumbnail
+            )
+            if let thumb = cachedThumb {
+                Self.drawAspectFill(image: thumb, in: thumbRect)
+            } else {
+                NSColor(calibratedWhite: 0.08, alpha: 1.0).setFill()
+                thumbPath.fill()
+                let icon = Lucide.image(.film, size: 22, color: NSColor(calibratedWhite: 0.48, alpha: 1.0))
+                icon.draw(in: NSRect(x: thumbRect.midX - 11, y: thumbRect.midY - 11, width: 22, height: 22))
+            }
         } else {
-            NSColor.black.setFill()
+            NSColor(srgbRed: 0.07, green: 0.14, blue: 0.11, alpha: 1.0).setFill()
             thumbPath.fill()
-            let icon = NSImage(systemSymbolName: "film", accessibilityDescription: nil)
-            icon?.draw(in: NSRect(x: thumbRect.midX - 14, y: thumbRect.midY - 14, width: 28, height: 28))
+            let icon = Lucide.image(.music, size: 22, color: .systemGreen)
+            icon.draw(in: NSRect(x: thumbRect.midX - 11, y: thumbRect.midY - 11, width: 22, height: 22))
         }
 
         ctx.restoreGState()
@@ -246,9 +298,12 @@ public final class TimelineGridView: NSView {
         badgePath.fill()
         drawText("#\(sequenceNum)", at: CGPoint(x: badgeRect.minX + 4, y: badgeRect.minY + 2), color: .systemYellow, fontSize: 10, bold: true)
 
-        // Duration Badge in top-right
-        let durStr = clip.mediaItem.formattedDuration
-        let durRect = NSRect(x: frame.maxX - 48, y: frame.minY + 6, width: 42, height: 16)
+        // Clip Duration Badge in top-right
+        let clipDurSec = max(0.0, CMTimeGetSeconds(clip.duration))
+        let durMin = Int(clipDurSec) / 60
+        let durSec = Int(clipDurSec) % 60
+        let durStr = String(format: "%02d:%02d", durMin, durSec)
+        let durRect = NSRect(x: frame.maxX - 44, y: frame.minY + 6, width: 38, height: 16)
         let durPath = NSBezierPath(roundedRect: durRect, xRadius: 3, yRadius: 3)
         NSColor.black.withAlphaComponent(0.85).setFill()
         durPath.fill()
@@ -377,7 +432,7 @@ public final class TimelineGridView: NSView {
     public override func mouseDown(with event: NSEvent) {
         onSectionActivated?()
         let localPoint = convert(event.locationInWindow, from: nil)
-        let isShift = event.modifierFlags.contains(.shift)
+        let isMulti = event.modifierFlags.contains(.shift) || event.modifierFlags.contains(.command)
 
         // 1. Check if user clicked on a card
         var hitIndex: Int? = nil
@@ -394,7 +449,7 @@ public final class TimelineGridView: NSView {
             guard srcIdx < clips.count else { return }
             let hitClip = clips[srcIdx]
 
-            if isShift {
+            if isMulti {
                 if timelineModel?.selectedClipIds.contains(hitClip.id) == true {
                     timelineModel?.selectedClipIds.remove(hitClip.id)
                 } else {
@@ -412,9 +467,42 @@ public final class TimelineGridView: NSView {
             runCardDragTrackingLoop(fromIndex: srcIdx, startPoint: localPoint)
         } else {
             // Click or Drag on Empty Background: Rubber-Band Marquee Box Selection!
-            runMarqueeTrackingLoop(startPoint: localPoint, isShift: isShift)
+            runMarqueeTrackingLoop(startPoint: localPoint, isShift: isMulti)
         }
     }
+
+    public override func rightMouseDown(with event: NSEvent) {
+        onSectionActivated?()
+        let localPoint = convert(event.locationInWindow, from: nil)
+        let clips = currentClips
+        var hitClip: TimelineClip? = nil
+        for (idx, frame) in cardFrames.enumerated() where idx < clips.count {
+            if frame.contains(localPoint) {
+                hitClip = clips[idx]
+                break
+            }
+        }
+        if let clip = hitClip {
+            if timelineModel?.selectedClipIds.contains(clip.id) != true {
+                timelineModel?.selectedClipIds = [clip.id]
+                needsDisplay = true
+            }
+            onClipSelected?(clip)
+            var menuItems: [VisionMenuItem] = [
+                .header(clip.mediaItem.name),
+                .action(title: "Vai alla clip in Timeline", icon: .play, iconColor: .systemCyan) { [weak self] in
+                    self?.onClipSelected?(clip)
+                },
+                .separator,
+                .action(title: "Elimina dalla sequenza", icon: .trash, isDestructive: true) { [weak self] in
+                    self?.onDeleteSelectedFromGrid?()
+                }
+            ]
+            VisionMenu(items: menuItems).show(for: event, in: self)
+        }
+    }
+
+    public override func menu(for event: NSEvent) -> NSMenu? { nil }
 
     private func runCardDragTrackingLoop(fromIndex: Int, startPoint: NSPoint) {
         var didStartDrag = false
@@ -443,17 +531,31 @@ public final class TimelineGridView: NSView {
                 }
             } else if nextEvent.type == .leftMouseUp {
                 if didStartDrag, let slot = activeInsertionSlot {
-                    let targetIdx = (slot > fromIndex) ? (slot - 1) : slot
                     let clips = currentClips
-                    if targetIdx != fromIndex && targetIdx >= 0 && targetIdx < clips.count {
-                        timelineModel?.reorderClips(
+                    let selectedIds = timelineModel?.selectedClipIds ?? []
+                    let trackSelectedCount = clips.filter { selectedIds.contains($0.id) }.count
+                    if trackSelectedCount > 1, fromIndex < clips.count, selectedIds.contains(clips[fromIndex].id) {
+                        if timelineModel?.reorderClipGroup(
+                            clipIds: selectedIds,
                             trackIndex: selectedTrackIndex,
                             isVideo: true,
-                            fromIndex: fromIndex,
-                            toIndex: targetIdx
-                        )
-                        recalculateLayout()
-                        onReorderCommitted?()
+                            toSlot: slot
+                        ) == true {
+                            recalculateLayout()
+                            onReorderCommitted?()
+                        }
+                    } else {
+                        let targetIdx = (slot > fromIndex) ? (slot - 1) : slot
+                        if targetIdx != fromIndex && targetIdx >= 0 && targetIdx < clips.count {
+                            timelineModel?.reorderClips(
+                                trackIndex: selectedTrackIndex,
+                                isVideo: true,
+                                fromIndex: fromIndex,
+                                toIndex: targetIdx
+                            )
+                            recalculateLayout()
+                            onReorderCommitted?()
+                        }
                     }
                 }
                 isDragging = false
@@ -579,5 +681,91 @@ public final class TimelineGridView: NSView {
             height: textSize.height
         )
         attrStr.draw(in: centeredRect)
+    }
+
+    public static func drawAspectFill(image: NSImage, in destRect: NSRect) {
+        let imgSize = image.size
+        guard imgSize.width > 0 && imgSize.height > 0 && destRect.width > 0 && destRect.height > 0 else {
+            image.draw(in: destRect)
+            return
+        }
+        let imgRatio = imgSize.width / imgSize.height
+        let destRatio = destRect.width / destRect.height
+        var srcRect = NSRect(origin: .zero, size: imgSize)
+        if imgRatio > destRatio {
+            let cropW = imgSize.height * destRatio
+            srcRect.origin.x = (imgSize.width - cropW) * 0.5
+            srcRect.size.width = cropW
+        } else if imgRatio < destRatio {
+            let cropH = imgSize.width / destRatio
+            srcRect.origin.y = (imgSize.height - cropH) * 0.5
+            srcRect.size.height = cropH
+        }
+        image.draw(in: destRect, from: srcRect, operation: .sourceOver, fraction: 1.0, respectFlipped: true, hints: [.interpolation: NSImageInterpolation.medium])
+    }
+
+    // MARK: - NSDraggingDestination (Drop from Media Pool, Libreria Musicale & Finder)
+
+    public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        updateExternalDragSlot(from: sender) ? .copy : []
+    }
+
+    public override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        updateExternalDragSlot(from: sender) ? .copy : []
+    }
+
+    public override func draggingExited(_ sender: NSDraggingInfo?) {
+        isExternalDragOver = false
+        activeInsertionSlot = nil
+        needsDisplay = true
+    }
+
+    private func updateExternalDragSlot(from sender: NSDraggingInfo) -> Bool {
+        let pboard = sender.draggingPasteboard
+        let hasKnownType = pboard.types?.contains(kMediaItemPasteboardType) == true
+            || pboard.types?.contains(kSelectionPasteboardType) == true
+            || pboard.types?.contains(.fileURL) == true
+            || !MediaPoolViewController.extractFileURLs(from: pboard).isEmpty
+        guard hasKnownType else { return false }
+
+        isExternalDragOver = true
+        let localPt = convert(sender.draggingLocation, from: nil)
+        activeInsertionSlot = findInsertionSlot(at: localPt, sourceIndex: -1)
+        needsDisplay = true
+        return true
+    }
+
+    public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let pboard = sender.draggingPasteboard
+        let localPt = convert(sender.draggingLocation, from: nil)
+        let slot = findInsertionSlot(at: localPt, sourceIndex: -1)
+        isExternalDragOver = false
+        activeInsertionSlot = nil
+        needsDisplay = true
+
+        if let selIdStr = pboard.string(forType: kSelectionPasteboardType), let selId = UUID(uuidString: selIdStr) {
+            onDropSelectionAtSlot?(selId, slot, selectedTrackIndex)
+            return true
+        }
+
+        var mediaIds: [UUID] = []
+        if let pbItems = pboard.pasteboardItems {
+            for item in pbItems {
+                if let str = item.string(forType: kMediaItemPasteboardType), let uuid = UUID(uuidString: str) {
+                    mediaIds.append(uuid)
+                }
+            }
+        }
+        if !mediaIds.isEmpty {
+            onDropMediaIdsAtSlot?(mediaIds, slot, selectedTrackIndex)
+            return true
+        }
+
+        let urls = MediaPoolViewController.extractFileURLs(from: pboard)
+        if !urls.isEmpty {
+            onDropURLsAtSlot?(urls, slot, selectedTrackIndex)
+            return true
+        }
+        return false
     }
 }

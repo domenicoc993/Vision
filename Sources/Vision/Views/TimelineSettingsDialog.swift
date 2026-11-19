@@ -41,6 +41,14 @@ public final class TimelineSettingsDialog {
         return response == .OK ? controller.resultingFormat : nil
     }
 
+    public static func testApplySettings(for timeline: TimelineModel, fpsIndex: Int) -> TimelineFormat? {
+        let controller = DialogController(timeline: timeline, panel: nil)
+        _ = controller.view
+        controller.setFpsIndexForTesting(fpsIndex)
+        controller.applyForTesting()
+        return controller.resultingFormat
+    }
+
     private final class DialogController: NSViewController {
         private let timeline: TimelineModel
         private weak var panel: NSPanel?
@@ -52,10 +60,19 @@ public final class TimelineSettingsDialog {
         private let fpsPopUp = VisionDropdownButton()
         private var isUpdatingFields = false
 
-        init(timeline: TimelineModel, panel: NSPanel) {
+        init(timeline: TimelineModel, panel: NSPanel?) {
             self.timeline = timeline
             self.panel = panel
             super.init(nibName: nil, bundle: nil)
+        }
+
+        func setFpsIndexForTesting(_ index: Int) {
+            fpsPopUp.selectItem(at: index)
+            onFpsChanged()
+        }
+
+        func applyForTesting() {
+            onSave()
         }
 
         required init?(coder: NSCoder) { fatalError() }
@@ -83,8 +100,9 @@ public final class TimelineSettingsDialog {
             }
             presetPopUp.addItem(withTitle: "Personalizzato")
             presetPopUp.translatesAutoresizingMaskIntoConstraints = false
-            presetPopUp.target = self
-            presetPopUp.action = #selector(onPresetChanged)
+            presetPopUp.onSelectionChanged = { [weak self] _, _ in
+                self?.onPresetChanged()
+            }
 
             // Resolution row
             let resLbl = makeFieldLabel("Risoluzione")
@@ -116,8 +134,9 @@ public final class TimelineSettingsDialog {
                 fpsPopUp.addItem(withTitle: item.label)
             }
             fpsPopUp.translatesAutoresizingMaskIntoConstraints = false
-            fpsPopUp.target = self
-            fpsPopUp.action = #selector(onFpsChanged)
+            fpsPopUp.onSelectionChanged = { [weak self] _, _ in
+                self?.onFpsChanged()
+            }
 
             syncControlsFromFormat(timeline.format)
 
@@ -259,7 +278,9 @@ public final class TimelineSettingsDialog {
 
         @objc private func onCancel() {
             resultingFormat = nil
-            NSApp.stopModal(withCode: .cancel)
+            if panel != nil {
+                NSApp.stopModal(withCode: .cancel)
+            }
         }
 
         @objc private func onSave() {
@@ -273,7 +294,14 @@ public final class TimelineSettingsDialog {
             }) {
                 resultingFormat = matched
             } else {
-                let fpsText = fps.truncatingRemainder(dividingBy: 1) == 0 ? "\(Int(fps))" : String(format: "%.2f", fps)
+                let fpsText: String
+                if abs(fps - 23.976) < 0.005 {
+                    fpsText = "23.976"
+                } else if fps.truncatingRemainder(dividingBy: 1) == 0 {
+                    fpsText = "\(Int(fps))"
+                } else {
+                    fpsText = String(format: "%.2f", fps)
+                }
                 resultingFormat = TimelineFormat(
                     id: "custom_\(w)x\(h)_\(fpsText)",
                     name: "\(w) × \(h) @ \(fpsText)fps",
@@ -281,7 +309,9 @@ public final class TimelineSettingsDialog {
                     fps: fps
                 )
             }
-            NSApp.stopModal(withCode: .OK)
+            if panel != nil {
+                NSApp.stopModal(withCode: .OK)
+            }
         }
     }
 }

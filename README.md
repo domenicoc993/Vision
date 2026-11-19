@@ -34,6 +34,17 @@ Vision è un editor video non-lineare (NLE) nativo per macOS, ottimizzato e acce
 
 ## Compilazione ed Esecuzione
 
+### Download Rapido (macOS Apple Silicon)
+
+Nel repository è incluso l'eseguibile precompilato **`Vision-macOS.zip`** (`Vision.app` per macOS 14.0+ su Apple Silicon M1/M2/M3/M4):
+
+1. Estrai `Vision-macOS.zip` (doppio clic).
+2. Sposta `Vision.app` in `/Applications` (opzionale) e avviala.
+3. Se su un altro Mac Gatekeeper blocca il primo avvio (firma ad-hoc), esegui una sola volta nel Terminale oppure usa **Impostazioni di Sistema → Privacy e sicurezza → Apri comunque**:
+   ```bash
+   xattr -cr /Applications/Vision.app
+   ```
+
 ### Creazione del Bundle Eseguibile (.app)
 
 Per generare l'applicazione macOS autonoma e firmata (`Vision.app`):

@@ -5,11 +5,13 @@ public struct MediaFolder: Identifiable, Hashable, Codable {
     public var id: UUID
     public var name: String
     public var itemIds: Set<UUID>
+    public var parentId: UUID?
 
-    public init(id: UUID = UUID(), name: String, itemIds: Set<UUID> = []) {
+    public init(id: UUID = UUID(), name: String, itemIds: Set<UUID> = [], parentId: UUID? = nil) {
         self.id = id
         self.name = name
         self.itemIds = itemIds
+        self.parentId = parentId
     }
 }
 
@@ -71,6 +73,7 @@ public final class EditorProject {
         copy.detectedBPM = orig.detectedBPM
         copy.beatIntervalMode = orig.beatIntervalMode
         copy.peakSensitivity = orig.peakSensitivity
+        copy.playheadSeconds = orig.playheadSeconds
         copy.videoTracks = orig.videoTracks.map { track in
             var t = track
             t.clips = track.clips.map { clip in
@@ -92,7 +95,9 @@ public final class EditorProject {
                     beatBPM: clip.beatBPM,
                     markers: clip.markers,
                     priority: clip.priority,
-                    isLocked: clip.isLocked
+                    isLocked: clip.isLocked,
+                    selectionSourceIn: clip.selectionSourceIn,
+                    selectionSourceOut: clip.selectionSourceOut
                 )
             }
             return t
@@ -118,7 +123,9 @@ public final class EditorProject {
                     beatBPM: clip.beatBPM,
                     markers: clip.markers,
                     priority: clip.priority,
-                    isLocked: clip.isLocked
+                    isLocked: clip.isLocked,
+                    selectionSourceIn: clip.selectionSourceIn,
+                    selectionSourceOut: clip.selectionSourceOut
                 )
             }
             return t
@@ -172,9 +179,42 @@ public final class EditorProject {
         onProjectChanged?()
     }
 
+    public var allFolderItemIds: Set<UUID> {
+        var ids = Set<UUID>()
+        for f in folders { ids.formUnion(f.itemIds) }
+        return ids
+    }
+
+    public func childFolders(of parentId: UUID?) -> [MediaFolder] {
+        folders.filter { $0.parentId == parentId }
+    }
+
+    public func flattenedFoldersWithDepth(parentId: UUID? = nil, depth: Int = 0, visited: Set<UUID> = []) -> [(folder: MediaFolder, depth: Int)] {
+        var result: [(folder: MediaFolder, depth: Int)] = []
+        for f in folders where f.parentId == parentId {
+            guard !visited.contains(f.id) else { continue }
+            var nextVisited = visited
+            nextVisited.insert(f.id)
+            result.append((f, depth))
+            result.append(contentsOf: flattenedFoldersWithDepth(parentId: f.id, depth: depth + 1, visited: nextVisited))
+        }
+        // Fallback for orphaned parent references (e.g., broken link)
+        if parentId == nil {
+            let knownIds = Set(folders.map(\.id))
+            for f in folders where f.parentId != nil && !knownIds.contains(f.parentId!) {
+                guard !visited.contains(f.id) else { continue }
+                var nextVisited = visited
+                nextVisited.insert(f.id)
+                result.append((f, 0))
+                result.append(contentsOf: flattenedFoldersWithDepth(parentId: f.id, depth: 1, visited: nextVisited))
+            }
+        }
+        return result
+    }
+
     @discardableResult
-    public func addFolder(name: String) -> MediaFolder {
-        let folder = MediaFolder(name: name)
+    public func addFolder(name: String, parentId: UUID? = nil) -> MediaFolder {
+        let folder = MediaFolder(name: name, parentId: parentId)
         folders.append(folder)
         onProjectChanged?()
         return folder
@@ -188,8 +228,19 @@ public final class EditorProject {
     }
 
     public func removeFolder(id: UUID) {
-        folders.removeAll(where: { $0.id == id })
-        if activeFolderId == id {
+        var toDelete: Set<UUID> = [id]
+        var added = true
+        while added {
+            added = false
+            for f in folders {
+                if let pId = f.parentId, toDelete.contains(pId), !toDelete.contains(f.id) {
+                    toDelete.insert(f.id)
+                    added = true
+                }
+            }
+        }
+        folders.removeAll { toDelete.contains($0.id) }
+        if let active = activeFolderId, toDelete.contains(active) {
             activeFolderId = nil
         }
         onProjectChanged?()
@@ -203,6 +254,27 @@ public final class EditorProject {
             }
         }
         onProjectChanged?()
+    }
+
+    /// Salva (o sovrascrive) l'analisi neurale dei beat su tutte le istanze della clip nel progetto e notifica il Media Pool.
+    public func setBeatAnalysis(_ analysis: SavedBeatAnalysis?, forMediaItemId mediaItemId: UUID) {
+        for tl in timelines {
+            for t in 0..<tl.videoTracks.count {
+                for c in 0..<tl.videoTracks[t].clips.count where tl.videoTracks[t].clips[c].mediaItem.id == mediaItemId {
+                    tl.videoTracks[t].clips[c].mediaItem.beatAnalysis = analysis
+                }
+            }
+            for t in 0..<tl.audioTracks.count {
+                for c in 0..<tl.audioTracks[t].clips.count where tl.audioTracks[t].clips[c].mediaItem.id == mediaItemId {
+                    tl.audioTracks[t].clips[c].mediaItem.beatAnalysis = analysis
+                }
+            }
+        }
+        NotificationCenter.default.post(
+            name: NSNotification.Name("MediaItemBeatAnalysisUpdated"),
+            object: nil,
+            userInfo: ["itemId": mediaItemId, "beatAnalysis": analysis as Any]
+        )
     }
 
     public func reset(with document: ProjectDocumentData, restoredMedia: [MediaItem]) {
