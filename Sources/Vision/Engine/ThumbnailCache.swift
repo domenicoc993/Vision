@@ -1,7 +1,9 @@
 import AppKit
 import AVFoundation
+import CoreImage
 import CryptoKit
 import ImageIO
+import Metal
 
 /// Lightweight, RAM-bounded + disk-cached thumbnail generator shared across Media Pool Grid and Timeline Grid.
 public final class ThumbnailCache: @unchecked Sendable {
@@ -9,15 +11,30 @@ public final class ThumbnailCache: @unchecked Sendable {
     public static let thumbnailReadyNotification = Notification.Name("Vision.ThumbnailCache.Ready")
 
     private let ramCache = NSCache<NSString, NSImage>()
+    private let lutRamCache = NSCache<NSString, NSImage>()
+    private var lastLutSignature: String = "off"
     private let cacheDir: URL
     private let workQueue: OperationQueue
     private let stateLock = NSLock()
     private var inFlightKeys: Set<String> = []
     private var failedKeys: Set<String> = []
+    private var lutObserver: Any?
+
+    private static let lutCIContext: CIContext = {
+        // Must match VisionLUTCompositor (CompositionEngine) working space (default Extended Linear sRGB)
+        if let device = MTLCreateSystemDefaultDevice() {
+            return CIContext(mtlDevice: device, options: [.cacheIntermediates: false, .useSoftwareRenderer: false])
+        }
+        return CIContext(options: [.cacheIntermediates: false])
+    }()
+
+    private static let renderColorSpace: CGColorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 
     private init() {
         ramCache.countLimit = 180
         ramCache.totalCostLimit = 24 * 1024 * 1024 // Strict ~24 MB RAM cap
+        lutRamCache.countLimit = 220
+        lutRamCache.totalCostLimit = 24 * 1024 * 1024
 
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
@@ -28,6 +45,58 @@ public final class ThumbnailCache: @unchecked Sendable {
         workQueue.name = "com.vision.thumbnailCacheQueue"
         workQueue.maxConcurrentOperationCount = 2
         workQueue.qualityOfService = .utility
+
+        lutObserver = NotificationCenter.default.addObserver(
+            forName: LUTEngine.stateChangedNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.stateLock.lock()
+            self.lutRamCache.removeAllObjects()
+            self.lastLutSignature = LUTEngine.shared.cacheSignature
+            self.stateLock.unlock()
+        }
+    }
+
+    deinit {
+        if let obs = lutObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
+    }
+
+    private func applyActiveLUTIfNeeded(to image: NSImage, baseKey: String) -> NSImage {
+        guard let lutParams = LUTEngine.shared.currentLUTParameters() else {
+            return image
+        }
+        let sig = LUTEngine.shared.cacheSignature
+        stateLock.lock()
+        if sig != lastLutSignature {
+            lutRamCache.removeAllObjects()
+            lastLutSignature = sig
+        }
+        let lutKey = "\(baseKey)#\(sig)" as NSString
+        if let cached = lutRamCache.object(forKey: lutKey) {
+            stateLock.unlock()
+            return cached
+        }
+        stateLock.unlock()
+
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return image
+        }
+        let ci = CIImage(cgImage: cg)
+        let filtered = LUTEngine.apply(lutParams, to: ci.clampedToExtent()).cropped(to: ci.extent)
+        guard let outCG = Self.lutCIContext.createCGImage(filtered, from: ci.extent, format: .RGBA8, colorSpace: Self.renderColorSpace) else {
+            return image
+        }
+        let outImg = NSImage(cgImage: outCG, size: image.size)
+        stateLock.lock()
+        if sig == lastLutSignature {
+            lutRamCache.setObject(outImg, forKey: lutKey, cost: estimatedByteCost(of: outImg))
+        }
+        stateLock.unlock()
+        return outImg
     }
 
     public func store(_ image: NSImage, for url: URL, atSeconds seconds: Double? = nil) {
@@ -52,14 +121,14 @@ public final class ThumbnailCache: @unchecked Sendable {
     ) -> NSImage? {
         let key = cacheKey(url: url, seconds: seconds)
         if let hit = ramCache.object(forKey: key as NSString) {
-            return hit
+            return applyActiveLUTIfNeeded(to: hit, baseKey: key)
         }
 
         let diskURL = cacheDir.appendingPathComponent("\(key).jpg")
         if FileManager.default.fileExists(atPath: diskURL.path),
            let diskImage = NSImage(contentsOf: diskURL) {
             ramCache.setObject(diskImage, forKey: key as NSString, cost: estimatedByteCost(of: diskImage))
-            return diskImage
+            return applyActiveLUTIfNeeded(to: diskImage, baseKey: key)
         }
 
         if let fallback = fallbackImage {
@@ -68,7 +137,7 @@ public final class ThumbnailCache: @unchecked Sendable {
             workQueue.addOperation {
                 Self.writeJPEG(image: fallback, to: targetDisk)
             }
-            return fallback
+            return applyActiveLUTIfNeeded(to: fallback, baseKey: key)
         }
 
         // Schedule lazy background generation (non-blocking)
@@ -78,7 +147,7 @@ public final class ThumbnailCache: @unchecked Sendable {
         if seconds != nil {
             let baseKey = cacheKey(url: url, seconds: nil)
             if let baseHit = ramCache.object(forKey: baseKey as NSString) {
-                return baseHit
+                return applyActiveLUTIfNeeded(to: baseHit, baseKey: baseKey)
             }
         }
         return nil
@@ -268,6 +337,14 @@ public final class ThumbnailCache: @unchecked Sendable {
                 )
             }
         }
+    }
+
+    public func invalidate(url: URL) {
+        let baseKey = cacheKey(url: url, seconds: nil)
+        stateLock.lock()
+        failedKeys.removeAll()
+        ramCache.removeObject(forKey: baseKey as NSString)
+        stateLock.unlock()
     }
 
     private func markFailed(_ key: String) {

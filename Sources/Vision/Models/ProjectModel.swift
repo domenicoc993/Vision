@@ -6,12 +6,23 @@ public struct MediaFolder: Identifiable, Hashable, Codable {
     public var name: String
     public var itemIds: Set<UUID>
     public var parentId: UUID?
+    public var sortColumnKey: String?
+    public var sortAscending: Bool?
 
-    public init(id: UUID = UUID(), name: String, itemIds: Set<UUID> = [], parentId: UUID? = nil) {
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        itemIds: Set<UUID> = [],
+        parentId: UUID? = nil,
+        sortColumnKey: String? = nil,
+        sortAscending: Bool? = nil
+    ) {
         self.id = id
         self.name = name
         self.itemIds = itemIds
         self.parentId = parentId
+        self.sortColumnKey = sortColumnKey
+        self.sortAscending = sortAscending
     }
 }
 
@@ -68,6 +79,7 @@ public final class EditorProject {
         copy.isLinkActive = orig.isLinkActive
         copy.isSnappingActive = orig.isSnappingActive
         copy.isSelectionFollowsPlayhead = orig.isSelectionFollowsPlayhead
+        copy.isRippleTrimMode = orig.isRippleTrimMode
         copy.isCageLockActive = orig.isCageLockActive
         copy.rhythmicCages = orig.rhythmicCages
         copy.detectedBPM = orig.detectedBPM
@@ -97,7 +109,8 @@ public final class EditorProject {
                     priority: clip.priority,
                     isLocked: clip.isLocked,
                     selectionSourceIn: clip.selectionSourceIn,
-                    selectionSourceOut: clip.selectionSourceOut
+                    selectionSourceOut: clip.selectionSourceOut,
+                    colorTag: clip.colorTag
                 )
             }
             return t
@@ -125,7 +138,8 @@ public final class EditorProject {
                     priority: clip.priority,
                     isLocked: clip.isLocked,
                     selectionSourceIn: clip.selectionSourceIn,
-                    selectionSourceOut: clip.selectionSourceOut
+                    selectionSourceOut: clip.selectionSourceOut,
+                    colorTag: clip.colorTag
                 )
             }
             return t

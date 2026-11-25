@@ -77,7 +77,8 @@ public final class KeyboardShortcutsDialog: NSViewController, NSSearchFieldDeleg
                 ShortcutEntry(keys: "⌘ E", description: "Esporta timeline attiva in Final Cut XML (.fcpxmld)"),
                 ShortcutEntry(keys: "⌘ Z", description: "Annulla (Undo)"),
                 ShortcutEntry(keys: "⇧ ⌘ Z / ⌘ Y", description: "Ripeti (Redo)"),
-                ShortcutEntry(keys: "⌃ F", description: "Schermo intero Viewer"),
+                ShortcutEntry(keys: "⌘ F", description: "Schermo intero Viewer"),
+                ShortcutEntry(keys: "Z", description: "Riporta zoom Viewer su 'Adatta'"),
                 ShortcutEntry(keys: "⌘ A", description: "Seleziona tutto nella sezione attiva")
             ]
         ),
@@ -85,16 +86,21 @@ public final class KeyboardShortcutsDialog: NSViewController, NSSearchFieldDeleg
             title: "RIPRODUZIONE",
             entries: [
                 ShortcutEntry(keys: "Spazio", description: "Play / Pausa"),
-                ShortcutEntry(keys: "← / →", description: "Passo indietro / avanti di 1 frame")
+                ShortcutEntry(keys: "← / →", description: "Passo indietro / avanti di 1 frame"),
+                ShortcutEntry(keys: "↑ / ↓", description: "Sposta testina al punto focale precedente / successivo (gabbie, tagli, marcatori)")
             ]
         ),
         ShortcutSection(
             title: "MONTAGGIO & SELEZIONE (TIMELINE)",
             entries: [
-                ShortcutEntry(keys: "Q", description: "Trim inizio clip alla testina (Ripple)"),
-                ShortcutEntry(keys: "W", description: "Trim fine clip alla testina (Ripple)"),
+                ShortcutEntry(keys: "A", description: "Modalità Selezione / Trim con scarto (lascia spazio)"),
+                ShortcutEntry(keys: "T", description: "Modalità Trim / Senza scarto (Ripple)"),
+                ShortcutEntry(keys: "Q", description: "Trim inizio clip alla testina (con o senza scarto)"),
+                ShortcutEntry(keys: "W", description: "Trim fine clip alla testina (con o senza scarto)"),
+                ShortcutEntry(keys: "Tab + Trascina", description: "Slip contenuto clip con anteprima IN/OUT (Classico, Selezione, Gabbie)"),
+                ShortcutEntry(keys: "U", description: "Alterna sorgente come Selezione / Clip originale"),
                 ShortcutEntry(keys: "S / B", description: "Spezza clip alla testina (Blade)"),
-                ShortcutEntry(keys: "1 / 2 / 3", description: "Assegna priorità clip (1 Hero, 2 Buona, 3 Filler)"),
+                ShortcutEntry(keys: "1 / 2 / 3 / 4", description: "Assegna priorità clip (1 Hero, 2 Buona, 3 Filler, 4 Dialogo/Intera)"),
                 ShortcutEntry(keys: "0", description: "Rimuovi priorità dalla clip"),
                 ShortcutEntry(keys: "M", description: "Aggiungi / rimuovi marcatore (o sbarra su traccia audio)"),
                 ShortcutEntry(keys: "Trascina Pin / ⌫", description: "Sposta o elimina marcatore / beat marker su audio e video"),
@@ -102,17 +108,23 @@ public final class KeyboardShortcutsDialog: NSViewController, NSSearchFieldDeleg
                 ShortcutEntry(keys: "⌥ ⌘ W", description: "Chiudi spazi (Close Gaps) tra clip selezionate"),
                 ShortcutEntry(keys: "N", description: "Attiva / disattiva Magnet (Snapping)"),
                 ShortcutEntry(keys: "L", description: "Blocca / sblocca clip (protetta in Auto-Fill)"),
+                ShortcutEntry(keys: "\\", description: "Approva clip OK (verde, bloccata fino a nuovo \\)"),
+                ShortcutEntry(keys: "C", description: "Apri palette colori clip (Default + 12 colori)"),
                 ShortcutEntry(keys: "⌘ L / ⌥ L", description: "Attiva / disattiva Link Audio/Video"),
                 ShortcutEntry(keys: "⌥ P", description: "Attiva / disattiva Seleziona sotto testina"),
                 ShortcutEntry(keys: "⌥ ↑ / ⌥ ↓", description: "Sposta clip tra tracce video/audio"),
-                ShortcutEntry(keys: "⌫ / E (Selezione)", description: "Elimina clip (o Ripple Delete in Selezione / su gabbie)")
+                ShortcutEntry(keys: "⌫", description: "Elimina clip (lascia spazio in A, Ripple in T / Selezione)"),
+                ShortcutEntry(keys: "E", description: "Elimina clip con scarto (Ripple Delete su Timeline / Selezione / Gabbie)")
             ]
         ),
         ShortcutSection(
             title: "GABBIE RITMATE",
             entries: [
+                ShortcutEntry(keys: "G", description: "Attiva / disattiva Modalità Gabbia"),
+                ShortcutEntry(keys: "⌥ G", description: "Allinea clip selezionate alle gabbie vicine (±6 frame)"),
+                ShortcutEntry(keys: "⇧ ⌘ ← / ⇧ ⌘ →", description: "Seleziona clip precedente / successiva"),
                 ShortcutEntry(keys: "⌥ S", description: "Alterna Slow Motion 50%"),
-                ShortcutEntry(keys: "⌥ + / ⌥ −", description: "Espandi / riduci span gabbia (1x / 2x / 3x)"),
+                ShortcutEntry(keys: "⌥ + / ⌥ −", description: "Espandi / riduci span clip nelle gabbie (solo gabbie intere)"),
                 ShortcutEntry(keys: "⌥ ← / ⌥ →", description: "Slip contenuto interno clip (±0.25s)"),
                 ShortcutEntry(keys: "⌘ ← / ⌘ →", description: "Scambia clip tra gabbie adiacenti")
             ]
@@ -817,10 +829,11 @@ public final class KeyboardShortcutsDialog: NSViewController, NSSearchFieldDeleg
         sensLbl.font = NSFont.systemFont(ofSize: compact ? 11 : 11.5, weight: .medium)
         sensLbl.textColor = NSColor(calibratedWhite: compact ? 0.68 : 0.78, alpha: 1.0)
 
-        let sensSlider = NSSlider(
+        let sensSlider = VisionSlider(
             value: mgr.wheelSensitivity,
             minValue: 0.1,
             maxValue: 4.0,
+            defaultValue: 1.0,
             target: self,
             action: #selector(onWheelSensitivityChanged(_:))
         )

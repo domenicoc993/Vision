@@ -1,7 +1,9 @@
 import AppKit
 import Foundation
 
-public final class ProxyGenerationDialog: NSWindowController {
+public final class ProxyGenerationDialog: NSWindowController, NSWindowDelegate {
+    private static var activeDialogs: [ObjectIdentifier: ProxyGenerationDialog] = [:]
+
     private let mediaItems: [MediaItem]
     private var chosenFolderURL: URL
     private var onCompletion: (() -> Void)?
@@ -30,10 +32,22 @@ public final class ProxyGenerationDialog: NSWindowController {
             defer: false
         )
         window.title = "Crea Proxy Video"
+        window.appearance = NSAppearance(named: .darkAqua)
         window.center()
         super.init(window: window)
+        window.delegate = self
 
         setupUI()
+    }
+
+    public override func showWindow(_ sender: Any?) {
+        ProxyGenerationDialog.activeDialogs[ObjectIdentifier(self)] = self
+        super.showWindow(sender)
+        window?.makeKeyAndOrderFront(sender)
+    }
+
+    public func windowWillClose(_ notification: Notification) {
+        ProxyGenerationDialog.activeDialogs.removeValue(forKey: ObjectIdentifier(self))
     }
 
     required init?(coder: NSCoder) { fatalError() }

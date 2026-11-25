@@ -2,7 +2,7 @@ import AppKit
 import AVFoundation
 import UniformTypeIdentifiers
 
-public final class MainEditorViewController: NSViewController, MediaPoolDelegate {
+public final class MainEditorViewController: NSViewController, MediaPoolDelegate, NSSplitViewDelegate {
     private var timelineModel: TimelineModel = EditorProject.shared.activeTimeline
     private let playbackController = PlaybackController()
 
@@ -12,6 +12,9 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
 
     private let mainSplit = NSSplitView()
     private let topSplit = NSSplitView()
+    private var isTimelineGridExpanded = false
+    private var savedNormalTopSplitRatio: CGFloat = 0.42
+    private var savedNormalMainSplitRatio: CGFloat = 0.52
     private let bottomNavBar = NSView()
     private let activeModePill = NSView()
     private let activeModeLabel = NSTextField(labelWithString: "")
@@ -21,7 +24,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
     private var historyVC: HistoryPanelViewController?
 
     private let projectManagerBtn = IconActionButton(toolTip: "Project Manager (⌘O)", isToggleMode: false)
-    private let copyDebugBtn = NSButton()
+    private let copyDebugBtn = FlatButton(title: "Log")
     private let autosaveStatusLabel = NSTextField(labelWithString: "● Salvato")
     private let historyBtn = IconActionButton(toolTip: "Cronologia Azioni (⌘Y)", isToggleMode: false)
     private let navUndoBtn = IconActionButton(toolTip: "Annulla (⌘Z)", isToggleMode: false)
@@ -29,6 +32,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
     private let keyboardBtn = IconActionButton(toolTip: "Scorciatoie da tastiera", isToggleMode: false)
 
     private var activeSection: FocusedSection = .timeline
+    private var savedTimelineBeforeCompare: TimelineModel?
     private var rebuildTask: Task<Void, Never>?
     private var initialDocument: ProjectDocumentData?
     private var jogFrameAccumulator: Double = 0
@@ -65,26 +69,50 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         mediaPoolVC.timelineModel = timelineModel
 
         playerVC = PlayerViewController(playbackController: playbackController)
+        playerVC.hasAnyProxyProvider = { [weak self] in
+            guard let self = self else { return false }
+            if self.mediaPoolVC.mediaItems.contains(where: { $0.hasProxy }) {
+                return true
+            }
+            return EditorProject.shared.timelines.contains { tl in
+                tl.videoTracks.contains { track in
+                    track.clips.contains { $0.mediaItem.hasProxy }
+                }
+            }
+        }
         playerVC.onProxyToggled = { [weak self] in
             self?.rebuildComposition()
         }
+        playerVC.updateProxyUI()
 
         timelineVC = TimelineViewController(model: timelineModel, playbackController: playbackController)
         timelineVC.onTimelineAction = { [weak self] title in
             guard let self = self else { return }
             self.mediaPoolVC.refreshTimelineGrid()
             self.mediaPoolVC.refreshMediaPoolDisplay()
-            let skipRebuildPrefixes = ["Marcatore", "Rimuovi Marcatori", "Sposta Marcatore", "Sposta Beat Marker", "Sposta Sbarra", "Elimina Marcatore", "Elimina Sbarra", "Priorità", "Rimuovi Priorità", "Blocca Clip", "Sblocca Clip", "Beat Finder"]
+            self.timelineVC.updateFPSWarningButton()
+            let skipRebuildPrefixes = ["Marcatore", "Rimuovi Marcatori", "Sposta Marcatore", "Sposta Beat Marker", "Sposta Sbarra", "Elimina Marcatore", "Elimina Sbarra", "Priorità", "Rimuovi Priorità", "Blocca Clip", "Sblocca Clip", "Approva Clip", "Rimuovi Approvazione", "Beat Finder", "Colore Clip", "Modalità ", "Sorgente come "]
             if !skipRebuildPrefixes.contains(where: { title.hasPrefix($0) }) {
                 self.rebuildComposition()
             }
-            HistoryManager.shared.record(title: title, project: EditorProject.shared, mediaItems: self.mediaPoolVC.mediaItems)
+            if !self.timelineModel.isTemporaryCompare {
+                HistoryManager.shared.record(title: title, project: EditorProject.shared, mediaItems: self.mediaPoolVC.mediaItems)
+            }
+            self.refreshSourcePreviewUsedRangesIfNeeded()
         }
         timelineVC.onTimelineModified = { [weak self] in
             self?.timelineVC.onTimelineAction?("Modifica Timeline")
         }
         timelineVC.onFormatChangedCallback = { [weak self] format in
-            self?.playerVC.updateAspectRatio(formatSize: format.size)
+            guard let self = self else { return }
+            self.playerVC.updateAspectRatio(formatSize: format.size)
+            self.timelineVC.reloadTimelineUI()
+            let nonConf = self.timelineModel.nonConformantFrameRateClips()
+            if !nonConf.isEmpty {
+                let tlFps = TimelineModel.formatFPSLabel(format.fps)
+                self.timelineVC.showWarningToast("\(nonConf.count) clip non conformi alla timeline a \(tlFps)fps")
+                DebugLogger.shared.log("⚠ Cambio formato a \(tlFps)fps: rilevate \(nonConf.count) clip con framerate non conforme.", level: .warning)
+            }
         }
         timelineVC.onResolveMediaItem = { [weak self] id, url in
             guard let self = self else { return nil }
@@ -126,8 +154,29 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         timelineVC.onSmartFilterChanged = { [weak self] in
             self?.rebuildComposition(preserveVisualSnapshot: false)
         }
-        timelineVC.onLiveSlipPreview = { [weak self] in
-            self?.rebuildComposition(preserveVisualSnapshot: true)
+        timelineVC.onEnterCompareTimeline = { [weak self] compareTL in
+            self?.enterTemporaryCompareTimeline(compareTL)
+        }
+        timelineVC.onExitCompareTimeline = { [weak self] in
+            self?.exitTemporaryCompareTimeline()
+        }
+        timelineVC.onSlipDualPreviewUpdate = { [weak self] url, inSec, outSec, fps, clipName in
+            self?.playerVC.showSlipDualPreview(url: url, inSeconds: inSec, outSeconds: outSec, fps: fps, clipName: clipName)
+        }
+        timelineVC.onSlipDualPreviewEnd = { [weak self] in
+            self?.playerVC.hideSlipDualPreview()
+        }
+        timelineVC.onUserPlayheadScrubbed = { [weak self] in
+            self?.playerVC.hideSourcePreview()
+        }
+        timelineVC.onClipDoubleClicked = { [weak self] clip in
+            guard let self = self else { return }
+            if let target = self.resolveTimelineGridTarget(for: clip) {
+                self.mediaPoolVC.revealClipInTimelineGrid(clipId: target.clipId, trackIndex: target.trackIndex)
+            }
+        }
+        timelineVC.onRelinkMediaItemRequested = { [weak self] item in
+            self?.mediaPoolVC.relinkOrReplaceMediaItems([item], allowSingleFile: true, forceManualReplace: false)
         }
 
         print(">>> loadView: setting up splits and views...")
@@ -138,6 +187,8 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
             DispatchQueue.main.async {
                 self.mediaPoolVC.updateTimelinePopUp()
                 self.mediaPoolVC.updateFolderPopUp()
+                self.timelineVC.updateTimelineIndicator()
+                self.playerVC.updateProxyUI()
                 self.updateActiveTimelinePill()
                 ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: self.mediaPoolVC.mediaItems)
             }
@@ -161,11 +212,13 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         ) { [weak self] _ in
             guard let self = self else { return }
             self.rebuildComposition(preserveVisualSnapshot: true)
+            self.mediaPoolVC.refreshThumbnailsForLUTChange()
             ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: self.mediaPoolVC.mediaItems)
         }
 
         playbackController.addTimeObserver(self) { [weak self] time in
             guard let self = self else { return }
+            guard !self.playbackController.isLoadingItem else { return }
             let sec = max(0.0, CMTimeGetSeconds(time))
             if abs(self.timelineModel.playheadSeconds - sec) > 0.005 {
                 self.timelineModel.playheadSeconds = sec
@@ -190,35 +243,34 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         }
 
         // Horizontal Split: Media Pool / Timeline Grid (left) | Player Viewer (right)
+        mediaPoolVC.view.translatesAutoresizingMaskIntoConstraints = false
+        playerVC.view.translatesAutoresizingMaskIntoConstraints = false
         topSplit.isVertical = true
-        topSplit.dividerStyle = .thin
+        topSplit.dividerStyle = .paneSplitter
+        topSplit.delegate = self
         topSplit.translatesAutoresizingMaskIntoConstraints = false
 
         topSplit.addArrangedSubview(mediaPoolVC.view)
         topSplit.addArrangedSubview(playerVC.view)
+        topSplit.setHoldingPriority(.init(200), forSubviewAt: 0)
+        topSplit.setHoldingPriority(.init(200), forSubviewAt: 1)
 
         // Vertical Split: Top (Pool + Player) / Bottom (Timeline)
         timelineVC.view.translatesAutoresizingMaskIntoConstraints = false
         mainSplit.isVertical = false
         mainSplit.dividerStyle = .paneSplitter
+        mainSplit.delegate = self
         mainSplit.translatesAutoresizingMaskIntoConstraints = false
 
         mainSplit.addArrangedSubview(topSplit)
         mainSplit.addArrangedSubview(timelineVC.view)
+        mainSplit.setHoldingPriority(.init(200), forSubviewAt: 0)
+        mainSplit.setHoldingPriority(.init(200), forSubviewAt: 1)
 
         setupBottomNavBar()
 
         root.addSubview(mainSplit)
         root.addSubview(bottomNavBar)
-
-        let minMPWidth = mediaPoolVC.view.widthAnchor.constraint(greaterThanOrEqualToConstant: 240)
-        minMPWidth.priority = .defaultHigh
-        let minPlayerWidth = playerVC.view.widthAnchor.constraint(greaterThanOrEqualToConstant: 320)
-        minPlayerWidth.priority = .defaultHigh
-        let minTopHeight = topSplit.heightAnchor.constraint(greaterThanOrEqualToConstant: 220)
-        minTopHeight.priority = .defaultHigh
-        let minBottomHeight = timelineVC.view.heightAnchor.constraint(greaterThanOrEqualToConstant: 180)
-        minBottomHeight.priority = .defaultHigh
 
         NSLayoutConstraint.activate([
             mainSplit.topAnchor.constraint(equalTo: root.topAnchor),
@@ -229,12 +281,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
             bottomNavBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             bottomNavBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             bottomNavBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            bottomNavBar.heightAnchor.constraint(equalToConstant: 38),
-
-            minMPWidth,
-            minPlayerWidth,
-            minTopHeight,
-            minBottomHeight
+            bottomNavBar.heightAnchor.constraint(equalToConstant: 38)
         ])
 
         addChild(mediaPoolVC)
@@ -250,24 +297,191 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         setupKeyboardMonitor()
         setupSpeedEditor()
 
-        DebugLogger.shared.log("Vision avviato. Scorciatoie: ⌃F (Schermo Intero), Spazio (Play/Pausa), 1/2/3/0 (Priorità), M/⌥M (Marcatori), Q/W/S (Trim/Spezza).", level: .info)
+        DebugLogger.shared.log("Vision avviato. Scorciatoie: ⌘F (Schermo Intero), Z (Viewer Adatta), Spazio (Play/Pausa), 1/2/3/0 (Priorità), M/⌥M (Marcatori), Q/W/S (Trim/Spezza).", level: .info)
     }
 
     public override func viewDidAppear() {
         super.viewDidAppear()
+        let dividerThickness = topSplit.dividerThickness
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            let totalW = self.view.bounds.width
-            let totalH = self.view.bounds.height
-            if totalW > 500 {
-                self.topSplit.setPosition(max(320, totalW * 0.42), ofDividerAt: 0)
+            let totalW = self.topSplit.bounds.width
+            let totalH = self.mainSplit.bounds.height
+            if totalW > 560 {
+                let targetX = max(260, min(totalW - 300 - dividerThickness, totalW * 0.42))
+                self.topSplit.setPosition(targetX, ofDividerAt: 0)
             }
-            if totalH > 400 {
-                self.mainSplit.setPosition(max(280, (totalH - 38) * 0.52), ofDividerAt: 0)
+            if totalH > 380 {
+                let targetY = max(200, min(totalH - 170, totalH * 0.52))
+                self.mainSplit.setPosition(targetY, ofDividerAt: 0)
             }
             self.view.window?.makeKeyAndOrderFront(nil)
             self.view.window?.orderFrontRegardless()
+            if let win = self.view.window {
+                NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: win)
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(self.onMainWindowWillClose(_:)),
+                    name: NSWindow.willCloseNotification,
+                    object: win
+                )
+            }
         }
+    }
+
+    @objc private func onMainWindowWillClose(_ notification: Notification) {
+        saveCurrentStateImmediately()
+    }
+
+    public func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        if isTimelineGridExpanded {
+            if splitView === mainSplit { return 280 }
+            if splitView === topSplit { return 180 }
+        } else {
+            if splitView === topSplit { return 250 }
+            if splitView === mainSplit { return 200 }
+        }
+        return proposedMinimumPosition
+    }
+
+    public func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        if isTimelineGridExpanded {
+            if splitView === mainSplit {
+                return max(280, splitView.bounds.width - splitView.dividerThickness - 340)
+            }
+            if splitView === topSplit {
+                return max(180, splitView.bounds.height - splitView.dividerThickness - 150)
+            }
+        } else {
+            if splitView === topSplit {
+                return max(250, splitView.bounds.width - splitView.dividerThickness - 280)
+            }
+            if splitView === mainSplit {
+                return max(200, splitView.bounds.height - splitView.dividerThickness - 160)
+            }
+        }
+        return proposedMaximumPosition
+    }
+
+    private func resolveTimelineGridTarget(for clip: TimelineClip) -> (clipId: UUID, trackIndex: Int)? {
+        for vTrack in timelineModel.videoTracks {
+            if let vClip = vTrack.clips.first(where: { $0.id == clip.id }) {
+                return (vClip.id, vTrack.id)
+            }
+        }
+        if let linkId = clip.linkGroupId {
+            for vTrack in timelineModel.videoTracks {
+                if let linkedVideo = vTrack.clips.first(where: { $0.linkGroupId == linkId }) {
+                    return (linkedVideo.id, vTrack.id)
+                }
+            }
+        }
+        return nil
+    }
+
+    public func didToggleTimelineGridExpanded(_ isExpanded: Bool) {
+        guard isTimelineGridExpanded != isExpanded else { return }
+        let preservedLeftW = mediaPoolVC.view.frame.width
+        if isExpanded {
+            if topSplit.bounds.width > 100 && preservedLeftW > 100 {
+                savedNormalTopSplitRatio = max(0.2, min(0.7, preservedLeftW / topSplit.bounds.width))
+            }
+            if mainSplit.bounds.height > 100 {
+                let topH = topSplit.frame.height
+                if topH > 100 {
+                    savedNormalMainSplitRatio = max(0.25, min(0.75, topH / mainSplit.bounds.height))
+                }
+            }
+        }
+
+        isTimelineGridExpanded = isExpanded
+        mediaPoolVC.view.removeFromSuperview()
+        playerVC.view.removeFromSuperview()
+        timelineVC.view.removeFromSuperview()
+        topSplit.removeFromSuperview()
+
+        if isExpanded {
+            topSplit.isVertical = false
+            topSplit.addArrangedSubview(playerVC.view)
+            topSplit.addArrangedSubview(timelineVC.view)
+            topSplit.setHoldingPriority(.init(200), forSubviewAt: 0)
+            topSplit.setHoldingPriority(.init(200), forSubviewAt: 1)
+
+            mainSplit.isVertical = true
+            mainSplit.addArrangedSubview(mediaPoolVC.view)
+            mainSplit.addArrangedSubview(topSplit)
+            mainSplit.setHoldingPriority(.init(200), forSubviewAt: 0)
+            mainSplit.setHoldingPriority(.init(200), forSubviewAt: 1)
+
+            view.layoutSubtreeIfNeeded()
+            mainSplit.adjustSubviews()
+            topSplit.adjustSubviews()
+
+            let totalW = mainSplit.bounds.width
+            if totalW > 600 {
+                let div = mainSplit.dividerThickness
+                let desiredW = preservedLeftW > 100 ? preservedLeftW : (totalW * 0.5)
+                let targetLeftW = max(280, min(totalW - 340 - div, desiredW))
+                mainSplit.setPosition(targetLeftW, ofDividerAt: 0)
+            }
+            let rightH = topSplit.bounds.height
+            if rightH > 350 {
+                let div = topSplit.dividerThickness
+                let targetTopH = max(180, min(rightH - 150 - div, rightH * 0.52))
+                topSplit.setPosition(targetTopH, ofDividerAt: 0)
+            }
+        } else {
+            topSplit.isVertical = true
+            topSplit.addArrangedSubview(mediaPoolVC.view)
+            topSplit.addArrangedSubview(playerVC.view)
+            topSplit.setHoldingPriority(.init(200), forSubviewAt: 0)
+            topSplit.setHoldingPriority(.init(200), forSubviewAt: 1)
+
+            mainSplit.isVertical = false
+            mainSplit.addArrangedSubview(topSplit)
+            mainSplit.addArrangedSubview(timelineVC.view)
+            mainSplit.setHoldingPriority(.init(200), forSubviewAt: 0)
+            mainSplit.setHoldingPriority(.init(200), forSubviewAt: 1)
+
+            view.layoutSubtreeIfNeeded()
+            mainSplit.adjustSubviews()
+            topSplit.adjustSubviews()
+
+            let totalH = mainSplit.bounds.height
+            if totalH > 380 {
+                let div = mainSplit.dividerThickness
+                let targetY = max(200, min(totalH - 170 - div, totalH * savedNormalMainSplitRatio))
+                mainSplit.setPosition(targetY, ofDividerAt: 0)
+            }
+            let totalW = topSplit.bounds.width
+            if totalW > 560 {
+                let div = topSplit.dividerThickness
+                let desiredW = preservedLeftW > 100 ? preservedLeftW : (totalW * savedNormalTopSplitRatio)
+                let targetX = max(250, min(totalW - 280 - div, desiredW))
+                topSplit.setPosition(targetX, ofDividerAt: 0)
+                savedNormalTopSplitRatio = max(0.2, min(0.7, targetX / totalW))
+            }
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.mediaPoolVC.refreshTimelineGrid()
+            self?.timelineVC.reloadTimelineUI()
+        }
+    }
+
+    public func didRequestClipContextMenuFromGrid(
+        _ clip: TimelineClip,
+        event: NSEvent,
+        sourceView: NSView,
+        extraItems: [VisionMenuItem]
+    ) {
+        timelineVC.presentClipContextMenu(
+            for: clip,
+            isVideo: true,
+            extraTopItems: extraItems,
+            event: event,
+            in: sourceView
+        )
     }
 
     private func setupKeyboardMonitor() {
@@ -284,6 +498,24 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
             guard let self = self else { return event }
             guard event.window == self.view.window, NSApp.modalWindow == nil else { return event }
 
+            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let isOption = mods.contains(.option)
+            let isCommand = mods.contains(.command)
+            let isControl = mods.contains(.control)
+            let isShift = mods.contains(.shift)
+            let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
+
+            // Lascia sempre passare le scorciatoie di sistema macOS (es. ⌃⌘Q Blocca Schermo / MX Lock, ⌃⌘Space, ⌃⌘F)
+            if isControl && isCommand {
+                return event
+            }
+
+            // Command + S -> Salva progetto immediatamente ovunque (anche dentro campi di testo; mai Split 'S')
+            if isCommand && !isControl && !isOption && (event.keyCode == 1 || chars == "s") {
+                self.saveProjectWithFeedback()
+                return nil
+            }
+
             if let firstResponder = self.view.window?.firstResponder, firstResponder is NSTextView {
                 return event
             }
@@ -295,13 +527,8 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                 return nil
             }
 
-            let isOption = event.modifierFlags.contains(.option)
-            let isCommand = event.modifierFlags.contains(.command)
-            let isControl = event.modifierFlags.contains(.control)
-            let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
-
-            // Control + F -> Fullscreen Viewer from ANYWHERE in the app
-            if isControl && (event.keyCode == 3 || chars == "f") {
+            // Command + F -> Fullscreen Viewer from ANYWHERE in the app
+            if isCommand && !isControl && !isOption && !event.modifierFlags.contains(.shift) && (event.keyCode == 3 || chars == "f") {
                 self.playerVC.toggleFullScreen()
                 return nil
             }
@@ -313,6 +540,12 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                 } else {
                     self.performUndo()
                 }
+                return nil
+            }
+
+            // Z senza modificatori -> Riporta Viewer su "Adatta"
+            if !isCommand && !isControl && !isOption && !event.modifierFlags.contains(.shift) && (event.keyCode == 6 || chars == "z") {
+                self.playerVC.setViewerZoomFit()
                 return nil
             }
 
@@ -342,6 +575,9 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                 } else if chars == "3" || event.keyCode == 20 || event.keyCode == 85 {
                     targetPriority = 3
                     matchedPriorityKey = true
+                } else if chars == "4" || event.keyCode == 21 || event.keyCode == 86 {
+                    targetPriority = 4
+                    matchedPriorityKey = true
                 } else if chars == "0" || event.keyCode == 29 || event.keyCode == 82 {
                     targetPriority = nil
                     matchedPriorityKey = true
@@ -356,18 +592,32 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                         case 1: label = "Priorità 1 — Hero"
                         case 2: label = "Priorità 2 — Buona"
                         case 3: label = "Priorità 3 — Filler"
+                        case 4: label = "Priorità 4 — Dialogo / Intera"
                         default: label = "Rimuovi Priorità"
                         }
-                        self.commitTimelineEdit(title: label, rebuild: false)
+                        self.commitTimelineEdit(title: label, rebuild: false, preserveSelection: true)
                         DebugLogger.shared.log(res.summary, level: .info)
                     } else {
-                        DebugLogger.shared.log("Seleziona una clip o posiziona la testina su una clip per assegnare la priorità (1/2/3/0).", level: .warning)
+                        DebugLogger.shared.log("Seleziona una clip o posiziona la testina su una clip per assegnare la priorità (1/2/3/4/0).", level: .warning)
+                    }
+                    return nil
+                }
+
+                // '\' (keyCode 10 ISO / 42 ANSI) -> Approva / rimuovi OK clip (verde, comportamento locked sbloccabile solo con '\')
+                if chars == "\\" || event.keyCode == 10 || event.keyCode == 42 {
+                    let res = self.timelineModel.toggleSelectedClipsApproved(at: self.playbackController.accurateCurrentTime)
+                    if res.toggledCount > 0 {
+                        let label = res.isNowApproved ? "Approva Clip (\\)" : "Rimuovi Approvazione (\\)"
+                        self.commitTimelineEdit(title: label, rebuild: false, preserveSelection: true)
+                        DebugLogger.shared.log(res.isNowApproved ? "Clip approvata OK ✓ (verde, bloccata)" : "Approvazione OK rimossa", level: .info)
+                    } else {
+                        DebugLogger.shared.log("Seleziona una clip o posiziona la testina su una clip per approvarla (\\).", level: .warning)
                     }
                     return nil
                 }
 
                 // 'M' -> Segna / rimuovi marcatore su clip audio/video under playhead or selected
-                if chars == "m" || event.keyCode == 46 {
+                if !isCommand && !isControl && !isOption && (chars == "m" || event.keyCode == 46) {
                     let markTime = self.playbackController.accurateCurrentTime
                     let res = self.timelineModel.toggleClipMarker(at: markTime)
                     if res.added > 0 || res.removed > 0 {
@@ -391,12 +641,27 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                 return nil
             }
 
+            // Supporto sia tastiera US (keyCode 24/27) che tastiera Italiana (keyCode 30/44) e tastierino numerico (69/78)
+            if isOption && !isCommand && !isControl && (chars == "+" || chars == "=" || event.keyCode == 24 || event.keyCode == 30 || event.keyCode == 69) {
+                self.timelineVC.onSpanClicked()
+                return nil
+            }
+            if isOption && !isCommand && !isControl && (chars == "-" || event.keyCode == 27 || event.keyCode == 44 || event.keyCode == 78) {
+                self.timelineVC.onDecreaseSpanClicked()
+                return nil
+            }
+
             switch event.keyCode {
-            case 49: // Spacebar -> Play / Pause
-                self.playbackController.togglePlayPause()
+            case 49: // Spacebar -> Play / Pause (o Source Preview se aperta)
+                guard !isCommand && !isControl && !isOption else { break }
+                if self.playerVC.isSourcePreviewActive {
+                    self.playerVC.toggleSourcePlayPause()
+                } else {
+                    self.playbackController.togglePlayPause()
+                }
                 return nil
 
-            case 0: // 'A' key -> Select All based on active section
+            case 0: // 'A' key -> Select All (with Cmd/Ctrl) or Selection Mode / con scarto (plain A)
                 if isCommand || isControl {
                     if self.activeSection == .timeline || self.mediaPoolVC.isTimelineGridVisible {
                         var allIds: Set<UUID> = []
@@ -416,6 +681,9 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                         DebugLogger.shared.log("Media Pool: selezionati tutti gli elementi.", level: .info)
                         return nil
                     }
+                } else if !isOption {
+                    self.timelineVC.setRippleTrimMode(false)
+                    return nil
                 }
 
             case 7: // 'X' -> Taglia (⌘X / ⌃X)
@@ -423,9 +691,12 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                     if self.performCut() { return nil }
                 }
 
-            case 8: // 'C' -> Copia (⌘C / ⌃C)
+            case 8: // 'C' -> Copia (⌘C / ⌃C) oppure Palette Colore Clip (C)
                 if (isCommand || isControl) && !isOption {
                     if self.performCopy() { return nil }
+                } else if !isCommand && !isControl && !isOption {
+                    self.timelineVC.presentColorPaletteForCurrentTarget()
+                    return nil
                 }
 
             case 9: // 'V' -> Incolla (⌘V / ⌃V)
@@ -434,6 +705,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                 }
 
             case 12: // 'Q' key -> Trim start to playhead with playhead alignment
+                guard !isCommand && !isControl && !isOption else { break }
                 let editTime = self.timelineModel.isSmartFilterActive
                     ? self.timelineModel.realTimelineTime(forDisplayedTime: self.playbackController.accurateCurrentTime)
                     : self.playbackController.accurateCurrentTime
@@ -453,6 +725,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                     }
                     return nil
                 }
+                guard !isCommand && !isControl && !isOption else { break }
                 let editTime = self.timelineModel.isSmartFilterActive
                     ? self.timelineModel.realTimelineTime(forDisplayedTime: self.playbackController.accurateCurrentTime)
                     : self.playbackController.accurateCurrentTime
@@ -462,11 +735,12 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                 return nil
 
             case 1, 11: // 'S' or 'B' key
-                if isOption, self.timelineModel.selectedClipId != nil {
+                if isOption && !isCommand && !isControl, event.keyCode == 1, self.timelineModel.selectedClipId != nil {
                     // Option + S -> Toggle 50% Slow Motion
                     self.timelineVC.onToggleSpeedClicked()
                     return nil
                 }
+                guard !isCommand && !isControl && !isOption else { break }
                 // S / B -> Spezza clip alla testina
                 let editTime = self.timelineModel.isSmartFilterActive
                     ? self.timelineModel.realTimelineTime(forDisplayedTime: self.playbackController.accurateCurrentTime)
@@ -476,30 +750,45 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                 }
                 return nil
 
-            case 24: // '+' or '=' key
+            case 24, 69: // '+' or '=' key
                 if isOption {
-                    // Option + (+) -> Aumenta Span gabbia (1x -> 2x -> 3x)
                     self.timelineVC.onSpanClicked()
                     return nil
                 }
 
-            case 27: // '-' key
-                if isOption, let selId = self.timelineModel.selectedClipId {
-                    // Option + (-) -> Riduci Span gabbia
-                    for track in self.timelineModel.videoTracks {
-                        if let clip = track.clips.first(where: { $0.id == selId }), clip.span > 1 {
-                            if self.timelineModel.setClipSpan(clipId: selId, newSpan: clip.span - 1) {
-                                self.commitTimelineEdit(title: "Riduci Span Gabbia (⌥-)")
-                            }
-                            break
-                        }
+            case 27, 78: // '-' key
+                if isOption {
+                    self.timelineVC.onDecreaseSpanClicked()
+                    return nil
+                }
+
+            case 5: // 'G' key -> Toggle Modalità Gabbie, Option+G -> Allinea selezione alle Gabbie
+                if isOption && !isCommand && !isControl {
+                    let res = self.timelineModel.alignSelectedClipsToCages(at: self.playbackController.accurateCurrentTime)
+                    if res.alignedCount > 0 {
+                        self.commitTimelineEdit(title: "Allinea alle Gabbie (⌥G)", preserveSelection: true)
+                        DebugLogger.shared.log("Allineate \(res.alignedCount) clip alle gabbie ritmate (±6 frame).", level: .info)
+                    } else {
+                        self.timelineVC.showWarningToast("Nessuna clip entro ±6 frame da una sbarra (o bloccata/materiale insufficiente).")
                     }
+                    return nil
+                }
+                if !isCommand && !isControl && !isOption {
+                    self.timelineVC.onCageLockToggleClicked()
+                    return nil
+                }
+
+            case 32: // 'U' key -> Alterna Sorgente come Selezione vs Clip Originale
+                if !isCommand && !isControl && !isOption {
+                    self.timelineVC.onSourceBoundsToggleClicked()
                     return nil
                 }
 
             case 45: // 'N' key -> Toggle Magnet Snapping (Resolve convention)
-                self.timelineVC.onMagnetToggleClicked()
-                return nil
+                if !isCommand && !isControl && !isOption {
+                    self.timelineVC.onMagnetToggleClicked()
+                    return nil
+                }
 
             case 37: // 'L' key -> Toggle Link / Unlink if Cmd/Opt, otherwise Lock/Unlock selected clip
                 if isCommand || isOption {
@@ -510,7 +799,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                     let res = self.timelineModel.toggleSelectedClipsLock(at: self.playbackController.accurateCurrentTime)
                     if res.toggledCount > 0 {
                         let label = res.isNowLocked ? "Blocca Clip (L)" : "Sblocca Clip (L)"
-                        self.commitTimelineEdit(title: label, rebuild: false)
+                        self.commitTimelineEdit(title: label, rebuild: false, preserveSelection: true)
                         DebugLogger.shared.log(res.isNowLocked ? "Clip bloccata 🔒 (protetta in Auto-Fill)" : "Clip sbloccata 🔓", level: .info)
                     } else {
                         DebugLogger.shared.log("Seleziona una clip o posiziona la testina su una clip per bloccarla/sbloccarla (L).", level: .warning)
@@ -523,48 +812,83 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                     self.timelineVC.onSelectionFollowsPlayheadClicked()
                     return nil
                 }
+            case 17: // 'T' key -> Trim / Ripple Mode (senza scarto)
+                if !isCommand && !isControl && !isOption {
+                    self.timelineVC.setRippleTrimMode(true)
+                    return nil
+                }
 
             case 123: // Left Arrow
+                if isShift && !isControl && !isOption {
+                    self.selectAdjacentClipFromKeyboard(direction: -1)
+                    return nil
+                }
                 if isOption, self.timelineModel.selectedClipId != nil {
                     // Option + Left -> Slip corpo clip indietro (-0.25s)
                     self.timelineVC.onSlipLeftClicked()
                     return nil
                 }
-                if isCommand, let selId = self.timelineModel.selectedClipId {
-                    // Command + Left -> Scambia con la gabbia precedente
-                    if self.timelineModel.swapAdjacentCages(clipId: selId, direction: -1) {
-                        self.commitTimelineEdit(title: "Scambia Gabbia Ritmica (←)")
+                if isCommand, !self.timelineModel.selectedClipIds.isEmpty {
+                    // Command + Left -> Sposta clip/gruppo in Selezione o scambia gabbia precedente
+                    if self.timelineModel.isSelection {
+                        if self.timelineModel.moveSelectedClipsInSelection(clipIds: self.timelineModel.selectedClipIds, direction: -1) {
+                            self.commitTimelineEdit(title: "Sposta Clip Selezione (←)", preserveSelection: true)
+                        }
+                    } else if let selId = self.timelineModel.selectedClipId,
+                              self.timelineModel.swapAdjacentCages(clipId: selId, direction: -1) {
+                        self.commitTimelineEdit(title: "Scambia Gabbia Ritmica (←)", preserveSelection: true)
                     }
                     return nil
                 }
-                self.playbackController.step(by: -1)
-                return nil
+                if !isShift && !isCommand && !isControl && !isOption {
+                    self.playbackController.step(by: -1)
+                    return nil
+                }
 
             case 124: // Right Arrow
+                if isShift && !isControl && !isOption {
+                    self.selectAdjacentClipFromKeyboard(direction: +1)
+                    return nil
+                }
                 if isOption, self.timelineModel.selectedClipId != nil {
                     // Option + Right -> Slip corpo clip avanti (+0.25s)
                     self.timelineVC.onSlipRightClicked()
                     return nil
                 }
-                if isCommand, let selId = self.timelineModel.selectedClipId {
-                    // Command + Right -> Scambia con la gabbia successiva
-                    if self.timelineModel.swapAdjacentCages(clipId: selId, direction: +1) {
-                        self.commitTimelineEdit(title: "Scambia Gabbia Ritmica (→)")
+                if isCommand, !self.timelineModel.selectedClipIds.isEmpty {
+                    // Command + Right -> Sposta clip/gruppo in Selezione o scambia gabbia successiva
+                    if self.timelineModel.isSelection {
+                        if self.timelineModel.moveSelectedClipsInSelection(clipIds: self.timelineModel.selectedClipIds, direction: +1) {
+                            self.commitTimelineEdit(title: "Sposta Clip Selezione (→)", preserveSelection: true)
+                        }
+                    } else if let selId = self.timelineModel.selectedClipId,
+                              self.timelineModel.swapAdjacentCages(clipId: selId, direction: +1) {
+                        self.commitTimelineEdit(title: "Scambia Gabbia Ritmica (→)", preserveSelection: true)
                     }
                     return nil
                 }
-                self.playbackController.step(by: 1)
-                return nil
+                if !isShift && !isCommand && !isControl && !isOption {
+                    self.playbackController.step(by: 1)
+                    return nil
+                }
 
-            case 126: // Up Arrow
+            case 126: // Up Arrow -> Sposta traccia su (⌥↑) o punto focale precedente (↑)
                 if isOption, let id = self.timelineModel.selectedClipId {
                     self.moveSelectedClipVertically(id: id, isMovingUp: true)
                     return nil
                 }
+                if !isCommand && !isControl && !isOption && !isShift && !self.isMediaPoolTableFocused() {
+                    self.stepToAdjacentFocalPoint(direction: -1)
+                    return nil
+                }
 
-            case 125: // Down Arrow
+            case 125: // Down Arrow -> Sposta traccia giù (⌥↓) o punto focale successivo (↓)
                 if isOption, let id = self.timelineModel.selectedClipId {
                     self.moveSelectedClipVertically(id: id, isMovingUp: false)
+                    return nil
+                }
+                if !isCommand && !isControl && !isOption && !isShift && !self.isMediaPoolTableFocused() {
+                    self.stepToAdjacentFocalPoint(direction: +1)
                     return nil
                 }
 
@@ -578,19 +902,19 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                     }
                     return event
                 }
-                if self.performBackspaceOrRippleDelete() {
+                if self.performBackspaceOrRippleDelete(forceRipple: nil) {
                     return nil
                 }
 
-            case 14: // 'E' key -> In Selezione e Modalità Gabbie equivale a Backspace (Elimina con scarto)
-                if !isCommand && !isControl && !isOption && (self.timelineModel.isSelection || self.timelineModel.isCageLockActive) {
-                    if self.performBackspaceOrRippleDelete() {
+            case 14: // 'E' key -> Elimina con scarto (Ripple Delete) su Timeline / Selezione / Gabbie
+                if !isCommand && !isControl && !isOption && (!self.isMediaPoolFocusedForDeletion() || !self.timelineModel.selectedClipIds.isEmpty) {
+                    if self.performBackspaceOrRippleDelete(forceRipple: true) {
                         return nil
                     }
                 }
 
-            case 15: // 'R' key -> Slow-Mo in gabbia (R) o Slow-Mo 2 gabbie (⌘R)
-                if !isOption && !isControl && self.timelineModel.selectedClipId != nil {
+            case 15: // 'R' key -> Slow-Mo in gabbia / Selezione (R) o Slow-Mo 2 gabbie (⌘R)
+                if !isOption && !isControl && self.timelineModel.resolvedVideoClipId() != nil {
                     if isCommand {
                         self.timelineVC.onToggleSlowMoMultiCageClicked()
                     } else {
@@ -667,6 +991,12 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
     }
 
     private func isMediaPoolFocusedForDeletion() -> Bool {
+        if mediaPoolVC.isTimelineGridVisible {
+            return false
+        }
+        if activeSection == .timeline {
+            return false
+        }
         if activeSection == .mediaPool {
             return true
         }
@@ -677,23 +1007,34 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
     }
 
     @discardableResult
-    private func performBackspaceOrRippleDelete() -> Bool {
+    private func performBackspaceOrRippleDelete(forceRipple: Bool? = nil) -> Bool {
         if self.timelineVC.deleteSelectedMarker() {
             self.commitTimelineEdit(title: "Elimina Marcatore", rebuild: false)
             return true
         }
+        let realPlayhead = self.timelineModel.isSmartFilterActive
+            ? self.timelineModel.realTimelineTime(forDisplayedTime: self.playbackController.accurateCurrentTime)
+            : self.playbackController.accurateCurrentTime
         if self.timelineModel.selectedClipIds.isEmpty && self.timelineModel.isSelectionFollowsPlayhead {
-            self.timelineModel.updateSelectionAtPlayhead(time: self.playbackController.currentTime)
+            self.timelineModel.updateSelectionAtPlayhead(time: realPlayhead)
         }
-        if let selId = self.timelineModel.selectedClipId, !self.timelineModel.activeCageIntervals().isEmpty {
+        if self.timelineModel.selectedClipIds.count <= 1,
+           let selId = self.timelineModel.selectedClipId,
+           !self.timelineModel.activeCageIntervals().isEmpty {
             if self.timelineModel.slotRippleDelete(clipId: selId) {
                 self.commitTimelineEdit(title: "Elimina Clip Ritmica")
                 return true
             }
         }
         if !self.timelineModel.selectedClipIds.isEmpty {
-            self.timelineModel.removeSelectedClips()
-            self.commitTimelineEdit(title: "Elimina Clip")
+            let useRipple = forceRipple ?? (self.timelineModel.isRippleTrimMode || self.timelineModel.isSelection)
+            if useRipple {
+                self.timelineModel.removeSelectedClips()
+                self.commitTimelineEdit(title: "Elimina Clip (Ripple)")
+            } else {
+                self.timelineModel.removeSelectedClipsWithoutRipple()
+                self.commitTimelineEdit(title: "Elimina Clip (Lascia Spazio)")
+            }
             return true
         }
         return false
@@ -797,7 +1138,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                 commitTimelineEdit(title: "Spezza Clip")
             }
         case .rippleDelete:
-            _ = performBackspaceOrRippleDelete()
+            _ = performBackspaceOrRippleDelete(forceRipple: true)
         case .closeGaps:
             if timelineModel.closeGapsBetweenSelectedClips() {
                 commitTimelineEdit(title: "Chiudi Spazi")
@@ -813,7 +1154,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                 commitTimelineEdit(title: "Rimuovi Marcatori Clip", rebuild: false)
             }
         case .toggleSlowMotion:
-            if timelineModel.selectedClipId != nil {
+            if timelineModel.resolvedVideoClipId() != nil {
                 timelineVC.onToggleSpeedClicked()
             }
         case .toggleLock:
@@ -851,12 +1192,22 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                 }
             }
         case .swapLeft:
-            if let selId = timelineModel.selectedClipId, timelineModel.swapAdjacentCages(clipId: selId, direction: -1) {
-                commitTimelineEdit(title: "Scambia Gabbia (←)")
+            if timelineModel.isSelection {
+                if !timelineModel.selectedClipIds.isEmpty,
+                   timelineModel.moveSelectedClipsInSelection(clipIds: timelineModel.selectedClipIds, direction: -1) {
+                    commitTimelineEdit(title: "Sposta Clip Selezione (←)", preserveSelection: true)
+                }
+            } else if let selId = timelineModel.selectedClipId, timelineModel.swapAdjacentCages(clipId: selId, direction: -1) {
+                commitTimelineEdit(title: "Scambia Gabbia (←)", preserveSelection: true)
             }
         case .swapRight:
-            if let selId = timelineModel.selectedClipId, timelineModel.swapAdjacentCages(clipId: selId, direction: +1) {
-                commitTimelineEdit(title: "Scambia Gabbia (→)")
+            if timelineModel.isSelection {
+                if !timelineModel.selectedClipIds.isEmpty,
+                   timelineModel.moveSelectedClipsInSelection(clipIds: timelineModel.selectedClipIds, direction: +1) {
+                    commitTimelineEdit(title: "Sposta Clip Selezione (→)", preserveSelection: true)
+                }
+            } else if let selId = timelineModel.selectedClipId, timelineModel.swapAdjacentCages(clipId: selId, direction: +1) {
+                commitTimelineEdit(title: "Scambia Gabbia (→)", preserveSelection: true)
             }
         case .moveClipUp:
             if let id = timelineModel.selectedClipId { moveSelectedClipVertically(id: id, isMovingUp: true) }
@@ -915,23 +1266,19 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         projectManagerBtn.widthAnchor.constraint(equalToConstant: 24).isActive = true
         projectManagerBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
 
-        copyDebugBtn.wantsLayer = true
-        copyDebugBtn.isBordered = false
         copyDebugBtn.title = "Log"
-        copyDebugBtn.image = Lucide.image(.fileCode2, size: 11, color: NSColor(calibratedRed: 1.0, green: 0.72, blue: 0.72, alpha: 1.0))
+        copyDebugBtn.image = Lucide.image(.fileCode2, size: 12, color: NSColor(calibratedRed: 1.0, green: 0.72, blue: 0.72, alpha: 1.0))
         copyDebugBtn.imagePosition = .imageLeading
         copyDebugBtn.font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
-        copyDebugBtn.contentTintColor = NSColor(calibratedRed: 1.0, green: 0.75, blue: 0.75, alpha: 1.0)
+        copyDebugBtn.customBackgroundColor = NSColor.systemRed.withAlphaComponent(0.24)
+        copyDebugBtn.customBorderColor = NSColor.systemRed.withAlphaComponent(0.65)
+        copyDebugBtn.customTextColor = NSColor(calibratedRed: 1.0, green: 0.75, blue: 0.75, alpha: 1.0)
         copyDebugBtn.toolTip = "Apri modale Log & Diagnostica con ricerca"
-        copyDebugBtn.layer?.backgroundColor = NSColor.systemRed.withAlphaComponent(0.24).cgColor
-        copyDebugBtn.layer?.borderColor = NSColor.systemRed.withAlphaComponent(0.65).cgColor
-        copyDebugBtn.layer?.borderWidth = 1.0
-        copyDebugBtn.layer?.cornerRadius = 5
         copyDebugBtn.translatesAutoresizingMaskIntoConstraints = false
         copyDebugBtn.target = self
         copyDebugBtn.action = #selector(onCopyDebugClicked)
-        copyDebugBtn.widthAnchor.constraint(equalToConstant: 58).isActive = true
-        copyDebugBtn.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        copyDebugBtn.widthAnchor.constraint(equalToConstant: 64).isActive = true
+        copyDebugBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
 
         autosaveStatusLabel.font = NSFont.systemFont(ofSize: 10, weight: .medium)
         autosaveStatusLabel.textColor = NSColor.systemGreen.withAlphaComponent(0.85)
@@ -1005,10 +1352,17 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
     }
 
     private func updateActiveTimelinePill() {
-        activeModePill.layer?.backgroundColor = NSColor.systemCyan.withAlphaComponent(0.12).cgColor
-        activeModePill.layer?.borderColor = NSColor.systemCyan.withAlphaComponent(0.32).cgColor
-        activeModeLabel.textColor = NSColor(calibratedWhite: 0.90, alpha: 1.0)
-        activeModeLabel.stringValue = "Montaggio"
+        if timelineModel.isTemporaryCompare {
+            activeModePill.layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.16).cgColor
+            activeModePill.layer?.borderColor = NSColor.systemYellow.withAlphaComponent(0.45).cgColor
+            activeModeLabel.textColor = .systemYellow
+            activeModeLabel.stringValue = "Confronto (Temp)"
+        } else {
+            activeModePill.layer?.backgroundColor = NSColor.systemCyan.withAlphaComponent(0.12).cgColor
+            activeModePill.layer?.borderColor = NSColor.systemCyan.withAlphaComponent(0.32).cgColor
+            activeModeLabel.textColor = NSColor(calibratedWhite: 0.90, alpha: 1.0)
+            activeModeLabel.stringValue = "Montaggio"
+        }
     }
 
     private func moveSelectedClipVertically(id: UUID, isMovingUp: Bool) {
@@ -1026,7 +1380,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                         return
                     }
                     timelineModel.commitMoveClip(id: id, toTrack: targetTrack, isVideo: true)
-                    commitTimelineEdit(title: "Sposta Clip su V\(targetTrack + 1)")
+                    commitTimelineEdit(title: "Sposta Clip su V\(targetTrack + 1)", preserveSelection: true)
                 }
                 return
             }
@@ -1046,15 +1400,15 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                         return
                     }
                     timelineModel.commitMoveClip(id: id, toTrack: targetTrack, isVideo: false)
-                    commitTimelineEdit(title: "Sposta Clip su A\(targetTrack + 1)")
+                    commitTimelineEdit(title: "Sposta Clip su A\(targetTrack + 1)", preserveSelection: true)
                 }
                 return
             }
         }
     }
 
-    private func commitTimelineEdit(title: String, rebuild: Bool = true) {
-        if timelineModel.isSelectionFollowsPlayhead {
+    private func commitTimelineEdit(title: String, rebuild: Bool = true, preserveSelection: Bool = false) {
+        if timelineModel.isSelectionFollowsPlayhead && !preserveSelection {
             timelineModel.updateSelectionAtPlayhead(time: playbackController.currentTime)
         }
         timelineVC.reloadTimelineUI()
@@ -1062,7 +1416,9 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         if rebuild {
             rebuildComposition()
         }
-        HistoryManager.shared.record(title: title, project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
+        if !timelineModel.isTemporaryCompare {
+            HistoryManager.shared.record(title: title, project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
+        }
     }
 
     public func didActivateSection(_ section: FocusedSection) {
@@ -1072,6 +1428,7 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
     private var playheadAutosaveWorkItem: DispatchWorkItem?
 
     private func schedulePlayheadAutosave() {
+        guard !timelineModel.isTemporaryCompare else { return }
         playheadAutosaveWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
@@ -1082,7 +1439,9 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
     }
 
     public func saveCurrentStateImmediately() {
-        timelineModel.playheadSeconds = max(0.0, CMTimeGetSeconds(playbackController.accurateCurrentTime))
+        if !timelineModel.isTemporaryCompare {
+            timelineModel.playheadSeconds = max(0.0, CMTimeGetSeconds(playbackController.accurateCurrentTime))
+        }
         let doc = ProjectDocumentData(project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
         ProjectDatabase.shared.saveDocumentImmediately(doc)
         _ = ProjectBackupManager.shared.createBackupIfNeeded(
@@ -1092,8 +1451,53 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         )
     }
 
+    @objc public func saveProjectWithFeedback() {
+        saveCurrentStateImmediately()
+        let timeStr = Self.autosaveTimeFormatter.string(from: Date())
+        autosaveStatusLabel.stringValue = "● Salvato (\(timeStr))"
+        autosaveStatusLabel.textColor = NSColor.systemGreen.withAlphaComponent(0.95)
+        DebugLogger.shared.log("Progetto salvato manualmente (⌘S) alle \(timeStr).", level: .info)
+    }
+
+    public func enterTemporaryCompareTimeline(_ compareTL: TimelineModel) {
+        if !self.timelineModel.isTemporaryCompare {
+            self.timelineModel.playheadSeconds = max(0.0, CMTimeGetSeconds(playbackController.accurateCurrentTime))
+            self.savedTimelineBeforeCompare = self.timelineModel
+        }
+        self.timelineModel = compareTL
+        self.activeSection = .timeline
+        self.playbackController.setPlayheadForPendingReload(.zero)
+        self.timelineVC.switchModel(compareTL)
+        self.mediaPoolVC.timelineModel = compareTL
+        self.playerVC.updateAspectRatio(formatSize: compareTL.format.size)
+        self.mediaPoolVC.refreshTimelineGrid()
+        self.updateActiveTimelinePill()
+        self.rebuildComposition(preserveVisualSnapshot: false)
+        let clipCount = compareTL.videoTracks.first?.clips.count ?? 0
+        DebugLogger.shared.log("Modalità Confronta aperta (temporanea, non salvata): \(clipCount) spezzoni in '\(compareTL.name)'.", level: .info)
+    }
+
+    public func exitTemporaryCompareTimeline() {
+        let target = savedTimelineBeforeCompare ?? EditorProject.shared.activeTimeline
+        savedTimelineBeforeCompare = nil
+        didSwitchActiveTimeline(to: target)
+        DebugLogger.shared.log("Modalità Confronta chiusa: ritorno a '\(target.name)'.", level: .info)
+    }
+
     public func didSwitchActiveTimeline(to timeline: TimelineModel) {
-        self.timelineModel.playheadSeconds = max(0.0, CMTimeGetSeconds(playbackController.accurateCurrentTime))
+        let isSwitchingTimeline = (timeline.id != self.timelineModel.id)
+        if !self.timelineModel.isTemporaryCompare {
+            self.timelineModel.playheadSeconds = max(0.0, CMTimeGetSeconds(playbackController.accurateCurrentTime))
+        }
+        if isSwitchingTimeline && playbackController.isPlaying {
+            playbackController.pause()
+        }
+        if !timeline.isTemporaryCompare {
+            self.savedTimelineBeforeCompare = nil
+            if let idx = EditorProject.shared.timelines.firstIndex(where: { $0.id == timeline.id }) {
+                EditorProject.shared.activeTimelineIndex = idx
+            }
+        }
         self.timelineModel = timeline
         self.activeSection = .timeline
         let restoredTime = CMTime(seconds: max(0.0, timeline.playheadSeconds), preferredTimescale: 600)
@@ -1103,15 +1507,102 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         self.playerVC.updateAspectRatio(formatSize: timeline.format.size)
         self.mediaPoolVC.refreshTimelineGrid()
         self.updateActiveTimelinePill()
-        self.rebuildComposition(preserveVisualSnapshot: false)
-        ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
+        self.rebuildComposition(preserveVisualSnapshot: false, explicitSeekTime: restoredTime)
+        self.timelineVC.centerViewportOnPlayheadIfOutsideVisibleArea()
+        DispatchQueue.main.async { [weak self] in
+            self?.timelineVC.centerViewportOnPlayheadIfOutsideVisibleArea()
+        }
+        self.refreshSourcePreviewUsedRangesIfNeeded()
+        if !timeline.isTemporaryCompare {
+            ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
+        }
     }
 
     public func didRenameTimeline(_ timeline: TimelineModel) {
         if self.timelineModel.id == timeline.id {
             self.timelineVC.reloadTimelineUI()
+            self.updateActiveTimelinePill()
         }
         HistoryManager.shared.record(title: "Rinomina Timeline", project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
+        ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
+    }
+
+    public func didRenameMediaItem(_ item: MediaItem) {
+        for tl in EditorProject.shared.timelines {
+            for tIdx in 0..<tl.videoTracks.count {
+                for cIdx in 0..<tl.videoTracks[tIdx].clips.count {
+                    if tl.videoTracks[tIdx].clips[cIdx].mediaItem.id == item.id {
+                        tl.videoTracks[tIdx].clips[cIdx].mediaItem.name = item.name
+                    }
+                }
+            }
+            for tIdx in 0..<tl.audioTracks.count {
+                for cIdx in 0..<tl.audioTracks[tIdx].clips.count {
+                    if tl.audioTracks[tIdx].clips[cIdx].mediaItem.id == item.id {
+                        tl.audioTracks[tIdx].clips[cIdx].mediaItem.name = item.name
+                    }
+                }
+            }
+        }
+        self.timelineVC.reloadTimelineUI()
+        self.mediaPoolVC.refreshTimelineGrid()
+        HistoryManager.shared.record(title: "Rinomina Clip", project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
+        ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
+    }
+
+    public func didRelinkMediaItems(_ updatedItems: [MediaItem]) {
+        guard !updatedItems.isEmpty else { return }
+        let updatedById = Dictionary(uniqueKeysWithValues: updatedItems.map { ($0.id, $0) })
+
+        func propagate(into timeline: TimelineModel) {
+            for tIdx in 0..<timeline.videoTracks.count {
+                for cIdx in 0..<timeline.videoTracks[tIdx].clips.count {
+                    let clipId = timeline.videoTracks[tIdx].clips[cIdx].mediaItem.id
+                    if let newItem = updatedById[clipId] {
+                        timeline.videoTracks[tIdx].clips[cIdx].mediaItem = newItem
+                        timeline.videoTracks[tIdx].clips[cIdx].isOrphan = false
+                        let maxDur = max(0.05, CMTimeGetSeconds(newItem.duration))
+                        let curIn = min(max(0.0, CMTimeGetSeconds(timeline.videoTracks[tIdx].clips[cIdx].sourceIn)), max(0.0, maxDur - 0.05))
+                        let curOut = min(maxDur, max(curIn + 0.05, CMTimeGetSeconds(timeline.videoTracks[tIdx].clips[cIdx].sourceOut)))
+                        if CMTimeGetSeconds(timeline.videoTracks[tIdx].clips[cIdx].sourceOut) > maxDur + 0.05 {
+                            timeline.videoTracks[tIdx].clips[cIdx].sourceIn = CMTime(seconds: curIn, preferredTimescale: 600)
+                            timeline.videoTracks[tIdx].clips[cIdx].sourceOut = CMTime(seconds: curOut, preferredTimescale: 600)
+                        }
+                    }
+                }
+            }
+            for tIdx in 0..<timeline.audioTracks.count {
+                for cIdx in 0..<timeline.audioTracks[tIdx].clips.count {
+                    let clipId = timeline.audioTracks[tIdx].clips[cIdx].mediaItem.id
+                    if let newItem = updatedById[clipId] {
+                        timeline.audioTracks[tIdx].clips[cIdx].mediaItem = newItem
+                        timeline.audioTracks[tIdx].clips[cIdx].isOrphan = false
+                        let maxDur = max(0.05, CMTimeGetSeconds(newItem.duration))
+                        let curIn = min(max(0.0, CMTimeGetSeconds(timeline.audioTracks[tIdx].clips[cIdx].sourceIn)), max(0.0, maxDur - 0.05))
+                        let curOut = min(maxDur, max(curIn + 0.05, CMTimeGetSeconds(timeline.audioTracks[tIdx].clips[cIdx].sourceOut)))
+                        if CMTimeGetSeconds(timeline.audioTracks[tIdx].clips[cIdx].sourceOut) > maxDur + 0.05 {
+                            timeline.audioTracks[tIdx].clips[cIdx].sourceIn = CMTime(seconds: curIn, preferredTimescale: 600)
+                            timeline.audioTracks[tIdx].clips[cIdx].sourceOut = CMTime(seconds: curOut, preferredTimescale: 600)
+                        }
+                    }
+                }
+            }
+        }
+
+        for tl in EditorProject.shared.timelines {
+            propagate(into: tl)
+        }
+        if timelineModel.isTemporaryCompare {
+            propagate(into: timelineModel)
+        }
+
+        self.timelineVC.reloadTimelineUI()
+        self.mediaPoolVC.refreshTimelineGrid()
+        self.mediaPoolVC.refreshMediaPoolDisplay()
+        self.playerVC.updateProxyUI()
+        self.rebuildComposition(preserveVisualSnapshot: false)
+        self.refreshSourcePreviewUsedRangesIfNeeded()
+        HistoryManager.shared.record(title: "Ricollega Clip", project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
         ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
     }
 
@@ -1132,6 +1623,57 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         commitTimelineEdit(title: "Aggiungi Clip in Timeline")
     }
 
+    public func didSelectMediaItemForSourcePreview(_ item: MediaItem) {
+        if playbackController.isPlaying {
+            playbackController.togglePlayPause()
+        }
+        let ranges = usedSourceRanges(forMediaId: item.id, in: timelineModel)
+        playerVC.showSourcePreview(item: item, usedRangesInTimeline: ranges)
+    }
+
+    private func refreshSourcePreviewUsedRangesIfNeeded() {
+        guard playerVC.isSourcePreviewActive, let mId = playerVC.sourcePreviewMediaId else { return }
+        let ranges = usedSourceRanges(forMediaId: mId, in: timelineModel)
+        playerVC.updateSourceUsedRanges(ranges, forMediaId: mId)
+    }
+
+    private func usedSourceRanges(forMediaId mediaId: UUID, in model: TimelineModel) -> [(start: Double, end: Double)] {
+        var raw: [(start: Double, end: Double)] = []
+        for track in model.videoTracks {
+            for clip in track.clips where clip.mediaItem.id == mediaId {
+                let s = CMTimeGetSeconds(clip.sourceIn)
+                let e = CMTimeGetSeconds(clip.sourceOut)
+                if e > s + 0.005 { raw.append((s, e)) }
+            }
+        }
+        for track in model.audioTracks {
+            for clip in track.clips where clip.mediaItem.id == mediaId {
+                let s = CMTimeGetSeconds(clip.sourceIn)
+                let e = CMTimeGetSeconds(clip.sourceOut)
+                if e > s + 0.005 { raw.append((s, e)) }
+            }
+        }
+        guard !raw.isEmpty else { return [] }
+        let sorted = raw.sorted { $0.start < $1.start }
+        var merged: [(start: Double, end: Double)] = []
+        for seg in sorted {
+            if let last = merged.last, seg.start <= last.end + 0.01 {
+                merged[merged.count - 1] = (last.start, max(last.end, seg.end))
+            } else {
+                merged.append(seg)
+            }
+        }
+        return merged
+    }
+
+    public func didSelectAddClipsToTimeline(_ items: [MediaItem]) {
+        guard !items.isEmpty else { return }
+        for item in items {
+            timelineModel.appendClip(mediaItem: item)
+        }
+        commitTimelineEdit(title: items.count > 1 ? "Aggiungi \(items.count) Clip in Timeline" : "Aggiungi Clip in Timeline")
+    }
+
     public func didChangeMediaOrientation(_ item: MediaItem) {
         for trackIdx in 0..<timelineModel.videoTracks.count where !timelineModel.videoTracks[trackIdx].isLocked {
             for clipIdx in 0..<timelineModel.videoTracks[trackIdx].clips.count {
@@ -1144,15 +1686,56 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
     }
 
     public func didSelectSeekToClip(_ clip: TimelineClip) {
+        timelineVC.preserveSelectionForNextSeek()
         playbackController.seek(to: clip.timelineStart, frameAccurate: true)
         timelineVC.reloadTimelineUI()
     }
 
+    public func didChangeSelectionFromGrid() {
+        timelineVC.reloadTimelineUI()
+    }
+
+    private func isMediaPoolTableFocused() -> Bool {
+        guard !mediaPoolVC.isTimelineGridVisible else { return false }
+        if let responder = view.window?.firstResponder as? NSTableView,
+           responder.isDescendant(of: mediaPoolVC.view) {
+            return true
+        }
+        return false
+    }
+
+    private func stepToAdjacentFocalPoint(direction: Int) {
+        let cur = timelineModel.isSmartFilterActive
+            ? timelineModel.realTimelineTime(forDisplayedTime: playbackController.accurateCurrentTime)
+            : playbackController.accurateCurrentTime
+        guard let targetReal = timelineModel.adjacentFocalPoint(direction: direction, fromTime: cur) else { return }
+        let targetDisplay = timelineModel.isSmartFilterActive
+            ? timelineModel.displayedTime(forRealTime: targetReal)
+            : targetReal
+        playbackController.seek(to: targetDisplay, frameAccurate: true)
+        if timelineModel.isSelectionFollowsPlayhead {
+            timelineModel.updateSelectionAtPlayhead(time: targetDisplay)
+        }
+        timelineVC.reloadTimelineUI()
+    }
+
+    private func selectAdjacentClipFromKeyboard(direction: Int) {
+        guard let target = timelineModel.selectAdjacentClip(direction: direction, fromPlayhead: playbackController.accurateCurrentTime) else {
+            return
+        }
+        timelineVC.preserveSelectionForNextSeek(duration: 0.6)
+        playbackController.seek(to: target.displayStart, frameAccurate: true)
+        timelineVC.reloadTimelineUI()
+        timelineVC.centerViewportOnPlayheadIfOutsideVisibleArea()
+        mediaPoolVC.scrollToSelectedTimelineClipIfVisible(target.clip.id)
+    }
+
     public func didReorderTimelineFromGrid() {
-        commitTimelineEdit(title: "Riordina Timeline da Griglia")
+        commitTimelineEdit(title: "Riordina Timeline da Griglia", preserveSelection: true)
     }
 
     public func didDeleteMediaItemsFromPool(_ items: [MediaItem]) {
+        playerVC.updateProxyUI()
         let title = items.count > 1 ? "Elimina \(items.count) Media dal Pool" : "Elimina Media dal Pool"
         commitTimelineEdit(title: title)
     }
@@ -1175,6 +1758,12 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
             playerVC.updateAspectRatio(formatSize: timeline.format.size)
             timelineVC.reloadTimelineUI()
             rebuildComposition()
+            let nonConf = timeline.nonConformantFrameRateClips()
+            if !nonConf.isEmpty {
+                let tlFps = TimelineModel.formatFPSLabel(timeline.format.fps)
+                timelineVC.showWarningToast("\(nonConf.count) clip non conformi alla timeline a \(tlFps)fps")
+                DebugLogger.shared.log("⚠ Timeline impostata a \(tlFps)fps: rilevate \(nonConf.count) clip con framerate non conforme.", level: .warning)
+            }
         }
         HistoryManager.shared.record(title: "Impostazioni Timeline", project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
         updateHistoryNavButtons()
@@ -1269,14 +1858,15 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         }
     }
 
-    private func rebuildComposition(preserveVisualSnapshot: Bool = true) {
-        let savedPlayhead = playbackController.currentTime
+    private func rebuildComposition(preserveVisualSnapshot: Bool = true, explicitSeekTime: CMTime? = nil) {
+        let wasPlaying = playbackController.isPlaying
+        let savedPlayhead = explicitSeekTime ?? playbackController.accurateCurrentTime
         rebuildTask?.cancel()
 
         let playbackModel = timelineModel.isSmartFilterActive ? timelineModel.compactedFilteredModel() : timelineModel
         let totalDur = playbackModel.totalDuration
         if CMTimeCompare(totalDur, .zero) <= 0 {
-            playbackController.clear()
+            playbackController.clear(preserveCurrentTime: timelineModel.isSmartFilterActive)
             playerVC.updateTimeDisplay()
             return
         }
@@ -1313,7 +1903,8 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
                             duration: totalDur,
                             targetFPS: Double(targetFPS),
                             seekToTime: savedPlayhead,
-                            visualHoldImage: holdCGImage
+                            visualHoldImage: holdCGImage,
+                            resumePlaying: wasPlaying
                         )
                     } else {
                         self.playbackController.clear()
@@ -1456,28 +2047,55 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
 
     public func performUndo() {
         if let snapshot = HistoryManager.shared.undo(currentProject: EditorProject.shared, currentMediaItems: mediaPoolVC.mediaItems) {
-            restoreProjectFromSnapshot(snapshot)
+            restoreProjectFromSnapshot(snapshot, preservePerTimelinePlayheads: true)
             DebugLogger.shared.log("Undo eseguito: \(HistoryManager.shared.currentTitle)", level: .info)
         }
     }
 
     public func performRedo() {
         if let snapshot = HistoryManager.shared.redo(currentProject: EditorProject.shared, currentMediaItems: mediaPoolVC.mediaItems) {
-            restoreProjectFromSnapshot(snapshot)
+            restoreProjectFromSnapshot(snapshot, preservePerTimelinePlayheads: true)
             DebugLogger.shared.log("Redo eseguito: \(HistoryManager.shared.currentTitle)", level: .info)
         }
     }
 
     public func performJumpToHistory(pastIndex: Int) {
         if let snapshot = HistoryManager.shared.jumpTo(pastIndex: pastIndex, currentProject: EditorProject.shared, currentMediaItems: mediaPoolVC.mediaItems) {
-            restoreProjectFromSnapshot(snapshot)
+            restoreProjectFromSnapshot(snapshot, preservePerTimelinePlayheads: true)
             DebugLogger.shared.log("Cronologia ripristinata a: \(HistoryManager.shared.currentTitle)", level: .info)
         }
     }
 
-    public func restoreProjectFromSnapshot(_ snapshot: ProjectDocumentData) {
+    public func restoreProjectFromSnapshot(_ snapshot: ProjectDocumentData, preservePerTimelinePlayheads: Bool = false) {
+        self.savedTimelineBeforeCompare = nil
+        if preservePerTimelinePlayheads && !self.timelineModel.isTemporaryCompare {
+            self.timelineModel.playheadSeconds = max(0.0, CMTimeGetSeconds(playbackController.accurateCurrentTime))
+        }
+        // L'altezza visiva delle tracce e la posizione della testina per timeline/selezione restano proprietà per-timeline durante Undo/Redo
+        let preservedTrackHeights: [UUID: (video: [Int: Double], audio: [Int: Double])] = Dictionary(
+            uniqueKeysWithValues: EditorProject.shared.timelines.map {
+                ($0.id, ($0.videoTrackHeights, $0.audioTrackHeights))
+            }
+        )
+        let preservedPlayheads: [UUID: Double] = preservePerTimelinePlayheads
+            ? Dictionary(uniqueKeysWithValues: EditorProject.shared.timelines.map { ($0.id, $0.playheadSeconds) })
+            : [:]
         let restoredMedia = snapshot.mediaItems.map { $0.toMediaItem() }
+        let backfilledCount: Int = zip(snapshot.mediaItems, restoredMedia).reduce(0) { count, pair in
+            let wasMissingMeta = (pair.0.fileSizeBytes == nil || (pair.0.originalFileName?.isEmpty ?? true))
+            let hasNowMeta = (pair.1.fileSizeBytes != nil && !pair.1.originalFileName.isEmpty)
+            return count + ((wasMissingMeta && hasNowMeta) ? 1 : 0)
+        }
         EditorProject.shared.reset(with: snapshot, restoredMedia: restoredMedia)
+        for timeline in EditorProject.shared.timelines {
+            if let heights = preservedTrackHeights[timeline.id] {
+                timeline.videoTrackHeights = heights.video
+                timeline.audioTrackHeights = heights.audio
+            }
+            if let ph = preservedPlayheads[timeline.id] {
+                timeline.playheadSeconds = max(0.0, ph)
+            }
+        }
         LUTEngine.shared.applySavedProjectState(enabled: snapshot.lutEnabled, presetRaw: snapshot.lutPreset, customPath: snapshot.lutCustomPath)
         mediaPoolVC.setMediaItems(restoredMedia)
         self.timelineModel = EditorProject.shared.activeTimeline
@@ -1489,11 +2107,18 @@ public final class MainEditorViewController: NSViewController, MediaPoolDelegate
         self.mediaPoolVC.updateFolderPopUp()
         self.mediaPoolVC.refreshTimelineGrid()
         self.playerVC.updateAspectRatio(formatSize: self.timelineModel.format.size)
+        self.playerVC.updateProxyUI()
         self.updateActiveTimelinePill()
-        self.rebuildComposition(preserveVisualSnapshot: false)
+        self.rebuildComposition(preserveVisualSnapshot: false, explicitSeekTime: savedPlayhead)
+        self.timelineVC.centerViewportOnPlayheadIfOutsideVisibleArea()
         self.view.window?.title = "Vision — \(EditorProject.shared.projectName)"
         updateHistoryNavButtons()
-        ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
+        if !preservePerTimelinePlayheads && backfilledCount > 0 {
+            ProjectDatabase.shared.saveProjectImmediately(project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
+            DebugLogger.shared.log("Aggiornati metadati file (nome + byte esatti) per \(backfilledCount) clip del progetto per ricollegamenti futuri.", level: .info)
+        } else {
+            ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: mediaPoolVC.mediaItems)
+        }
     }
 
     private func updateHistoryNavButtons() {

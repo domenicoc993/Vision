@@ -4,8 +4,10 @@ import AVFoundation
 
 public struct MediaItem: Identifiable, Hashable {
     public let id: UUID
-    public let url: URL
-    public let name: String
+    public var url: URL
+    public var name: String
+    public var originalFileName: String
+    public var fileSizeBytes: Int64?
     public let duration: CMTime
     public let resolution: CGSize
     public let frameRate: Float
@@ -17,6 +19,28 @@ public struct MediaItem: Identifiable, Hashable {
     public var thumbnail: NSImage?
     public var proxyURL: URL?
     public var beatAnalysis: SavedBeatAnalysis?
+
+    public var matchFileName: String {
+        originalFileName.isEmpty ? url.lastPathComponent : originalFileName
+    }
+
+    public var isMediaAvailableOnDisk: Bool {
+        FileManager.default.fileExists(atPath: url.path)
+    }
+
+    public static func measureFileSizeBytes(at url: URL) -> Int64? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        if let vals = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+           vals.isRegularFile == true,
+           let sz = vals.fileSize {
+            return Int64(sz)
+        }
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+           let num = attrs[.size] as? NSNumber {
+            return num.int64Value
+        }
+        return nil
+    }
 
     public var hasProxy: Bool {
         guard let p = proxyURL else { return false }
@@ -34,6 +58,8 @@ public struct MediaItem: Identifiable, Hashable {
         id: UUID = UUID(),
         url: URL,
         name: String,
+        originalFileName: String? = nil,
+        fileSizeBytes: Int64? = nil,
         duration: CMTime,
         resolution: CGSize,
         frameRate: Float,
@@ -49,6 +75,9 @@ public struct MediaItem: Identifiable, Hashable {
         self.id = id
         self.url = url
         self.name = name
+        let diskName = originalFileName ?? ""
+        self.originalFileName = diskName.isEmpty ? url.lastPathComponent : diskName
+        self.fileSizeBytes = fileSizeBytes
         self.duration = duration
         self.resolution = resolution
         self.frameRate = frameRate
@@ -119,9 +148,12 @@ public struct MediaItem: Identifiable, Hashable {
             }
         }
 
+        let byteSize = Self.measureFileSizeBytes(at: url)
         let item = MediaItem(
             url: url,
             name: url.lastPathComponent,
+            originalFileName: url.lastPathComponent,
+            fileSizeBytes: byteSize,
             duration: duration,
             resolution: videoSize,
             frameRate: nominalFPS > 0 ? nominalFPS : 24.0,

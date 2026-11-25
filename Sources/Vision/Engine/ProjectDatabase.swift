@@ -8,6 +8,8 @@ public struct MediaItemData: Codable {
     public var id: UUID
     public var urlPath: String
     public var name: String
+    public var originalFileName: String?
+    public var fileSizeBytes: Int64?
     public var durationSeconds: Double
     public var width: Double
     public var height: Double
@@ -24,6 +26,8 @@ public struct MediaItemData: Codable {
         self.id = item.id
         self.urlPath = item.url.path
         self.name = item.name
+        self.originalFileName = item.matchFileName
+        self.fileSizeBytes = item.fileSizeBytes ?? MediaItem.measureFileSizeBytes(at: item.url)
         self.durationSeconds = CMTimeGetSeconds(item.duration)
         self.width = Double(item.resolution.width)
         self.height = Double(item.resolution.height)
@@ -56,12 +60,16 @@ public struct MediaItemData: Codable {
             }
         }
 
+        let resolvedOriginalName = (originalFileName?.isEmpty == false) ? originalFileName! : url.lastPathComponent
+        let resolvedByteSize = fileSizeBytes ?? MediaItem.measureFileSizeBytes(at: url)
         let proxy = proxyURLPath.map { URL(fileURLWithPath: $0) }
         let orient = ClipOrientation(rawValue: orientation) ?? .normal
         return MediaItem(
             id: id,
             url: url,
             name: name,
+            originalFileName: resolvedOriginalName,
+            fileSizeBytes: resolvedByteSize,
             duration: CMTime(seconds: durationSeconds, preferredTimescale: 600),
             resolution: CGSize(width: width, height: height),
             frameRate: frameRate,
@@ -95,8 +103,10 @@ public struct TimelineClipData: Codable {
     public var markers: [Double]?
     public var priority: Int?
     public var isLocked: Bool?
+    public var isApproved: Bool?
     public var selectionSourceIn: Double?
     public var selectionSourceOut: Double?
+    public var colorTag: String?
 
     public init(clip: TimelineClip) {
         self.id = clip.id
@@ -117,8 +127,10 @@ public struct TimelineClipData: Codable {
         self.markers = clip.markers.isEmpty ? nil : clip.markers
         self.priority = clip.priority
         self.isLocked = clip.isLocked ? true : nil
+        self.isApproved = clip.isApproved ? true : nil
         self.selectionSourceIn = clip.selectionSourceIn
         self.selectionSourceOut = clip.selectionSourceOut
+        self.colorTag = clip.colorTag?.rawValue
     }
 
     public func toClip(mediaItems: [UUID: MediaItem]) -> TimelineClip? {
@@ -144,8 +156,10 @@ public struct TimelineClipData: Codable {
             markers: markers ?? [],
             priority: priority,
             isLocked: isLocked ?? false,
+            isApproved: isApproved ?? false,
             selectionSourceIn: selectionSourceIn,
-            selectionSourceOut: selectionSourceOut
+            selectionSourceOut: selectionSourceOut,
+            colorTag: colorTag.flatMap { ClipColorTag(rawValue: $0) }
         )
     }
 }
@@ -193,7 +207,9 @@ public struct TimelineModelData: Codable {
     public var isLinkActive: Bool
     public var isSnappingActive: Bool
     public var isSelectionFollowsPlayhead: Bool
+    public var isRippleTrimMode: Bool?
     public var isCageLockActive: Bool?
+    public var isSelectionSourceConstrained: Bool?
     public var rhythmicCages: [RhythmicCage]?
     public var detectedBPM: Double?
     public var beatIntervalMode: BeatIntervalMode?
@@ -212,7 +228,9 @@ public struct TimelineModelData: Codable {
         self.isLinkActive = model.isLinkActive
         self.isSnappingActive = model.isSnappingActive
         self.isSelectionFollowsPlayhead = model.isSelectionFollowsPlayhead
+        self.isRippleTrimMode = model.isRippleTrimMode
         self.isCageLockActive = model.isCageLockActive
+        self.isSelectionSourceConstrained = model.isSelectionSourceConstrained
         self.rhythmicCages = model.rhythmicCages
         self.detectedBPM = model.detectedBPM
         self.beatIntervalMode = model.beatIntervalMode
@@ -234,7 +252,9 @@ public struct TimelineModelData: Codable {
         model.isLinkActive = isLinkActive
         model.isSnappingActive = isSnappingActive
         model.isSelectionFollowsPlayhead = isSelectionFollowsPlayhead
+        model.isRippleTrimMode = isRippleTrimMode ?? true
         model.isCageLockActive = isCageLockActive ?? true
+        model.isSelectionSourceConstrained = isSelectionSourceConstrained ?? true
         model.rhythmicCages = rhythmicCages ?? []
         model.detectedBPM = detectedBPM
         if let savedMode = beatIntervalMode {

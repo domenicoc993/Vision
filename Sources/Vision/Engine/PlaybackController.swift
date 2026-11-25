@@ -29,8 +29,20 @@ public final class PlaybackController: NSObject {
         weak var owner: AnyObject?
         let handler: (Bool) -> Void
     }
+    private struct WillReplaceItemObserver {
+        let ownerId: ObjectIdentifier
+        weak var owner: AnyObject?
+        let handler: (CGImage?) -> Void
+    }
+    private struct ReadyFrameObserver {
+        let ownerId: ObjectIdentifier
+        weak var owner: AnyObject?
+        let handler: () -> Void
+    }
     private var timeObservers: [TimeObserver] = []
     private var playStateObservers: [PlayStateObserver] = []
+    private var willReplaceItemObservers: [WillReplaceItemObserver] = []
+    private var readyFrameObservers: [ReadyFrameObserver] = []
 
     private var timeObserverToken: Any?
     private var itemStatusObservation: NSKeyValueObservation?
@@ -38,7 +50,7 @@ public final class PlaybackController: NSObject {
 
     // Smooth Scrubbing: Seek-Chase Engine (Resolve style)
     private var isSeekInProgress = false
-    private var isLoadingItem = false
+    public private(set) var isLoadingItem = false
     private var chaseTime: CMTime = .invalid
     private var chaseFrameAccurate: Bool = false
     private var seekGeneration: UInt64 = 0
@@ -54,6 +66,50 @@ public final class PlaybackController: NSObject {
         let oid = ObjectIdentifier(owner)
         playStateObservers.removeAll { $0.owner == nil || $0.ownerId == oid }
         playStateObservers.append(PlayStateObserver(ownerId: oid, owner: owner, handler: handler))
+    }
+
+    public func addWillReplaceItemObserver(_ owner: AnyObject, handler: @escaping (CGImage?) -> Void) {
+        let oid = ObjectIdentifier(owner)
+        willReplaceItemObservers.removeAll { $0.owner == nil || $0.ownerId == oid }
+        willReplaceItemObservers.append(WillReplaceItemObserver(ownerId: oid, owner: owner, handler: handler))
+    }
+
+    public func addReadyFrameObserver(_ owner: AnyObject, handler: @escaping () -> Void) {
+        let oid = ObjectIdentifier(owner)
+        readyFrameObservers.removeAll { $0.owner == nil || $0.ownerId == oid }
+        readyFrameObservers.append(ReadyFrameObserver(ownerId: oid, owner: owner, handler: handler))
+    }
+
+    private func notifyWillReplaceItem(_ image: CGImage?) {
+        let dispatch = { [weak self] in
+            guard let self = self else { return }
+            self.onWillReplaceItem?(image)
+            self.willReplaceItemObservers.removeAll { $0.owner == nil }
+            for obs in self.willReplaceItemObservers {
+                obs.handler(image)
+            }
+        }
+        if Thread.isMainThread {
+            dispatch()
+        } else {
+            DispatchQueue.main.async(execute: dispatch)
+        }
+    }
+
+    private func notifyReadyFrameRendered() {
+        let dispatch = { [weak self] in
+            guard let self = self else { return }
+            self.onReadyFrameRendered?()
+            self.readyFrameObservers.removeAll { $0.owner == nil }
+            for obs in self.readyFrameObservers {
+                obs.handler()
+            }
+        }
+        if Thread.isMainThread {
+            dispatch()
+        } else {
+            DispatchQueue.main.async(execute: dispatch)
+        }
     }
 
     private func notifyTimeChanged(_ time: CMTime) {
@@ -141,16 +197,17 @@ public final class PlaybackController: NSObject {
     public func setPlayheadForPendingReload(_ time: CMTime) {
         jogSettleWorkItem?.cancel()
         jogSettleWorkItem = nil
-        let clamped = CMTimeClampToRange(time, range: CMTimeRange(start: .zero, duration: max(duration, CMTime(value: 1, timescale: 600))))
+        // Non clampare contro la vecchia `duration`: durante apertura progetto o cambio timeline `duration` appartiene ancora al modello precedente.
+        let target = CMTimeCompare(time, .zero) >= 0 ? time : .zero
         seekGeneration &+= 1
         isLoadingItem = true
         isSeekInProgress = false
         chaseTime = .invalid
-        currentTime = clamped
-        notifyTimeChanged(clamped)
+        currentTime = target
+        notifyTimeChanged(target)
     }
 
-    public func clear() {
+    public func clear(preserveCurrentTime: Bool = false) {
         jogSettleWorkItem?.cancel()
         jogSettleWorkItem = nil
         itemStatusObservation?.invalidate()
@@ -159,13 +216,15 @@ public final class PlaybackController: NSObject {
         isLoadingItem = false
         isSeekInProgress = false
         chaseTime = .invalid
-        onReadyFrameRendered?()
+        notifyReadyFrameRendered()
         player.replaceCurrentItem(with: nil)
         self.duration = .zero
-        self.currentTime = .zero
+        if !preserveCurrentTime {
+            self.currentTime = .zero
+        }
         self.isPlaying = false
         self.onStatusChanged?("Pronto")
-        self.notifyTimeChanged(.zero)
+        self.notifyTimeChanged(self.currentTime)
         DebugLogger.shared.log("Player azzerato (timeline vuota).", level: .playback)
     }
 
@@ -174,7 +233,8 @@ public final class PlaybackController: NSObject {
         duration: CMTime,
         targetFPS: Double = 30.0,
         seekToTime: CMTime? = nil,
-        visualHoldImage: CGImage? = nil
+        visualHoldImage: CGImage? = nil,
+        resumePlaying: Bool = false
     ) {
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
@@ -198,7 +258,7 @@ public final class PlaybackController: NSObject {
             }
         }
 
-        onWillReplaceItem?(visualHoldImage)
+        notifyWillReplaceItem(visualHoldImage)
 
         self.duration = duration
         self.fps = targetFPS
@@ -218,13 +278,21 @@ public final class PlaybackController: NSObject {
                     DebugLogger.shared.log("PlayerItem status: READY TO PLAY (Pronto alla riproduzione)", level: .playback)
                     self.onStatusChanged?("Pronto")
                     let desiredTime = (self.seekGeneration == loadGeneration) ? targetTime : self.currentTime
-                    self.player.seek(to: desiredTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                    self.player.seek(to: desiredTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                         DispatchQueue.main.async {
                             guard let self = self, self.player.currentItem === observedItem else { return }
+                            guard finished || self.seekGeneration == loadGeneration else { return }
                             self.isLoadingItem = false
                             self.currentTime = desiredTime
                             self.notifyTimeChanged(desiredTime)
-                            self.onReadyFrameRendered?()
+                            if resumePlaying {
+                                self.player.play()
+                                self.isPlaying = true
+                            }
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self = self, self.player.currentItem === observedItem, !self.isLoadingItem else { return }
+                                self.notifyReadyFrameRendered()
+                            }
                         }
                     }
                 }
@@ -234,7 +302,7 @@ public final class PlaybackController: NSObject {
                 DispatchQueue.main.async { [weak self] in
                     self?.isLoadingItem = false
                     self?.onStatusChanged?("Errore: \(errMsg)")
-                    self?.onReadyFrameRendered?()
+                    self?.notifyReadyFrameRendered()
                 }
             case .unknown:
                 DebugLogger.shared.log("PlayerItem status: Inizializzazione...", level: .playback)
@@ -246,11 +314,11 @@ public final class PlaybackController: NSObject {
 
         player.replaceCurrentItem(with: item)
 
-        // Safety failsafe so freeze overlay / loading flag can never linger if AVPlayer stalls
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            guard let self = self, self.seekGeneration == loadGeneration else { return }
+        // Safety failsafe so freeze overlay / loading flag can never linger indefinitely if AVPlayer stalls
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            guard let self = self, self.seekGeneration == loadGeneration, self.isLoadingItem else { return }
             self.isLoadingItem = false
-            self.onReadyFrameRendered?()
+            self.notifyReadyFrameRendered()
         }
 
         DebugLogger.shared.log("Player caricato: durata = \(String(format: "%.2f", CMTimeGetSeconds(duration)))s, fps = \(targetFPS), playhead a \(formattedCurrentTime)", level: .playback)
@@ -279,7 +347,7 @@ public final class PlaybackController: NSObject {
     public func play() {
         jogSettleWorkItem?.cancel()
         jogSettleWorkItem = nil
-        onReadyFrameRendered?()
+        notifyReadyFrameRendered()
         // If at the end of the timeline, automatically rewind to start
         if CMTimeCompare(currentTime, duration) >= 0 {
             DebugLogger.shared.log("Play alla fine della timeline: riavvolgimento automatico a 00:00:00:00", level: .playback)
@@ -401,7 +469,7 @@ public final class PlaybackController: NSObject {
                     self.executeActualSeek(to: next, frameAccurate: nextAccurate)
                 } else {
                     self.isSeekInProgress = false
-                    self.onReadyFrameRendered?()
+                    self.notifyReadyFrameRendered()
                 }
             }
         }

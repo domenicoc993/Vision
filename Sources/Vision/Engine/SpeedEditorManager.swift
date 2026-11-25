@@ -69,7 +69,7 @@ public enum VisionCommandAction: String, CaseIterable, Codable, Sendable {
         case .swapRight: return "Scambia gabbia a destra (⌘→)"
         case .moveClipUp: return "Sposta clip su traccia sopra (⌥↑)"
         case .moveClipDown: return "Sposta clip su traccia sotto (⌥↓)"
-        case .toggleFullScreen: return "Viewer Schermo Intero (⌃F)"
+        case .toggleFullScreen: return "Viewer Schermo Intero (⌘F)"
         case .undo: return "Annulla — Undo (⌘Z)"
         case .redo: return "Ripeti — Redo (⇧⌘Z)"
         case .openRhythmicStudio: return "Apri Auto-Fill Ritmico"

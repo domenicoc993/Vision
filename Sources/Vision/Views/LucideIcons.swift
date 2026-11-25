@@ -59,8 +59,13 @@ public enum LucideIcon {
     case fileCode2
     case arrowLeftRight
     case layers
+    case scale
     case flag
     case letterM
+    case mousePointer
+    case caretsFromAxisDashedVertical
+    case ghost
+    case snail
 }
 
 public final class Lucide {
@@ -213,10 +218,20 @@ public final class Lucide {
             return #"<path d="M8 3 4 7l4 4" /><path d="M4 7h16" /><path d="m16 21 4-4-4-4" /><path d="M20 17H4" />"#
         case .layers:
             return #"<path d="M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83z" /><path d="M2 12a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 12" /><path d="M2 17a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 17" />"#
+        case .scale:
+            return #"<path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" /><path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" /><path d="M7 21h10" /><path d="M12 3v18" /><path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2" />"#
         case .flag:
             return #"<path d="M4 22V4a1 1 0 0 1 .4-.8A6 6 0 0 1 8 2c3 0 5 2 7.333 2q2 0 3.067-.8A1 1 0 0 1 20 4v10a1 1 0 0 1-.4.8A6 6 0 0 1 16 16c-3 0-5-2-8-2a6 6 0 0 0-4 1.528" />"#
         case .letterM:
             return #"<path d="M5 19V5l7 8 7-8v14" />"#
+        case .mousePointer:
+            return #"<path d="M4.037 4.688a.495.495 0 0 1 .651-.651l16 6.5a.5.5 0 0 1-.063.947l-6.124 1.58a2 2 0 0 0-1.438 1.435l-1.579 6.126a.5.5 0 0 1-.947.063z" />"#
+        case .caretsFromAxisDashedVertical:
+            return #"<path d="M12 14v2" /><path d="M12 20v2" /><path d="M12 2v2" /><path d="M12 8v2" /><path d="M17.712 16.703 A1 1 0 0 1 15.999 16 V8 a1 1 0 0 1 1.713 -.703 l3.99 3.991 a1 1 0 0 1 .001 1.424 z" /><path d="M6.288 16.703 A1 1 0 0 0 8.001 16 V8 a1 1 0 0 0 -1.713 -.703 l-3.99 3.991 a1 1 0 0 0 -.001 1.424 z" />"#
+        case .ghost:
+            return #"<path d="M15 10v1" /><path d="M7.528 20.472 a1.6 1.6 0 0 1 2.277 0 l1.057 1.056 a1.6 1.6 0 0 0 2.276 0 l1.057 -1.056 a1.6 1.6 0 0 1 2.277 0 l1.114 1.114 a1.4 1.4 0 0 0 2.414 -1 V10 a8 8 0 0 0 -16 0 v10.586 a1.4 1.4 0 0 0 2.414 1 z" /><path d="M9 10v1" />"#
+        case .snail:
+            return #"<path d="M2 13 a6 6 0 1 0 12 0 a4 4 0 1 0 -8 0 a2 2 0 0 0 4 0" /><circle cx="10" cy="13" r="8" /><path d="M2 21 h12 c4.4 0 8 -3.6 8 -8 V7 a2 2 0 1 0 -4 0 v6" /><path d="M18 3 l1.1 2.2" />"#
         }
     }
 }

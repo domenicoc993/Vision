@@ -10,8 +10,11 @@ public enum FocusedSection {
 
 public protocol MediaPoolDelegate: AnyObject {
     func didSelectAddClipToTimeline(_ item: MediaItem)
+    func didSelectAddClipsToTimeline(_ items: [MediaItem])
+    func didSelectMediaItemForSourcePreview(_ item: MediaItem)
     func didChangeMediaOrientation(_ item: MediaItem)
     func didSelectSeekToClip(_ clip: TimelineClip)
+    func didChangeSelectionFromGrid()
     func didReorderTimelineFromGrid()
     func didActivateSection(_ section: FocusedSection)
     func didSwitchActiveTimeline(to timeline: TimelineModel)
@@ -21,6 +24,10 @@ public protocol MediaPoolDelegate: AnyObject {
     func didImportTimelinesFromXML(_ timelines: [TimelineModel])
     func didRequestExportTimelineToFCPXML(_ timeline: TimelineModel)
     func didRenameTimeline(_ timeline: TimelineModel)
+    func didRenameMediaItem(_ item: MediaItem)
+    func didRelinkMediaItems(_ updatedItems: [MediaItem])
+    func didToggleTimelineGridExpanded(_ isExpanded: Bool)
+    func didRequestClipContextMenuFromGrid(_ clip: TimelineClip, event: NSEvent, sourceView: NSView, extraItems: [VisionMenuItem])
 }
 
 public let kMediaItemPasteboardType = NSPasteboard.PasteboardType("com.vision.mediaitem.id")
@@ -61,10 +68,16 @@ final class DragDropContainerView: NSView {
 final class ContextMenuTableView: NSTableView {
     var onRightClick: ((NSEvent, Int) -> Void)?
     var onMouseDown: (() -> Void)?
+    var onSingleClickRow: ((Int) -> Void)?
 
     override func mouseDown(with event: NSEvent) {
         onMouseDown?()
         super.mouseDown(with: event)
+        let pt = convert(event.locationInWindow, from: nil)
+        let hitRow = self.row(at: pt)
+        if event.clickCount == 1 && hitRow >= 0 && selectedRowIndexes.count == 1 && selectedRowIndexes.contains(hitRow) {
+            onSingleClickRow?(hitRow)
+        }
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -111,11 +124,14 @@ public enum SidebarRow {
     case projectRoot
     case folder(MediaFolder, Int)
     case smart(SmartFolderKind)
+    case smartVideoFPS(fps: Double, label: String, count: Int)
 }
 
 public final class MediaPoolViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSSplitViewDelegate, NSTextFieldDelegate {
     public weak var delegate: MediaPoolDelegate?
     public var activeSmartFolder: SmartFolderKind? = nil
+    public var activeSmartVideoFPSLabel: String? = nil
+    private var isSmartVideoExpanded: Bool = false
 
     /// Multi-selezione cartelle stile DaVinci Resolve ("Progetto" root = `isProjectRootSelected`).
     public private(set) var isProjectRootSelected: Bool = true
@@ -131,16 +147,26 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         }
     }
 
-    private enum ContentSortKey {
+    private enum ContentSortKey: String {
+        case name
+        case duration
+        case resolution
+        case fileFormat
+        case codec
+        case fps
+        case usage
         case title
         case artist
         case album
         case genre
-        case duration
     }
-    private var sortKey: ContentSortKey = .title
+    private var sortKey: ContentSortKey = .name
     private var sortAscending: Bool = true
     private var isShowingMusicColumns: Bool = false
+    private var isApplyingSortDescriptors: Bool = false
+    private var folderSortPreferences: [String: (key: ContentSortKey, ascending: Bool)] = [:]
+    private var activeProxyDialog: ProxyGenerationDialog?
+    private var cachedMediaUsage: [UUID: (current: Int, total: Int)] = [:]
 
     public var isTimelineGridVisible: Bool {
         !timelineGridContainer.isHidden
@@ -150,6 +176,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         didSet {
             timelineGridView.timelineModel = timelineModel
             updateTrackPopUp()
+            refreshUsageCache()
         }
     }
     public private(set) var mediaItems: [MediaItem] = []
@@ -165,21 +192,256 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         return mediaItems.filter { !filedIds.contains($0.id) }
     }
 
+    private func currentSortScopeKey() -> String {
+        if let smart = activeSmartFolder {
+            if smart == .video, let fpsLbl = activeSmartVideoFPSLabel {
+                return "smart_video_\(fpsLbl)"
+            }
+            return "smart_\(smart.rawValue)"
+        }
+        if selectedFolderIds.count == 1 && !isProjectRootSelected, let fId = selectedFolderIds.first {
+            return "folder_\(fId.uuidString)"
+        }
+        if selectedFolderIds.isEmpty || (isProjectRootSelected && selectedFolderIds.isEmpty) {
+            return "root"
+        }
+        let sortedIds = selectedFolderIds.map(\.uuidString).sorted().joined(separator: "_")
+        return "multi_\(isProjectRootSelected ? "root_" : "")\(sortedIds)"
+    }
+
+    private func loadSortStateForCurrentScope() {
+        let isMusic = (activeSmartFolder == .musicLibrary)
+        let defaultKey: ContentSortKey = isMusic ? .title : .name
+        let scopeKey = currentSortScopeKey()
+
+        if let cached = folderSortPreferences[scopeKey] {
+            let validForMusic: Set<ContentSortKey> = [.title, .artist, .album, .genre, .duration]
+            let validForPool: Set<ContentSortKey> = [.name, .duration, .resolution, .fileFormat, .codec, .fps, .usage]
+            if isMusic ? validForMusic.contains(cached.key) : validForPool.contains(cached.key) {
+                sortKey = cached.key
+                sortAscending = cached.ascending
+            } else {
+                sortKey = defaultKey
+                sortAscending = true
+            }
+        } else if !isMusic, activeSmartFolder == nil, selectedFolderIds.count == 1, !isProjectRootSelected,
+                  let fId = selectedFolderIds.first,
+                  let folder = EditorProject.shared.folders.first(where: { $0.id == fId }),
+                  let savedKey = folder.sortColumnKey,
+                  let parsedKey = ContentSortKey(rawValue: savedKey),
+                  [.name, .duration, .resolution, .fileFormat, .codec, .fps, .usage].contains(parsedKey) {
+            sortKey = parsedKey
+            sortAscending = folder.sortAscending ?? true
+            folderSortPreferences[scopeKey] = (sortKey, sortAscending)
+        } else {
+            sortKey = defaultKey
+            sortAscending = true
+        }
+        applySortDescriptorToContentTableHeader()
+    }
+
+    private func saveSortStateForCurrentScope(key: ContentSortKey, ascending: Bool) {
+        let scopeKey = currentSortScopeKey()
+        folderSortPreferences[scopeKey] = (key, ascending)
+        if activeSmartFolder == nil, selectedFolderIds.count == 1, !isProjectRootSelected,
+           let fId = selectedFolderIds.first,
+           let idx = EditorProject.shared.folders.firstIndex(where: { $0.id == fId }) {
+            EditorProject.shared.folders[idx].sortColumnKey = key.rawValue
+            EditorProject.shared.folders[idx].sortAscending = ascending
+            ProjectDatabase.shared.scheduleRealtimeAutosave(project: EditorProject.shared, mediaItems: mediaItems)
+        }
+    }
+
+    private func applySortDescriptorToContentTableHeader() {
+        isApplyingSortDescriptors = true
+        defer { isApplyingSortDescriptors = false }
+        let descKey: String
+        switch sortKey {
+        case .name: descKey = "name"
+        case .duration: descKey = "duration"
+        case .resolution: descKey = "resolution"
+        case .fileFormat: descKey = "fileFormat"
+        case .codec: descKey = "codec"
+        case .fps: descKey = "fps"
+        case .usage: descKey = "usage"
+        case .title: descKey = "title"
+        case .artist: descKey = "artist"
+        case .album: descKey = "album"
+        case .genre: descKey = "genre"
+        }
+        contentTableView.sortDescriptors = [NSSortDescriptor(key: descKey, ascending: sortAscending)]
+    }
+
+    private func countMediaOccurrences(in timeline: TimelineModel) -> [UUID: Int] {
+        var counts: [UUID: Int] = [:]
+        var countedLinkGroups: Set<UUID> = []
+        for track in timeline.videoTracks {
+            for clip in track.clips {
+                counts[clip.mediaItem.id, default: 0] += 1
+                if let lId = clip.linkGroupId {
+                    countedLinkGroups.insert(lId)
+                }
+            }
+        }
+        for track in timeline.audioTracks {
+            for clip in track.clips {
+                if let lId = clip.linkGroupId, countedLinkGroups.contains(lId) {
+                    continue
+                }
+                counts[clip.mediaItem.id, default: 0] += 1
+            }
+        }
+        return counts
+    }
+
+    private func refreshUsageCache() {
+        let currentCounts = timelineModel.map { countMediaOccurrences(in: $0) } ?? [:]
+        var totalCounts: [UUID: Int] = [:]
+        for tl in EditorProject.shared.timelines {
+            let tlCounts = countMediaOccurrences(in: tl)
+            for (id, count) in tlCounts {
+                totalCounts[id, default: 0] += count
+            }
+        }
+        var combined: [UUID: (current: Int, total: Int)] = [:]
+        for item in mediaItems {
+            let cur = currentCounts[item.id] ?? 0
+            let tot = totalCounts[item.id] ?? 0
+            combined[item.id] = (cur, tot)
+        }
+        cachedMediaUsage = combined
+    }
+
+    private func usageText(for mediaId: UUID) -> (text: String, isActive: Bool) {
+        let info = cachedMediaUsage[mediaId] ?? (0, 0)
+        if info.current == 0 && info.total == 0 {
+            return ("", false)
+        }
+        if info.current == info.total {
+            return ("\(info.current)", info.current > 0)
+        }
+        return ("\(info.current)/\(info.total)", info.current > 0)
+    }
+
+    private func formatExtensionLabel(for m: MediaItem) -> String {
+        let ext = m.url.pathExtension.uppercased()
+        if !ext.isEmpty { return ext }
+        return m.hasVideo ? "VIDEO" : "AUDIO"
+    }
+
+    private func sortedMediaItems(_ raw: [MediaItem]) -> [MediaItem] {
+        return raw.sorted { a, b in
+            let cmp: ComparisonResult
+            switch sortKey {
+            case .name, .title, .artist, .album, .genre:
+                cmp = a.name.localizedStandardCompare(b.name)
+            case .duration:
+                let da = CMTimeGetSeconds(a.duration)
+                let db = CMTimeGetSeconds(b.duration)
+                let safeA = da.isFinite ? da : 0
+                let safeB = db.isFinite ? db : 0
+                if abs(safeA - safeB) > 0.0001 {
+                    cmp = safeA < safeB ? .orderedAscending : .orderedDescending
+                } else {
+                    cmp = .orderedSame
+                }
+            case .resolution:
+                let pxA = a.hasVideo ? Int(a.resolution.width * a.resolution.height) : -1
+                let pxB = b.hasVideo ? Int(b.resolution.width * b.resolution.height) : -1
+                cmp = pxA < pxB ? .orderedAscending : (pxA > pxB ? .orderedDescending : .orderedSame)
+            case .fileFormat:
+                cmp = formatExtensionLabel(for: a).localizedStandardCompare(formatExtensionLabel(for: b))
+            case .codec:
+                let ca = a.hasVideo ? a.videoCodec : "Audio \(a.audioTrackCount)ch"
+                let cb = b.hasVideo ? b.videoCodec : "Audio \(b.audioTrackCount)ch"
+                cmp = ca.localizedStandardCompare(cb)
+            case .fps:
+                let fa = a.hasVideo ? a.frameRate : -1
+                let fb = b.hasVideo ? b.frameRate : -1
+                cmp = fa < fb ? .orderedAscending : (fa > fb ? .orderedDescending : .orderedSame)
+            case .usage:
+                let ua = cachedMediaUsage[a.id] ?? (0, 0)
+                let ub = cachedMediaUsage[b.id] ?? (0, 0)
+                if ua.current != ub.current {
+                    cmp = ua.current < ub.current ? .orderedAscending : .orderedDescending
+                } else if ua.total != ub.total {
+                    cmp = ua.total < ub.total ? .orderedAscending : .orderedDescending
+                } else {
+                    cmp = .orderedSame
+                }
+            }
+            if cmp == .orderedSame {
+                let nameCmp = a.name.localizedStandardCompare(b.name)
+                if nameCmp == .orderedSame {
+                    return a.id.uuidString < b.id.uuidString
+                }
+                return nameCmp == .orderedAscending
+            }
+            return sortAscending ? (cmp == .orderedAscending) : (cmp == .orderedDescending)
+        }
+    }
+
+    private func sortedTimelineEntries(_ raw: [(timeline: TimelineModel, index: Int)]) -> [(timeline: TimelineModel, index: Int)] {
+        return raw.sorted { a, b in
+            let cmp: ComparisonResult
+            switch sortKey {
+            case .name, .title, .artist, .album, .genre, .usage:
+                cmp = a.timeline.name.localizedStandardCompare(b.timeline.name)
+            case .duration:
+                let da = CMTimeGetSeconds(a.timeline.totalDuration)
+                let db = CMTimeGetSeconds(b.timeline.totalDuration)
+                let safeA = da.isFinite ? da : 0
+                let safeB = db.isFinite ? db : 0
+                if abs(safeA - safeB) > 0.0001 {
+                    cmp = safeA < safeB ? .orderedAscending : .orderedDescending
+                } else {
+                    cmp = .orderedSame
+                }
+            case .resolution:
+                let pa = a.timeline.isSelection ? 0 : Int(a.timeline.format.size.width * a.timeline.format.size.height)
+                let pb = b.timeline.isSelection ? 0 : Int(b.timeline.format.size.width * b.timeline.format.size.height)
+                cmp = pa < pb ? .orderedAscending : (pa > pb ? .orderedDescending : .orderedSame)
+            case .fileFormat:
+                let fa = a.timeline.isSelection ? "Selezione" : "Timeline"
+                let fb = b.timeline.isSelection ? "Selezione" : "Timeline"
+                cmp = fa.localizedStandardCompare(fb)
+            case .codec:
+                let ca = a.timeline.format.name
+                let cb = b.timeline.format.name
+                cmp = ca.localizedStandardCompare(cb)
+            case .fps:
+                let fa = a.timeline.isSelection ? -1 : a.timeline.format.fps
+                let fb = b.timeline.isSelection ? -1 : b.timeline.format.fps
+                cmp = fa < fb ? .orderedAscending : (fa > fb ? .orderedDescending : .orderedSame)
+            }
+            if cmp == .orderedSame {
+                return a.timeline.name.localizedStandardCompare(b.timeline.name) == .orderedAscending
+            }
+            return sortAscending ? (cmp == .orderedAscending) : (cmp == .orderedDescending)
+        }
+    }
+
     public var displayedMediaItems: [MediaItem] {
+        let filtered: [MediaItem]
         if let smart = activeSmartFolder {
             switch smart {
             case .video:
-                return mediaItems.filter { $0.hasVideo }
+                if let targetLabel = activeSmartVideoFPSLabel {
+                    filtered = mediaItems.filter { $0.hasVideo && $0.frameRate > 0 && TimelineModel.formatFPSLabel($0.frameRate) == targetLabel }
+                } else {
+                    filtered = mediaItems.filter { $0.hasVideo }
+                }
             case .audio:
-                return mediaItems.filter { $0.hasAudio && !$0.hasVideo }
+                filtered = mediaItems.filter { $0.hasAudio && !$0.hasVideo }
             case .timelines, .selections, .musicLibrary:
                 return []
             }
+            return sortedMediaItems(filtered)
         }
 
         if selectedFolderIds.isEmpty {
             // Root "Progetto": soli file che non stanno in nessuna cartella
-            return unfiledMediaItems
+            return sortedMediaItems(unfiledMediaItems)
         }
 
         let includeRoot = isProjectRootSelected
@@ -189,11 +451,12 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             allowedIds.formUnion(f.itemIds)
         }
 
-        return mediaItems.filter { item in
+        filtered = mediaItems.filter { item in
             if allowedIds.contains(item.id) { return true }
             if includeRoot && !filedIds.contains(item.id) { return true }
             return false
         }
+        return sortedMediaItems(filtered)
     }
 
     public var currentListItems: [MediaPoolListItem] {
@@ -203,19 +466,25 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             case .video, .audio:
                 for m in displayedMediaItems { items.append(.media(m)) }
             case .timelines:
-                for (idx, tl) in EditorProject.shared.timelines.enumerated() where !tl.isSelection {
-                    items.append(.timeline(tl, index: idx))
+                let tlEntries = EditorProject.shared.timelines.enumerated().compactMap { (idx, tl) -> (timeline: TimelineModel, index: Int)? in
+                    tl.isSelection ? nil : (tl, idx)
+                }
+                for entry in sortedTimelineEntries(tlEntries) {
+                    items.append(.timeline(entry.timeline, index: entry.index))
                 }
             case .selections:
-                for (idx, tl) in EditorProject.shared.timelines.enumerated() where tl.isSelection {
-                    items.append(.timeline(tl, index: idx))
+                let selEntries = EditorProject.shared.timelines.enumerated().compactMap { (idx, tl) -> (timeline: TimelineModel, index: Int)? in
+                    tl.isSelection ? (tl, idx) : nil
+                }
+                for entry in sortedTimelineEntries(selEntries) {
+                    items.append(.timeline(entry.timeline, index: entry.index))
                 }
             case .musicLibrary:
                 var tracks = MusicLibraryManager.shared.tracks
                 tracks.sort { a, b in
                     let cmp: ComparisonResult
                     switch sortKey {
-                    case .title:
+                    case .title, .name, .resolution, .fileFormat, .codec, .fps, .usage:
                         cmp = a.displayTitle.localizedStandardCompare(b.displayTitle)
                     case .artist:
                         cmp = (a.artist ?? "").localizedStandardCompare(b.artist ?? "")
@@ -241,24 +510,34 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         }
 
         let showRootItems = selectedFolderIds.isEmpty || isProjectRootSelected
+
+        // Le cartelle sono sempre al top
+        var foldersToShow: [MediaFolder] = []
         if showRootItems {
-            for (idx, tl) in EditorProject.shared.timelines.enumerated() {
-                items.append(.timeline(tl, index: idx))
+            foldersToShow = EditorProject.shared.childFolders(of: nil)
+        } else if selectedFolderIds.count == 1, let onlyId = selectedFolderIds.first {
+            foldersToShow = EditorProject.shared.childFolders(of: onlyId)
+        }
+        foldersToShow.sort { a, b in
+            let cmp = a.name.localizedStandardCompare(b.name)
+            if sortKey == .name {
+                return sortAscending ? (cmp == .orderedAscending) : (cmp == .orderedDescending)
+            }
+            return cmp == .orderedAscending
+        }
+        for f in foldersToShow {
+            items.append(.folder(f))
+        }
+
+        if showRootItems {
+            let tlEntries = EditorProject.shared.timelines.enumerated().map { (timeline: $0.element, index: $0.offset) }
+            for entry in sortedTimelineEntries(tlEntries) {
+                items.append(.timeline(entry.timeline, index: entry.index))
             }
         }
 
         for m in displayedMediaItems {
             items.append(.media(m))
-        }
-
-        if showRootItems {
-            for f in EditorProject.shared.childFolders(of: nil) {
-                items.append(.folder(f))
-            }
-        } else if selectedFolderIds.count == 1, let onlyId = selectedFolderIds.first {
-            for f in EditorProject.shared.childFolders(of: onlyId) {
-                items.append(.folder(f))
-            }
         }
 
         return applySearchFilter(to: items)
@@ -297,17 +576,21 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     /// Programmatic selection helper (usato anche nei test automatici per multi-selezione Resolve-style).
     public func selectSidebarBins(includeProjectRoot: Bool, folderIds: Set<UUID>) {
         activeSmartFolder = nil
+        activeSmartVideoFPSLabel = nil
         isProjectRootSelected = includeProjectRoot || folderIds.isEmpty
         selectedFolderIds = folderIds
         EditorProject.shared.activeFolderId = folderIds.count == 1 && !includeProjectRoot ? folderIds.first : folderIds.first
+        loadSortStateForCurrentScope()
         refreshMediaPoolDisplay()
     }
 
     public func selectSmartFolder(_ kind: SmartFolderKind) {
         activeSmartFolder = kind
+        activeSmartVideoFPSLabel = nil
         isProjectRootSelected = false
         selectedFolderIds.removeAll()
         EditorProject.shared.activeFolderId = nil
+        loadSortStateForCurrentScope()
         refreshMediaPoolDisplay()
     }
 
@@ -351,8 +634,31 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         return rows
     }
 
+    private var videoFPSBuckets: [(fps: Double, label: String, count: Int)] {
+        var map: [String: (fps: Double, count: Int)] = [:]
+        for item in mediaItems where item.hasVideo && item.frameRate > 0 {
+            let lbl = TimelineModel.formatFPSLabel(item.frameRate)
+            if let existing = map[lbl] {
+                map[lbl] = (existing.fps, existing.count + 1)
+            } else {
+                map[lbl] = (Double(item.frameRate), 1)
+            }
+        }
+        return map.map { (fps: $0.value.fps, label: $0.key, count: $0.value.count) }
+            .sorted { $0.fps < $1.fps }
+    }
+
     public var smartSidebarRows: [SidebarRow] {
-        SmartFolderKind.allCases.map { .smart($0) }
+        var rows: [SidebarRow] = []
+        for kind in SmartFolderKind.allCases {
+            rows.append(.smart(kind))
+            if kind == .video && isSmartVideoExpanded {
+                for bucket in videoFPSBuckets {
+                    rows.append(.smartVideoFPS(fps: bucket.fps, label: bucket.label, count: bucket.count))
+                }
+            }
+        }
+        return rows
     }
 
     private enum ViewMode {
@@ -361,13 +667,14 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     }
     private var currentViewMode: ViewMode = .list
 
-    // Top Header Controls (Boxless Lucide Icons)
-    private let mediaPoolTabBtn = IconActionButton(toolTip: "Media Pool")
-    private let timelineGridTabBtn = IconActionButton(toolTip: "Timeline Grid")
-    private let listModeBtn = IconActionButton(toolTip: "Vista Elenco (List)")
-    private let gridModeBtn = IconActionButton(toolTip: "Vista Anteprime (Grid)")
+    // Top Header Controls (Single Switch Buttons — Boxless Lucide Icons)
+    private let poolTabSwitchBtn = IconActionButton(toolTip: "Media Pool (clicca per passare a Timeline Grid)")
+    private let gridExpandToggleBtn = IconActionButton(toolTip: "Espandi Timeline Grid verticalmente sulla sinistra")
+    private var isGridExpanded: Bool = false
+    private let viewModeSwitchBtn = IconActionButton(toolTip: "Vista Elenco (clicca per Anteprime)")
     private let viewModeDivider = NSView()
     private let searchToggleBtn = IconActionButton(toolTip: "Cerca nel Media Pool")
+    private let gridHeaderStack = NSStackView()
 
     // Media Pool View Hierarchy
     private let mediaPoolContainer = NSView()
@@ -379,6 +686,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     private let sidebarTableView = ContextMenuTableView()
     private let sidebarScrollView = NSScrollView()
     private let smartSectionView = NSView()
+    private var smartSectionHeightConstraint: NSLayoutConstraint?
     private let smartTableView = ContextMenuTableView()
     private let smartScrollView = NSScrollView()
 
@@ -404,6 +712,8 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     private let timelineGridScrollView = NSScrollView()
     private let trackPopUp = VisionDropdownButton()
     private let gridInfoLabel = NSTextField(labelWithString: "")
+    private let gridSizeIcon = NSImageView()
+    private let gridSizeSlider = VisionSlider(value: 1.0, minValue: 0.75, maxValue: 1.25, defaultValue: 1.0)
 
     private static let audioExtensions: Set<String> = [
         "wav", "mp3", "m4a", "m4b", "m4r", "aac", "alac", "flac", "aiff", "aif", "aifc", "caf",
@@ -577,6 +887,27 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             hasAppliedInitialSidebarWidth = true
             splitView.setPosition(155, ofDividerAt: 0)
         }
+        syncSidebarTableWidths()
+    }
+
+    private func syncSidebarTableWidths() {
+        let sideW = sidebarScrollView.contentView.bounds.width
+        if sideW > 0 {
+            if abs(sidebarTableView.frame.width - sideW) > 0.5 {
+                sidebarTableView.frame.size.width = sideW
+            }
+            sidebarTableView.tableColumns.first?.width = sideW
+            sidebarTableView.sizeLastColumnToFit()
+        }
+        let smartW = smartScrollView.contentView.bounds.width
+        if smartW > 0 {
+            if abs(smartTableView.frame.width - smartW) > 0.5 {
+                smartTableView.frame.size.width = smartW
+            }
+            smartTableView.tableColumns.first?.width = smartW
+            smartTableView.sizeLastColumnToFit()
+            smartTableView.tile()
+        }
     }
 
     private func setupTopHeaderUI(_ topHeader: NSView) {
@@ -587,25 +918,60 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         tabsStack.alignment = .centerY
         topHeader.addSubview(tabsStack)
 
-        mediaPoolTabBtn.image = Lucide.template(.fileVideoCamera, size: 17)
-        mediaPoolTabBtn.toolTip = "Media Pool"
-        mediaPoolTabBtn.activeTintColor = .systemCyan
-        mediaPoolTabBtn.isToggleActive = true
-        mediaPoolTabBtn.target = self
-        mediaPoolTabBtn.action = #selector(onMediaPoolTabClicked)
-        mediaPoolTabBtn.widthAnchor.constraint(equalToConstant: 26).isActive = true
-        mediaPoolTabBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
-        tabsStack.addArrangedSubview(mediaPoolTabBtn)
+        poolTabSwitchBtn.image = Lucide.template(.fileVideoCamera, size: 17)
+        poolTabSwitchBtn.toolTip = "Media Pool — Clicca per passare a Timeline Grid"
+        poolTabSwitchBtn.activeTintColor = .systemCyan
+        poolTabSwitchBtn.isToggleActive = false
+        poolTabSwitchBtn.target = self
+        poolTabSwitchBtn.action = #selector(onPoolTabSwitchClicked)
+        poolTabSwitchBtn.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        poolTabSwitchBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        tabsStack.addArrangedSubview(poolTabSwitchBtn)
 
-        timelineGridTabBtn.image = Lucide.template(.galleryHorizontalEnd, size: 17)
-        timelineGridTabBtn.toolTip = "Timeline Grid"
-        timelineGridTabBtn.activeTintColor = .systemCyan
-        timelineGridTabBtn.isToggleActive = false
-        timelineGridTabBtn.target = self
-        timelineGridTabBtn.action = #selector(onTimelineGridTabClicked)
-        timelineGridTabBtn.widthAnchor.constraint(equalToConstant: 26).isActive = true
-        timelineGridTabBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
-        tabsStack.addArrangedSubview(timelineGridTabBtn)
+        gridExpandToggleBtn.image = Lucide.template(.maximize2, size: 15)
+        gridExpandToggleBtn.toolTip = "Espandi Timeline Grid verticalmente sulla sinistra"
+        gridExpandToggleBtn.activeTintColor = .systemCyan
+        gridExpandToggleBtn.isToggleActive = false
+        gridExpandToggleBtn.target = self
+        gridExpandToggleBtn.action = #selector(onGridExpandToggleClicked)
+        gridExpandToggleBtn.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        gridExpandToggleBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        gridExpandToggleBtn.isHidden = true
+        tabsStack.addArrangedSubview(gridExpandToggleBtn)
+
+        gridHeaderStack.translatesAutoresizingMaskIntoConstraints = false
+        gridHeaderStack.orientation = .horizontal
+        gridHeaderStack.spacing = 8
+        gridHeaderStack.alignment = .centerY
+        gridHeaderStack.isHidden = true
+
+        let gridDivider = NSView()
+        gridDivider.translatesAutoresizingMaskIntoConstraints = false
+        gridDivider.wantsLayer = true
+        gridDivider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        gridDivider.widthAnchor.constraint(equalToConstant: 1).isActive = true
+        gridDivider.heightAnchor.constraint(equalToConstant: 14).isActive = true
+        gridHeaderStack.addArrangedSubview(gridDivider)
+
+        let trackLabel = NSTextField(labelWithString: "Traccia:")
+        trackLabel.translatesAutoresizingMaskIntoConstraints = false
+        trackLabel.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+        gridHeaderStack.addArrangedSubview(trackLabel)
+
+        trackPopUp.translatesAutoresizingMaskIntoConstraints = false
+        trackPopUp.target = self
+        trackPopUp.action = #selector(onTrackPopUpChanged)
+        trackPopUp.widthAnchor.constraint(equalToConstant: 75).isActive = true
+        gridHeaderStack.addArrangedSubview(trackPopUp)
+
+        gridInfoLabel.translatesAutoresizingMaskIntoConstraints = false
+        gridInfoLabel.font = NSFont.systemFont(ofSize: 11)
+        gridInfoLabel.textColor = .secondaryLabelColor
+        gridInfoLabel.lineBreakMode = .byTruncatingTail
+        gridInfoLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        gridHeaderStack.addArrangedSubview(gridInfoLabel)
+
+        tabsStack.addArrangedSubview(gridHeaderStack)
 
         let viewModeStack = NSStackView()
         viewModeStack.translatesAutoresizingMaskIntoConstraints = false
@@ -614,25 +980,32 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         viewModeStack.alignment = .centerY
         topHeader.addSubview(viewModeStack)
 
-        listModeBtn.image = Lucide.template(.list, size: 16)
-        listModeBtn.toolTip = "Vista Elenco (List)"
-        listModeBtn.activeTintColor = .systemCyan
-        listModeBtn.isToggleActive = true
-        listModeBtn.target = self
-        listModeBtn.action = #selector(onListModeClicked)
-        listModeBtn.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        listModeBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
-        viewModeStack.addArrangedSubview(listModeBtn)
+        gridSizeIcon.translatesAutoresizingMaskIntoConstraints = false
+        gridSizeIcon.image = Lucide.template(.layoutGrid, size: 13)
+        gridSizeIcon.contentTintColor = .secondaryLabelColor
+        gridSizeIcon.toolTip = "Dimensione schede (doppio clic sullo slider per ripristinare)"
+        gridSizeIcon.widthAnchor.constraint(equalToConstant: 14).isActive = true
+        gridSizeIcon.heightAnchor.constraint(equalToConstant: 14).isActive = true
+        gridSizeIcon.isHidden = true
+        viewModeStack.addArrangedSubview(gridSizeIcon)
 
-        gridModeBtn.image = Lucide.template(.squarePlay, size: 16)
-        gridModeBtn.toolTip = "Vista Anteprime (Grid)"
-        gridModeBtn.activeTintColor = .systemCyan
-        gridModeBtn.isToggleActive = false
-        gridModeBtn.target = self
-        gridModeBtn.action = #selector(onGridModeClicked)
-        gridModeBtn.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        gridModeBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
-        viewModeStack.addArrangedSubview(gridModeBtn)
+        gridSizeSlider.translatesAutoresizingMaskIntoConstraints = false
+        gridSizeSlider.target = self
+        gridSizeSlider.action = #selector(onGridSizeSliderChanged)
+        gridSizeSlider.toolTip = "Dimensione schede (doppio clic per ripristinare)"
+        gridSizeSlider.widthAnchor.constraint(equalToConstant: 74).isActive = true
+        gridSizeSlider.isHidden = true
+        viewModeStack.addArrangedSubview(gridSizeSlider)
+
+        viewModeSwitchBtn.image = Lucide.template(.list, size: 16)
+        viewModeSwitchBtn.toolTip = "Vista Elenco — Clicca per Vista Anteprime (Grid)"
+        viewModeSwitchBtn.activeTintColor = .systemCyan
+        viewModeSwitchBtn.isToggleActive = false
+        viewModeSwitchBtn.target = self
+        viewModeSwitchBtn.action = #selector(onViewModeSwitchClicked)
+        viewModeSwitchBtn.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        viewModeSwitchBtn.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        viewModeStack.addArrangedSubview(viewModeSwitchBtn)
 
         viewModeDivider.translatesAutoresizingMaskIntoConstraints = false
         viewModeDivider.wantsLayer = true
@@ -654,6 +1027,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         NSLayoutConstraint.activate([
             tabsStack.leadingAnchor.constraint(equalTo: topHeader.leadingAnchor, constant: 10),
             tabsStack.centerYAnchor.constraint(equalTo: topHeader.centerYAnchor),
+            tabsStack.trailingAnchor.constraint(lessThanOrEqualTo: viewModeStack.leadingAnchor, constant: -8),
 
             viewModeStack.trailingAnchor.constraint(equalTo: topHeader.trailingAnchor, constant: -10),
             viewModeStack.centerYAnchor.constraint(equalTo: topHeader.centerYAnchor)
@@ -702,6 +1076,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
 
         sidebarContainer.frame = NSRect(x: 0, y: 0, width: sidebarW, height: totalH)
         contentContainer.frame = NSRect(x: sidebarW + dividerThickness, y: 0, width: contentW, height: totalH)
+        syncSidebarTableWidths()
     }
 
     private func setupSidebarUI() {
@@ -721,6 +1096,10 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
 
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("SidebarCol"))
         col.title = "Cartelle"
+        col.width = 145
+        col.minWidth = 80
+        col.resizingMask = .autoresizingMask
+        sidebarTableView.autoresizingMask = [.width, .height]
         sidebarTableView.addTableColumn(col)
         sidebarTableView.headerView = nil
         sidebarTableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
@@ -751,8 +1130,9 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         smartSectionView.layer?.backgroundColor = NSColor(calibratedWhite: 0.085, alpha: 1.0).cgColor
         sidebarContainer.addSubview(smartSectionView)
 
-        let smartDivider = NSBox()
-        smartDivider.boxType = .separator
+        let smartDivider = NSView()
+        smartDivider.wantsLayer = true
+        smartDivider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.10).cgColor
         smartDivider.translatesAutoresizingMaskIntoConstraints = false
         smartSectionView.addSubview(smartDivider)
 
@@ -760,18 +1140,26 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         smartHeader.translatesAutoresizingMaskIntoConstraints = false
         smartHeader.font = NSFont.systemFont(ofSize: 9.5, weight: .bold)
         smartHeader.textColor = NSColor(calibratedWhite: 0.52, alpha: 1.0)
+        smartHeader.setContentHuggingPriority(.required, for: .vertical)
+        smartHeader.setContentCompressionResistancePriority(.required, for: .vertical)
         smartSectionView.addSubview(smartHeader)
 
         smartScrollView.translatesAutoresizingMaskIntoConstraints = false
         smartScrollView.documentView = smartTableView
         smartScrollView.borderType = .noBorder
-        smartScrollView.hasVerticalScroller = false
+        smartScrollView.hasVerticalScroller = true
         smartScrollView.hasHorizontalScroller = false
+        smartScrollView.scrollerStyle = .overlay
+        smartScrollView.autohidesScrollers = true
         smartScrollView.drawsBackground = false
         smartSectionView.addSubview(smartScrollView)
 
         let smartCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("SmartSidebarCol"))
         smartCol.title = "Smart"
+        smartCol.width = 145
+        smartCol.minWidth = 80
+        smartCol.resizingMask = .autoresizingMask
+        smartTableView.autoresizingMask = [.width, .height]
         smartTableView.addTableColumn(smartCol)
         smartTableView.headerView = nil
         smartTableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
@@ -784,6 +1172,9 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         smartTableView.target = self
         smartTableView.backgroundColor = .clear
         smartTableView.selectionHighlightStyle = .regular
+        if #available(macOS 11.0, *) {
+            smartTableView.style = .plain
+        }
         smartTableView.rowSizeStyle = .custom
         smartTableView.rowHeight = 22
         smartTableView.registerForDraggedTypes([.fileURL, .URL, NSPasteboard.PasteboardType("NSFilenamesPboardType")])
@@ -794,7 +1185,9 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             self?.showSmartSidebarContextMenu(forRow: row, event: event)
         }
 
-        let smartHeight = CGFloat(SmartFolderKind.allCases.count) * 24.0 + 30.0
+        let smartHeight = min(220.0, CGFloat(smartSidebarRows.count) * 24.0 + 34.0)
+        let smartHC = smartSectionView.heightAnchor.constraint(equalToConstant: smartHeight)
+        self.smartSectionHeightConstraint = smartHC
         NSLayoutConstraint.activate([
             sidebarScrollView.topAnchor.constraint(equalTo: sidebarContainer.topAnchor, constant: 4),
             sidebarScrollView.leadingAnchor.constraint(equalTo: sidebarContainer.leadingAnchor),
@@ -804,11 +1197,12 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             smartSectionView.leadingAnchor.constraint(equalTo: sidebarContainer.leadingAnchor),
             smartSectionView.trailingAnchor.constraint(equalTo: sidebarContainer.trailingAnchor),
             smartSectionView.bottomAnchor.constraint(equalTo: sidebarContainer.bottomAnchor),
-            smartSectionView.heightAnchor.constraint(equalToConstant: smartHeight),
+            smartHC,
 
             smartDivider.topAnchor.constraint(equalTo: smartSectionView.topAnchor),
             smartDivider.leadingAnchor.constraint(equalTo: smartSectionView.leadingAnchor),
             smartDivider.trailingAnchor.constraint(equalTo: smartSectionView.trailingAnchor),
+            smartDivider.heightAnchor.constraint(equalToConstant: 1),
 
             smartHeader.topAnchor.constraint(equalTo: smartDivider.bottomAnchor, constant: 6),
             smartHeader.leadingAnchor.constraint(equalTo: smartSectionView.leadingAnchor, constant: 10),
@@ -907,6 +1301,12 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         contentTableView.onMouseDown = { [weak self] in
             self?.delegate?.didActivateSection(.mediaPool)
         }
+        contentTableView.onSingleClickRow = { [weak self] row in
+            guard let self = self else { return }
+            let list = self.currentListItems
+            guard row >= 0 && row < list.count, case .media(let m) = list[row] else { return }
+            self.delegate?.didSelectMediaItemForSourcePreview(m)
+        }
         contentTableView.onRightClick = { [weak self] event, row in
             self?.showContentContextMenu(forRow: row, event: event)
         }
@@ -932,8 +1332,11 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             self.delegate?.didActivateSection(.mediaPool)
             self.syncTableSelectionFromGridIds(selectedIds)
         }
-        gridView.onClipSelected = { [weak self] _, _ in
+        gridView.onClipSelected = { [weak self] item, modifiers in
             self?.delegate?.didActivateSection(.mediaPool)
+            if !modifiers.contains(.command) && !modifiers.contains(.shift) {
+                self?.delegate?.didSelectMediaItemForSourcePreview(item)
+            }
         }
         gridView.onMusicTrackSelected = { [weak self] _, _ in
             self?.delegate?.didActivateSection(.mediaPool)
@@ -1031,6 +1434,18 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         gridView.onRenameFolder = { [weak self] f in
             self?.showRenameFolderDialog(folder: f)
         }
+        gridView.onRenameMedia = { [weak self] m in
+            self?.renameMediaItemInPlace(media: m)
+        }
+        gridView.onRelinkFolder = { [weak self] f in
+            self?.relinkMediaInFolder(f)
+        }
+        gridView.onRelinkMedia = { [weak self] items in
+            self?.relinkOrReplaceMediaItems(items, allowSingleFile: items.count == 1, forceManualReplace: false)
+        }
+        gridView.onReplaceMediaSource = { [weak self] item in
+            self?.relinkOrReplaceMediaItems([item], allowSingleFile: true, forceManualReplace: true)
+        }
         gridView.onDeleteFolder = { [weak self] f in
             self?.deleteFolder(id: f.id)
         }
@@ -1083,27 +1498,6 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     }
 
     private func setupTimelineGridUI(in container: NSView) {
-        let subHeader = NSView()
-        subHeader.translatesAutoresizingMaskIntoConstraints = false
-        subHeader.wantsLayer = true
-        subHeader.layer?.backgroundColor = NSColor(calibratedWhite: 0.105, alpha: 1.0).cgColor
-        container.addSubview(subHeader)
-
-        let trackLabel = NSTextField(labelWithString: "Traccia:")
-        trackLabel.translatesAutoresizingMaskIntoConstraints = false
-        trackLabel.font = NSFont.systemFont(ofSize: 11, weight: .bold)
-        subHeader.addSubview(trackLabel)
-
-        trackPopUp.translatesAutoresizingMaskIntoConstraints = false
-        trackPopUp.target = self
-        trackPopUp.action = #selector(onTrackPopUpChanged)
-        subHeader.addSubview(trackPopUp)
-
-        gridInfoLabel.translatesAutoresizingMaskIntoConstraints = false
-        gridInfoLabel.font = NSFont.systemFont(ofSize: 11)
-        gridInfoLabel.textColor = .secondaryLabelColor
-        subHeader.addSubview(gridInfoLabel)
-
         timelineGridScrollView.translatesAutoresizingMaskIntoConstraints = false
         timelineGridScrollView.documentView = timelineGridView
         timelineGridScrollView.hasVerticalScroller = true
@@ -1114,6 +1508,9 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         timelineGridView.onClipSelected = { [weak self] clip in
             self?.delegate?.didActivateSection(.mediaPool)
             self?.delegate?.didSelectSeekToClip(clip)
+        }
+        timelineGridView.onSelectionChanged = { [weak self] in
+            self?.delegate?.didChangeSelectionFromGrid()
         }
         timelineGridView.onReorderCommitted = { [weak self] in
             self?.delegate?.didReorderTimelineFromGrid()
@@ -1159,24 +1556,12 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             self.delegate?.didReorderTimelineFromGrid()
             self.updateTimelineGridInfo()
         }
+        timelineGridView.onClipContextMenuRequested = { [weak self] clip, event, sourceView, extraItems in
+            self?.delegate?.didRequestClipContextMenuFromGrid(clip, event: event, sourceView: sourceView, extraItems: extraItems)
+        }
 
         NSLayoutConstraint.activate([
-            subHeader.topAnchor.constraint(equalTo: container.topAnchor),
-            subHeader.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            subHeader.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            subHeader.heightAnchor.constraint(equalToConstant: 34),
-
-            trackLabel.leadingAnchor.constraint(equalTo: subHeader.leadingAnchor, constant: 10),
-            trackLabel.centerYAnchor.constraint(equalTo: subHeader.centerYAnchor),
-
-            trackPopUp.leadingAnchor.constraint(equalTo: trackLabel.trailingAnchor, constant: 4),
-            trackPopUp.centerYAnchor.constraint(equalTo: subHeader.centerYAnchor),
-            trackPopUp.widthAnchor.constraint(equalToConstant: 75),
-
-            gridInfoLabel.leadingAnchor.constraint(equalTo: trackPopUp.trailingAnchor, constant: 10),
-            gridInfoLabel.centerYAnchor.constraint(equalTo: subHeader.centerYAnchor),
-
-            timelineGridScrollView.topAnchor.constraint(equalTo: subHeader.bottomAnchor),
+            timelineGridScrollView.topAnchor.constraint(equalTo: container.topAnchor),
             timelineGridScrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             timelineGridScrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             timelineGridScrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
@@ -1217,45 +1602,86 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     }
 
     // MARK: - Tab & View Mode Actions
-    @objc private func onMediaPoolTabClicked() {
-        delegate?.didActivateSection(.mediaPool)
-        mediaPoolTabBtn.isToggleActive = true
-        timelineGridTabBtn.isToggleActive = false
-        listModeBtn.isHidden = false
-        gridModeBtn.isHidden = false
-        viewModeDivider.isHidden = false
-        searchToggleBtn.isHidden = false
-        mediaPoolContainer.isHidden = false
-        timelineGridContainer.isHidden = true
+    private func setTimelineGridVisible(_ showGrid: Bool) {
+        poolTabSwitchBtn.image = Lucide.template(showGrid ? .galleryHorizontalEnd : .fileVideoCamera, size: 17)
+        poolTabSwitchBtn.isToggleActive = showGrid
+        poolTabSwitchBtn.toolTip = showGrid
+            ? "Timeline Grid — Clicca per tornare a Media Pool"
+            : "Media Pool — Clicca per passare a Timeline Grid"
+
+        gridHeaderStack.isHidden = !showGrid
+        gridExpandToggleBtn.isHidden = !showGrid
+        gridSizeIcon.isHidden = !showGrid
+        gridSizeSlider.isHidden = !showGrid
+        viewModeSwitchBtn.isHidden = showGrid
+        viewModeDivider.isHidden = showGrid
+        searchToggleBtn.isHidden = showGrid
+        mediaPoolContainer.isHidden = showGrid
+        timelineGridContainer.isHidden = !showGrid
+
+        if showGrid {
+            isGridExpanded = isGridExpanded && isTimelineGridVisible
+            updateGridExpandButtonVisual()
+            refreshTimelineGrid()
+            timelineGridView.updateLayoutForCurrentWidth()
+        } else if isGridExpanded {
+            isGridExpanded = false
+            updateGridExpandButtonVisual()
+            delegate?.didToggleTimelineGridExpanded(false)
+        }
     }
 
-    @objc private func onTimelineGridTabClicked() {
+    @objc private func onGridSizeSliderChanged() {
+        timelineGridView.cardScale = CGFloat(gridSizeSlider.doubleValue)
+    }
+
+    public func revealClipInTimelineGrid(clipId: UUID, trackIndex: Int) {
         delegate?.didActivateSection(.mediaPool)
-        mediaPoolTabBtn.isToggleActive = false
-        timelineGridTabBtn.isToggleActive = true
-        listModeBtn.isHidden = true
-        gridModeBtn.isHidden = true
-        viewModeDivider.isHidden = true
-        searchToggleBtn.isHidden = true
-        mediaPoolContainer.isHidden = true
-        timelineGridContainer.isHidden = false
+        if !isTimelineGridVisible {
+            setTimelineGridVisible(true)
+        }
+        if timelineGridView.selectedTrackIndex != trackIndex {
+            timelineGridView.selectedTrackIndex = trackIndex
+        }
         refreshTimelineGrid()
-        timelineGridView.updateLayoutForCurrentWidth()
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.timelineGridContainer.layoutSubtreeIfNeeded()
+            self.timelineGridView.reloadData()
+            self.timelineGridView.scrollToClipIfNeeded(clipId)
+        }
     }
 
-    @objc private func onListModeClicked() {
+    @objc private func onPoolTabSwitchClicked() {
         delegate?.didActivateSection(.mediaPool)
-        currentViewMode = .list
-        listModeBtn.isToggleActive = true
-        gridModeBtn.isToggleActive = false
-        updateContentModeVisibility()
+        setTimelineGridVisible(!isTimelineGridVisible)
     }
 
-    @objc private func onGridModeClicked() {
+    @objc private func onGridExpandToggleClicked() {
         delegate?.didActivateSection(.mediaPool)
-        currentViewMode = .grid
-        listModeBtn.isToggleActive = false
-        gridModeBtn.isToggleActive = true
+        guard isTimelineGridVisible else { return }
+        isGridExpanded.toggle()
+        updateGridExpandButtonVisual()
+        delegate?.didToggleTimelineGridExpanded(isGridExpanded)
+    }
+
+    private func updateGridExpandButtonVisual() {
+        gridExpandToggleBtn.image = Lucide.template(isGridExpanded ? .minimize2 : .maximize2, size: 15)
+        gridExpandToggleBtn.isToggleActive = isGridExpanded
+        gridExpandToggleBtn.toolTip = isGridExpanded
+            ? "Ripristina layout predefinito di Timeline Grid"
+            : "Espandi Timeline Grid verticalmente sulla sinistra"
+    }
+
+    @objc private func onViewModeSwitchClicked() {
+        delegate?.didActivateSection(.mediaPool)
+        currentViewMode = (currentViewMode == .list) ? .grid : .list
+        let isGrid = (currentViewMode == .grid)
+        viewModeSwitchBtn.image = Lucide.template(isGrid ? .squarePlay : .list, size: 16)
+        viewModeSwitchBtn.isToggleActive = isGrid
+        viewModeSwitchBtn.toolTip = isGrid
+            ? "Vista Anteprime — Clicca per Vista Elenco"
+            : "Vista Elenco — Clicca per Vista Anteprime"
         updateContentModeVisibility()
     }
 
@@ -1361,19 +1787,47 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             } else {
                 let colName = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("Name"))
                 colName.title = "Nome Clip"
-                colName.width = 180
+                colName.width = 165
+                colName.sortDescriptorPrototype = NSSortDescriptor(key: "name", ascending: true)
                 contentTableView.addTableColumn(colName)
 
                 let colDur = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("Duration"))
                 colDur.title = "Durata"
-                colDur.width = 65
+                colDur.width = 58
+                colDur.sortDescriptorPrototype = NSSortDescriptor(key: "duration", ascending: true)
                 contentTableView.addTableColumn(colDur)
 
+                let colRes = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("Resolution"))
+                colRes.title = "Risoluzione"
+                colRes.width = 84
+                colRes.sortDescriptorPrototype = NSSortDescriptor(key: "resolution", ascending: true)
+                contentTableView.addTableColumn(colRes)
+
+                let colFmt = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("FileFormat"))
+                colFmt.title = "Formato"
+                colFmt.width = 62
+                colFmt.sortDescriptorPrototype = NSSortDescriptor(key: "fileFormat", ascending: true)
+                contentTableView.addTableColumn(colFmt)
+
                 let colCodec = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("Codec"))
-                colCodec.title = "Formato"
-                colCodec.width = 150
+                colCodec.title = "Codec"
+                colCodec.width = 74
+                colCodec.sortDescriptorPrototype = NSSortDescriptor(key: "codec", ascending: true)
                 contentTableView.addTableColumn(colCodec)
+
+                let colFps = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("FPS"))
+                colFps.title = "FPS"
+                colFps.width = 52
+                colFps.sortDescriptorPrototype = NSSortDescriptor(key: "fps", ascending: true)
+                contentTableView.addTableColumn(colFps)
+
+                let colUsage = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("Usage"))
+                colUsage.title = "Utilizzo"
+                colUsage.width = 58
+                colUsage.sortDescriptorPrototype = NSSortDescriptor(key: "usage", ascending: false)
+                contentTableView.addTableColumn(colUsage)
             }
+            loadSortStateForCurrentScope()
         }
     }
 
@@ -1382,6 +1836,8 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         if let smart = activeSmartFolder {
             if smart == .musicLibrary {
                 placeholderText = "Cerca titolo, artista, album, genere..."
+            } else if smart == .video, let fpsLabel = activeSmartVideoFPSLabel {
+                placeholderText = "Cerca in Video (\(fpsLabel) fps)..."
             } else {
                 placeholderText = "Cerca in \(smart.rawValue)..."
             }
@@ -1471,7 +1927,32 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         updateContentModeVisibility()
     }
 
+    private func updateSmartSectionHeight() {
+        let targetH = min(220.0, CGFloat(smartSidebarRows.count) * 24.0 + 34.0)
+        smartSectionHeightConstraint?.constant = targetH
+    }
+
+    @objc private func onSmartVideoDisclosureClicked() {
+        isSmartVideoExpanded.toggle()
+        if !isSmartVideoExpanded && activeSmartVideoFPSLabel != nil {
+            activeSmartVideoFPSLabel = nil
+            activeSmartFolder = .video
+            loadSortStateForCurrentScope()
+        }
+        updateSmartSectionHeight()
+        isUpdatingSidebarSelection = true
+        smartTableView.reloadData()
+        isUpdatingSidebarSelection = false
+        updateSidebarSelection()
+        updateContentModeVisibility()
+    }
+
     public func refreshMediaPoolDisplay() {
+        refreshUsageCache()
+        if let activeFps = activeSmartVideoFPSLabel, !videoFPSBuckets.contains(where: { $0.label == activeFps }) {
+            activeSmartVideoFPSLabel = nil
+        }
+        updateSmartSectionHeight()
         isUpdatingSidebarSelection = true
         sidebarTableView.reloadData()
         smartTableView.reloadData()
@@ -1488,10 +1969,26 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         let knownFolderIds = Set(EditorProject.shared.folders.map(\.id))
         selectedFolderIds = selectedFolderIds.intersection(knownFolderIds)
 
-        if let smart = activeSmartFolder,
-           let smartIdx = SmartFolderKind.allCases.firstIndex(of: smart) {
+        if let smart = activeSmartFolder {
             sidebarTableView.deselectAll(nil)
-            smartTableView.selectRowIndexes(IndexSet(integer: smartIdx), byExtendingSelection: false)
+            let sRows = smartSidebarRows
+            let targetIdx: Int?
+            if smart == .video, let fpsLabel = activeSmartVideoFPSLabel {
+                targetIdx = sRows.firstIndex { row in
+                    if case .smartVideoFPS(_, let lbl, _) = row { return lbl == fpsLabel }
+                    return false
+                }
+            } else {
+                targetIdx = sRows.firstIndex { row in
+                    if case .smart(let k) = row { return k == smart }
+                    return false
+                }
+            }
+            if let smartIdx = targetIdx {
+                smartTableView.selectRowIndexes(IndexSet(integer: smartIdx), byExtendingSelection: false)
+            } else {
+                smartTableView.deselectAll(nil)
+            }
         } else {
             smartTableView.deselectAll(nil)
             var idxs = IndexSet()
@@ -1619,12 +2116,12 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         }
     }
 
-    private func generalContextMenuItems(defaultParentFolderId: UUID? = nil) -> [VisionMenuItem] {
+    private func generalContextMenuItems(defaultParentFolderId: UUID? = nil, isProjectRootMenu: Bool = false) -> [VisionMenuItem] {
         if activeSmartFolder == .musicLibrary {
             return musicLibraryContextMenuItems()
         }
         let parentTarget = defaultParentFolderId ?? (selectedFolderIds.count == 1 && !isProjectRootSelected ? selectedFolderIds.first : nil)
-        return [
+        var items: [VisionMenuItem] = [
             .action(title: parentTarget == nil ? "Nuova cartella in Progetto" : "Nuova sottocartella", icon: .folder, iconColor: .systemOrange) { [weak self] in
                 self?.showNewFolderDialog(parentId: parentTarget)
             },
@@ -1642,6 +2139,19 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 self?.importFolderWithPanel()
             }
         ]
+        if isProjectRootMenu || (defaultParentFolderId == nil && isProjectRootSelected && activeSmartFolder == nil) {
+            items.append(.separator)
+            items.append(.action(title: "Ricollega clip...", icon: .link, iconColor: .systemCyan) { [weak self] in
+                self?.relinkAllProjectMedia()
+            })
+        } else if let folderId = parentTarget,
+                  let folder = EditorProject.shared.folders.first(where: { $0.id == folderId }) {
+            items.append(.separator)
+            items.append(.action(title: "Ricollega clip...", icon: .link, iconColor: .systemCyan) { [weak self] in
+                self?.relinkMediaInFolder(folder)
+            })
+        }
+        return items
     }
 
     private func showGeneralContextMenu(event: NSEvent) {
@@ -1654,7 +2164,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         if row >= 0 && row < rows.count {
             switch rows[row] {
             case .projectRoot:
-                items = generalContextMenuItems(defaultParentFolderId: nil)
+                items = generalContextMenuItems(defaultParentFolderId: nil, isProjectRootMenu: true)
             case .folder(let folder, _):
                 items = [
                     .header(folder.name),
@@ -1665,14 +2175,17 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                         self?.showNewFolderDialog(parentId: folder.id)
                     },
                     .action(title: "Rinomina cartella...", icon: .pencil) { [weak self] in
-                        self?.showRenameFolderDialog(folder: folder)
+                        self?.showRenameFolderDialog(folder: folder, preferSidebar: true)
+                    },
+                    .action(title: "Ricollega clip...", icon: .link, iconColor: .systemCyan) { [weak self] in
+                        self?.relinkMediaInFolder(folder)
                     },
                     .separator,
                     .action(title: "Elimina cartella", icon: .trash, isDestructive: true) { [weak self] in
                         self?.deleteFolder(id: folder.id)
                     }
                 ]
-            case .smart:
+            case .smart, .smartVideoFPS:
                 items = generalContextMenuItems()
             }
         } else {
@@ -1683,20 +2196,48 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
 
     private func showSmartSidebarContextMenu(forRow row: Int, event: NSEvent) {
         let rows = smartSidebarRows
-        guard row >= 0 && row < rows.count, case .smart(let kind) = rows[row] else {
+        guard row >= 0 && row < rows.count else {
             showGeneralContextMenu(event: event)
             return
         }
         let items: [VisionMenuItem]
-        if kind == .musicLibrary {
-            items = musicLibraryContextMenuItems()
-        } else {
+        switch rows[row] {
+        case .smart(let kind):
+            if kind == .musicLibrary {
+                items = musicLibraryContextMenuItems()
+            } else if kind == .video {
+                items = [
+                    .header("Cartella Smart: Video"),
+                    .action(title: "Apri Video", icon: .folder, iconColor: .systemCyan) { [weak self] in
+                        self?.selectSmartFolder(.video)
+                    },
+                    .action(title: self.isSmartVideoExpanded ? "Comprimi sottocartelle FPS" : "Espandi sottocartelle FPS", icon: self.isSmartVideoExpanded ? .chevronDown : .chevronRight) { [weak self] in
+                        self?.onSmartVideoDisclosureClicked()
+                    }
+                ]
+            } else {
+                items = [
+                    .header("Cartella Smart: \(kind.rawValue)"),
+                    .action(title: "Apri \(kind.rawValue)", icon: .folder, iconColor: .systemCyan) { [weak self] in
+                        self?.selectSmartFolder(kind)
+                    }
+                ]
+            }
+        case .smartVideoFPS(_, let label, _):
             items = [
-                .header("Cartella Smart: \(kind.rawValue)"),
-                .action(title: "Apri \(kind.rawValue)", icon: .folder, iconColor: .systemCyan) { [weak self] in
-                    self?.selectSmartFolder(kind)
+                .header("Video • \(label) fps"),
+                .action(title: "Mostra clip a \(label) fps", icon: .film, iconColor: .systemIndigo) { [weak self] in
+                    self?.activeSmartFolder = .video
+                    self?.activeSmartVideoFPSLabel = label
+                    self?.isProjectRootSelected = false
+                    self?.selectedFolderIds.removeAll()
+                    self?.loadSortStateForCurrentScope()
+                    self?.refreshMediaPoolDisplay()
                 }
             ]
+        default:
+            showGeneralContextMenu(event: event)
+            return
         }
         VisionMenu(items: items).show(for: event, in: self.view)
     }
@@ -1776,6 +2317,9 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             items.append(.action(title: "Rinomina cartella...", icon: .pencil) { [weak self] in
                 self?.showRenameFolderDialog(folder: folder)
             })
+            items.append(.action(title: "Ricollega clip...", icon: .link, iconColor: .systemCyan) { [weak self] in
+                self?.relinkMediaInFolder(folder)
+            })
             items.append(.separator)
             if isPartOfMultiSelection {
                 items.append(.action(title: "Elimina \(selectedIdsUnion.count) elementi dal Media Pool...", icon: .trash, isDestructive: true) { [weak self] in
@@ -1789,11 +2333,16 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
 
         case .media(let media):
             let selMedia = selectedMediaItems
-            let targetIds = (selMedia.contains(where: { $0.id == media.id }) && selMedia.count > 1) ? selMedia.map(\.id) : [media.id]
+            let targetItems = (selMedia.contains(where: { $0.id == media.id }) && selMedia.count > 1) ? selMedia : [media]
+            let targetIds = targetItems.map(\.id)
 
             items.append(.header(isPartOfMultiSelection ? "\(selectedIdsUnion.count) elementi selezionati" : (targetIds.count > 1 ? "\(targetIds.count) elementi selezionati" : media.name)))
-            items.append(.action(title: "Inserisci in timeline", icon: .plus, iconColor: .systemCyan) { [weak self] in
-                self?.delegate?.didSelectAddClipToTimeline(media)
+            items.append(.action(title: targetItems.count > 1 ? "Inserisci \(targetItems.count) clip in timeline" : "Inserisci in timeline", icon: .plus, iconColor: .systemCyan) { [weak self] in
+                if targetItems.count > 1 {
+                    self?.delegate?.didSelectAddClipsToTimeline(targetItems)
+                } else {
+                    self?.delegate?.didSelectAddClipToTimeline(media)
+                }
             })
 
             if media.hasVideo {
@@ -1805,6 +2354,25 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                     }
                 }
                 items.append(.submenu(title: "Orientamento clip", icon: .rotateCw, items: orientChildren))
+            }
+
+            if targetItems.count == 1 && !isPartOfMultiSelection {
+                items.append(.action(title: "Rinomina...", icon: .pencil) { [weak self] in
+                    self?.renameMediaItemInPlace(media: media)
+                })
+            }
+
+            items.append(.action(
+                title: targetItems.count > 1 ? "Ricollega \(targetItems.count) clip..." : "Ricollega clip...",
+                icon: .link,
+                iconColor: .systemCyan
+            ) { [weak self] in
+                self?.relinkOrReplaceMediaItems(targetItems, allowSingleFile: targetItems.count == 1, forceManualReplace: false)
+            })
+            if targetItems.count == 1 && !isPartOfMultiSelection {
+                items.append(.action(title: "Sostituisci sorgente...", icon: .arrowLeftRight) { [weak self] in
+                    self?.relinkOrReplaceMediaItems([media], allowSingleFile: true, forceManualReplace: true)
+                })
             }
 
             var folderChildren: [VisionMenuItem] = [
@@ -1913,6 +2481,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 self?.timelineGridView.reloadData()
             }
         }
+        self.activeProxyDialog = dialog
         dialog.showWindow(nil)
     }
 
@@ -1926,7 +2495,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             showRenameProjectDialog()
         case .folder(let folder, _):
             showRenameFolderDialog(folder: folder)
-        case .smart:
+        case .smart, .smartVideoFPS:
             break
         }
     }
@@ -1935,9 +2504,13 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         delegate?.didActivateSection(.mediaPool)
         let row = smartTableView.clickedRow
         let rows = smartSidebarRows
-        guard row >= 0 && row < rows.count, case .smart(let kind) = rows[row] else { return }
-        if kind == .musicLibrary {
-            addMusicLibrarySourceWithPanel()
+        guard row >= 0 && row < rows.count else { return }
+        if case .smart(let kind) = rows[row] {
+            if kind == .musicLibrary {
+                addMusicLibrarySourceWithPanel()
+            } else if kind == .video {
+                onSmartVideoDisclosureClicked()
+            }
         }
     }
 
@@ -1964,29 +2537,331 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         }
     }
 
-    private func showRenameFolderDialog(folder: MediaFolder) {
-        delegate?.didActivateSection(.mediaPool)
-        let alert = NSAlert()
-        alert.messageText = "Rinomina Cartella"
-        alert.informativeText = "Nuovo nome per '\(folder.name)':"
-        alert.alertStyle = .informational
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
-        input.stringValue = folder.name
-        alert.accessoryView = input
-        alert.addButton(withTitle: "Rinomina")
-        alert.addButton(withTitle: "Annulla")
+    private func beginInlineRename(in tableView: NSTableView, row: Int, initialText: String, onCommit: @escaping (String) -> Void) {
+        guard row >= 0, row < tableView.numberOfRows else { return }
+        tableView.scrollRowToVisible(row)
+        tableView.layoutSubtreeIfNeeded()
+        let colIndex: Int
+        if tableView === contentTableView {
+            colIndex = tableView.tableColumns.firstIndex(where: {
+                let id = $0.identifier.rawValue
+                return id == "Name" || id == "MusicTitle"
+            }) ?? 0
+        } else {
+            colIndex = 0
+        }
+        guard let cell = tableView.view(atColumn: colIndex, row: row, makeIfNecessary: true) as? NSTableCellView else { return }
+        cell.layoutSubtreeIfNeeded()
+        let anchorView: NSView = cell.textField ?? cell
+        var rect = tableView.convert(anchorView.bounds, from: anchorView)
+        let maxRight = tableView.convert(cell.bounds, from: cell).maxX - 4
+        rect.origin.x -= 3
+        rect.size.width = max(rect.width + 6, maxRight - rect.origin.x)
+        rect.size.height = max(rect.height + 4, 20)
+        rect.origin.y = rect.midY - rect.size.height * 0.5
+        InlineRenameSession.begin(
+            in: tableView,
+            frame: rect,
+            font: cell.textField?.font ?? NSFont.systemFont(ofSize: 11, weight: .medium),
+            initialText: initialText,
+            maskedView: cell.textField,
+            onCommit: onCommit
+        )
+    }
 
-        if alert.runModal() == .alertFirstButtonReturn {
-            let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !name.isEmpty {
-                EditorProject.shared.renameFolder(id: folder.id, newName: name)
-                refreshMediaPoolDisplay()
+    private func showRenameFolderDialog(folder: MediaFolder, preferSidebar: Bool = false) {
+        delegate?.didActivateSection(.mediaPool)
+        let commit: (String) -> Void = { [weak self] name in
+            EditorProject.shared.renameFolder(id: folder.id, newName: name)
+            self?.refreshMediaPoolDisplay()
+        }
+
+        if !preferSidebar {
+            if currentViewMode == .grid && timelineGridContainer.isHidden,
+               currentListItems.contains(where: { if case .folder(let f) = $0 { return f.id == folder.id }; return false }) {
+                gridView.beginInlineRename(forItemId: folder.id, initialText: folder.name, onCommit: commit)
+                return
             }
+            if let row = currentListItems.firstIndex(where: { if case .folder(let f) = $0 { return f.id == folder.id }; return false }) {
+                beginInlineRename(in: contentTableView, row: row, initialText: folder.name, onCommit: commit)
+                return
+            }
+        }
+
+        if let sidebarRow = folderSidebarRows.firstIndex(where: { if case .folder(let f, _) = $0 { return f.id == folder.id }; return false }) {
+            beginInlineRename(in: sidebarTableView, row: sidebarRow, initialText: folder.name, onCommit: commit)
+        }
+    }
+
+    private func renameMediaItemInPlace(media: MediaItem) {
+        delegate?.didActivateSection(.mediaPool)
+        let commit: (String) -> Void = { [weak self] name in
+            guard let self = self,
+                  let idx = self.mediaItems.firstIndex(where: { $0.id == media.id }) else { return }
+            self.mediaItems[idx].name = name
+            let updated = self.mediaItems[idx]
+            self.refreshMediaPoolDisplay()
+            self.delegate?.didRenameMediaItem(updated)
+        }
+
+        if currentViewMode == .grid && timelineGridContainer.isHidden {
+            gridView.beginInlineRename(forItemId: media.id, initialText: media.name, onCommit: commit)
+        } else if let row = currentListItems.firstIndex(where: { if case .media(let m) = $0 { return m.id == media.id }; return false }) {
+            beginInlineRename(in: contentTableView, row: row, initialText: media.name, onCommit: commit)
         }
     }
 
     private func deleteFolder(id: UUID) {
         confirmAndDeletePoolItems(mediaIds: [], timelineIds: [], folderIds: [id])
+    }
+
+    // MARK: - Media Relink & Source Replacement (Nome file + Dimensione esatta in byte)
+    private func descendantMediaItemIds(inFolder rootFolderId: UUID) -> Set<UUID> {
+        var folderIds: Set<UUID> = [rootFolderId]
+        var added = true
+        while added {
+            added = false
+            for f in EditorProject.shared.folders {
+                if let pId = f.parentId, folderIds.contains(pId), !folderIds.contains(f.id) {
+                    folderIds.insert(f.id)
+                    added = true
+                }
+            }
+        }
+        var result: Set<UUID> = []
+        for f in EditorProject.shared.folders where folderIds.contains(f.id) {
+            result.formUnion(f.itemIds)
+        }
+        return result
+    }
+
+    public func relinkAllProjectMedia() {
+        promptAndRelinkScope(targetItems: mediaItems, scopeTitle: "Progetto", allowSingleFile: false)
+    }
+
+    private func relinkMediaInFolder(_ folder: MediaFolder) {
+        let scopedIds = descendantMediaItemIds(inFolder: folder.id)
+        let scopedItems = mediaItems.filter { scopedIds.contains($0.id) }
+        promptAndRelinkScope(targetItems: scopedItems, scopeTitle: folder.name, allowSingleFile: false)
+    }
+
+    public func relinkOrReplaceMediaItems(_ items: [MediaItem], allowSingleFile: Bool, forceManualReplace: Bool) {
+        let targetIds = Set(items.map(\.id))
+        let resolvedItems = mediaItems.filter { targetIds.contains($0.id) }
+        let effectiveItems = resolvedItems.isEmpty ? items : resolvedItems
+        guard !effectiveItems.isEmpty else { return }
+
+        if forceManualReplace, let single = effectiveItems.first {
+            let panel = NSOpenPanel()
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = false
+            panel.allowsMultipleSelection = false
+            panel.message = "Scegli il nuovo file sorgente da collegare a '\(single.name)':"
+            panel.prompt = "Collega sorgente"
+            guard panel.runModal() == .OK, let chosenURL = panel.url else { return }
+            let actualBytes = MediaItem.measureFileSizeBytes(at: chosenURL)
+            applyManualSourceReplacement(item: single, to: chosenURL, actualBytes: actualBytes)
+            return
+        }
+
+        let scopeLabel = effectiveItems.count == 1 ? effectiveItems[0].name : "\(effectiveItems.count) clip selezionate"
+        promptAndRelinkScope(targetItems: effectiveItems, scopeTitle: scopeLabel, allowSingleFile: allowSingleFile)
+    }
+
+    private func promptAndRelinkScope(targetItems: [MediaItem], scopeTitle: String, allowSingleFile: Bool) {
+        delegate?.didActivateSection(.mediaPool)
+        guard !targetItems.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "Nessuna clip presente"
+            alert.informativeText = "Non ci sono clip da ricollegare in '\(scopeTitle)'."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = allowSingleFile && targetItems.count == 1
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Ricollega"
+        if panel.canChooseFiles {
+            panel.message = "Seleziona una cartella Finder in cui cercare '\(targetItems[0].matchFileName)' oppure scegli il file diretto:"
+        } else {
+            panel.message = "Seleziona la cartella Finder in cui cercare le clip spostate di '\(scopeTitle)' (verifica per nome file e dimensione esatta in byte):"
+        }
+
+        guard panel.runModal() == .OK, let chosenURL = panel.url else { return }
+
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: chosenURL.path, isDirectory: &isDir) else { return }
+
+        if !isDir.boolValue && targetItems.count == 1 {
+            let single = targetItems[0]
+            let verification = MediaRelinkService.doesFileMatchStrict(chosenURL, item: single)
+            if verification.matches {
+                applyStrictSingleRelink(item: single, to: chosenURL, actualBytes: verification.actualBytes)
+            } else {
+                let expectedDesc = single.fileSizeBytes.map { "\($0) byte" } ?? "dimensione sconosciuta"
+                let actualDesc = verification.actualBytes.map { "\($0) byte" } ?? "dimensione sconosciuta"
+                let confirm = NSAlert()
+                confirm.alertStyle = .informational
+                confirm.messageText = "Sorgente diversa rilevata"
+                confirm.informativeText = "Atteso: \(single.matchFileName) (\(expectedDesc))\nSelezionato: \(chosenURL.lastPathComponent) (\(actualDesc))\n\nVuoi collegare comunque questo file come nuova sorgente?"
+                confirm.addButton(withTitle: "Collega comunque")
+                confirm.addButton(withTitle: "Annulla")
+                if confirm.runModal() == .alertFirstButtonReturn {
+                    applyManualSourceReplacement(item: single, to: chosenURL, actualBytes: verification.actualBytes)
+                }
+            }
+            return
+        }
+
+        // Scansione ricorsiva della cartella scelta su coda asincrona
+        Task {
+            let index = await Task.detached(priority: .userInitiated) {
+                MediaRelinkService.indexDirectory(at: chosenURL)
+            }.value
+
+            var relinkedItems: [MediaItem] = []
+            var relinkedCount = 0
+            var alreadyOkCount = 0
+            var unmatchedNames: [String] = []
+
+            for item in targetItems {
+                if let match = MediaRelinkService.findMatch(for: item, in: index) {
+                    let samePath = match.url.standardizedFileURL.path == item.url.standardizedFileURL.path
+                    if samePath && item.isMediaAvailableOnDisk {
+                        if item.fileSizeBytes == nil || item.originalFileName != match.fileName {
+                            var refreshed = item
+                            refreshed.originalFileName = match.fileName
+                            refreshed.fileSizeBytes = match.fileSizeBytes
+                            relinkedItems.append(refreshed)
+                        }
+                        alreadyOkCount += 1
+                    } else {
+                        let updated = await MediaRelinkService.buildRelinkedItem(
+                            from: item,
+                            to: match.url,
+                            actualBytes: match.fileSizeBytes,
+                            reloadMediaProperties: false
+                        )
+                        relinkedItems.append(updated)
+                        relinkedCount += 1
+                    }
+                } else {
+                    unmatchedNames.append(item.matchFileName)
+                }
+            }
+
+            await MainActor.run {
+                self.commitRelinkedItems(
+                    relinkedItems,
+                    scopeTitle: scopeTitle,
+                    totalTargeted: targetItems.count,
+                    relinkedCount: relinkedCount,
+                    alreadyOkCount: alreadyOkCount,
+                    unmatchedNames: unmatchedNames,
+                    showSummaryAlert: true
+                )
+            }
+        }
+    }
+
+    private func applyStrictSingleRelink(item: MediaItem, to newURL: URL, actualBytes: Int64?) {
+        Task {
+            let updated = await MediaRelinkService.buildRelinkedItem(
+                from: item,
+                to: newURL,
+                actualBytes: actualBytes,
+                reloadMediaProperties: false
+            )
+            await MainActor.run {
+                self.commitRelinkedItems(
+                    [updated],
+                    scopeTitle: item.name,
+                    totalTargeted: 1,
+                    relinkedCount: 1,
+                    alreadyOkCount: 0,
+                    unmatchedNames: [],
+                    showSummaryAlert: false
+                )
+            }
+        }
+    }
+
+    private func applyManualSourceReplacement(item: MediaItem, to newURL: URL, actualBytes: Int64?) {
+        Task {
+            let updated = await MediaRelinkService.buildRelinkedItem(
+                from: item,
+                to: newURL,
+                actualBytes: actualBytes,
+                reloadMediaProperties: true
+            )
+            await MainActor.run {
+                self.commitRelinkedItems(
+                    [updated],
+                    scopeTitle: item.name,
+                    totalTargeted: 1,
+                    relinkedCount: 1,
+                    alreadyOkCount: 0,
+                    unmatchedNames: [],
+                    showSummaryAlert: false
+                )
+                DebugLogger.shared.log("Sorgente di '\(item.name)' sostituita con '\(newURL.lastPathComponent)'.", level: .info)
+            }
+        }
+    }
+
+    @MainActor
+    private func commitRelinkedItems(
+        _ updatedItems: [MediaItem],
+        scopeTitle: String,
+        totalTargeted: Int,
+        relinkedCount: Int,
+        alreadyOkCount: Int,
+        unmatchedNames: [String],
+        showSummaryAlert: Bool
+    ) {
+        var appliedItems: [MediaItem] = []
+        for updated in updatedItems {
+            if let idx = mediaItems.firstIndex(where: { $0.id == updated.id }) {
+                mediaItems[idx] = updated
+            }
+            if updated.hasAudio {
+                AudioWaveformCache.shared.loadWaveform(for: updated)
+            }
+            appliedItems.append(updated)
+        }
+
+        if !appliedItems.isEmpty {
+            refreshMediaPoolDisplay()
+            delegate?.didRelinkMediaItems(appliedItems)
+        }
+
+        let unmatchedCount = unmatchedNames.count
+        DebugLogger.shared.log(
+            "Ricollegamento '\(scopeTitle)': \(relinkedCount) ricollegate, \(alreadyOkCount) già collegate, \(unmatchedCount) non trovate (su \(totalTargeted)).",
+            level: unmatchedCount > 0 ? .warning : .info
+        )
+
+        if showSummaryAlert {
+            let alert = NSAlert()
+            alert.alertStyle = relinkedCount > 0 || alreadyOkCount > 0 ? .informational : .warning
+            alert.messageText = relinkedCount > 0
+                ? "Ricollegamento completato (\(scopeTitle))"
+                : (alreadyOkCount > 0 ? "Nessuna clip da spostare (\(scopeTitle))" : "Nessuna corrispondenza trovata (\(scopeTitle))")
+            var lines: [String] = []
+            if relinkedCount > 0 { lines.append("• \(relinkedCount) clip ricollegate (nome + dimensione byte esatta)") }
+            if alreadyOkCount > 0 { lines.append("• \(alreadyOkCount) clip già puntavano al file corretto") }
+            if unmatchedCount > 0 {
+                let preview = unmatchedNames.prefix(5).joined(separator: ", ")
+                let suffix = unmatchedCount > 5 ? " ..." : ""
+                lines.append("• \(unmatchedCount) clip non trovate nella cartella scelta (\(preview)\(suffix))")
+            }
+            alert.informativeText = lines.joined(separator: "\n")
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
     }
 
     private func showNewTimelineDialog() {
@@ -2012,26 +2887,23 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
 
     private func showRenameTimelineDialog(timelineIndex: Int) {
         guard timelineIndex < EditorProject.shared.timelines.count else { return }
-        let currentName = EditorProject.shared.timelines[timelineIndex].name
-        let alert = NSAlert()
-        alert.messageText = "Rinomina Timeline"
-        alert.informativeText = "Nuovo nome per '\(currentName)':"
-        alert.alertStyle = .informational
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
-        input.stringValue = currentName
-        alert.accessoryView = input
-        alert.addButton(withTitle: "Rinomina")
-        alert.addButton(withTitle: "Annulla")
-
-        if alert.runModal() == .alertFirstButtonReturn {
-            let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !name.isEmpty {
-                EditorProject.shared.renameTimeline(index: timelineIndex, newName: name)
-                refreshMediaPoolDisplay()
-                if timelineIndex < EditorProject.shared.timelines.count {
-                    delegate?.didRenameTimeline(EditorProject.shared.timelines[timelineIndex])
-                }
+        delegate?.didActivateSection(.mediaPool)
+        let timeline = EditorProject.shared.timelines[timelineIndex]
+        let commit: (String) -> Void = { [weak self] name in
+            EditorProject.shared.renameTimeline(index: timelineIndex, newName: name)
+            self?.refreshMediaPoolDisplay()
+            if timelineIndex < EditorProject.shared.timelines.count {
+                self?.delegate?.didRenameTimeline(EditorProject.shared.timelines[timelineIndex])
             }
+        }
+
+        if currentViewMode == .grid && timelineGridContainer.isHidden {
+            gridView.beginInlineRename(forItemId: timeline.id, initialText: timeline.name, onCommit: commit)
+        } else if let row = currentListItems.firstIndex(where: {
+            if case .timeline(_, let idx) = $0 { return idx == timelineIndex }
+            return false
+        }) {
+            beginInlineRename(in: contentTableView, row: row, initialText: timeline.name, onCommit: commit)
         }
     }
 
@@ -2110,21 +2982,11 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     }
 
     private func showRenameProjectDialog() {
-        let alert = NSAlert()
-        alert.messageText = "Rinomina Progetto"
-        alert.informativeText = "Inserisci il nome del progetto:"
-        alert.alertStyle = .informational
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
-        input.stringValue = EditorProject.shared.projectName
-        alert.accessoryView = input
-        alert.addButton(withTitle: "Salva")
-        alert.addButton(withTitle: "Annulla")
-
-        if alert.runModal() == .alertFirstButtonReturn {
-            let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !name.isEmpty {
-                EditorProject.shared.projectName = name
-            }
+        delegate?.didActivateSection(.mediaPool)
+        guard let rootRow = folderSidebarRows.firstIndex(where: { if case .projectRoot = $0 { return true }; return false }) else { return }
+        beginInlineRename(in: sidebarTableView, row: rootRow, initialText: EditorProject.shared.projectName) { [weak self] name in
+            EditorProject.shared.projectName = name
+            self?.refreshMediaPoolDisplay()
         }
     }
 
@@ -2582,6 +3444,17 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
         updateTimelineGridInfo()
     }
 
+    public func refreshThumbnailsForLUTChange() {
+        gridView.refreshAllThumbnails()
+        timelineGridView.needsDisplay = true
+    }
+
+    public func scrollToSelectedTimelineClipIfVisible(_ clipId: UUID) {
+        if !timelineGridContainer.isHidden {
+            timelineGridView.scrollToClipIfNeeded(clipId)
+        }
+    }
+
     private func updateTimelineGridInfo() {
         let clips = timelineGridView.currentClips
         var totalSec: Double = 0
@@ -2626,7 +3499,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                     includeRoot = true
                 case .folder(let f, _):
                     folderIds.insert(f.id)
-                case .smart:
+                case .smart, .smartVideoFPS:
                     break
                 }
             }
@@ -2638,13 +3511,23 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             smartTableView.deselectAll(nil)
             isUpdatingSidebarSelection = false
 
+            loadSortStateForCurrentScope()
             updateContentModeVisibility()
             timelineGridView.reloadData()
         } else if tv == smartTableView {
             let row = tv.selectedRow
             let rows = smartSidebarRows
-            guard row >= 0 && row < rows.count, case .smart(let kind) = rows[row] else { return }
-            activeSmartFolder = kind
+            guard row >= 0 && row < rows.count else { return }
+            switch rows[row] {
+            case .smart(let kind):
+                activeSmartFolder = kind
+                activeSmartVideoFPSLabel = nil
+            case .smartVideoFPS(_, let label, _):
+                activeSmartFolder = .video
+                activeSmartVideoFPSLabel = label
+            default:
+                return
+            }
             isProjectRootSelected = false
             selectedFolderIds.removeAll()
             EditorProject.shared.activeFolderId = nil
@@ -2653,6 +3536,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
             sidebarTableView.deselectAll(nil)
             isUpdatingSidebarSelection = false
 
+            loadSortStateForCurrentScope()
             updateContentModeVisibility()
             timelineGridView.reloadData()
         } else if tv == contentTableView {
@@ -2674,16 +3558,26 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
     }
 
     public func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
-        guard tableView == contentTableView, let first = tableView.sortDescriptors.first, let key = first.key else { return }
+        guard !isApplyingSortDescriptors,
+              tableView == contentTableView,
+              let first = tableView.sortDescriptors.first,
+              let key = first.key else { return }
         sortAscending = first.ascending
         switch key {
+        case "name": sortKey = .name
+        case "duration": sortKey = .duration
+        case "resolution": sortKey = .resolution
+        case "fileFormat": sortKey = .fileFormat
+        case "codec": sortKey = .codec
+        case "fps": sortKey = .fps
+        case "usage": sortKey = .usage
         case "title": sortKey = .title
         case "artist": sortKey = .artist
         case "album": sortKey = .album
         case "genre": sortKey = .genre
-        case "duration": sortKey = .duration
-        default: sortKey = .title
+        default: sortKey = (activeSmartFolder == .musicLibrary) ? .title : .name
         }
+        saveSortStateForCurrentScope(key: sortKey, ascending: sortAscending)
         updateContentModeVisibility()
     }
 
@@ -2728,7 +3622,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 case .folder:
                     tableView.setDropRow(row, dropOperation: .on)
                     return hasInternalClips ? .move : (isExternalFiles ? .copy : [])
-                case .smart:
+                case .smart, .smartVideoFPS:
                     return []
                 }
             }
@@ -2779,7 +3673,7 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                         processDroppedURLs(fileURLs, targetFolderId: f.id)
                         return true
                     }
-                case .smart:
+                case .smart, .smartVideoFPS:
                     return false
                 }
             } else if !fileURLs.isEmpty {
@@ -2928,40 +3822,118 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 cell.textField?.font = NSFont.systemFont(ofSize: 11, weight: .medium)
                 cell.textField?.textColor = .labelColor
                 return cell
-            case .smart:
+            case .smart, .smartVideoFPS:
                 return nil
             }
         }
 
         if tableView == smartTableView {
             let rows = smartSidebarRows
-            guard row >= 0 && row < rows.count, case .smart(let kind) = rows[row] else { return nil }
-            let cell = makeSidebarCell(for: tableView, indent: 0)
-            switch kind {
-            case .video:
-                let count = mediaItems.filter { $0.hasVideo }.count
-                cell.imageView?.image = Lucide.image(.film, size: 14, color: .systemIndigo)
-                cell.textField?.stringValue = "Video (\(count))"
-            case .audio:
-                let count = mediaItems.filter { $0.hasAudio && !$0.hasVideo }.count
-                cell.imageView?.image = Lucide.image(.music, size: 14, color: .systemGreen)
-                cell.textField?.stringValue = "Audio (\(count))"
-            case .timelines:
-                let count = EditorProject.shared.timelines.filter { !$0.isSelection }.count
-                cell.imageView?.image = Lucide.image(.clapperboard, size: 14, color: .systemCyan)
-                cell.textField?.stringValue = "Timeline (\(count))"
-            case .selections:
-                let count = EditorProject.shared.timelines.filter { $0.isSelection }.count
-                cell.imageView?.image = Lucide.image(.sparkles, size: 14, color: .systemPurple)
-                cell.textField?.stringValue = "Selezioni (\(count))"
-            case .musicLibrary:
-                let count = MusicLibraryManager.shared.tracks.count
-                cell.imageView?.image = Lucide.image(.volume2, size: 14, color: .systemOrange)
-                cell.textField?.stringValue = "Libreria musicale (\(count))"
+            guard row >= 0 && row < rows.count else { return nil }
+            switch rows[row] {
+            case .smart(let kind):
+                if kind == .video {
+                    let cellId = NSUserInterfaceItemIdentifier("SmartVideoToggleCell")
+                    var cell = tableView.makeView(withIdentifier: cellId, owner: nil) as? NSTableCellView
+                    if cell == nil {
+                        let newCell = NSTableCellView()
+                        newCell.identifier = cellId
+
+                        let imgView = NSImageView()
+                        imgView.translatesAutoresizingMaskIntoConstraints = false
+                        newCell.addSubview(imgView)
+                        newCell.imageView = imgView
+
+                        let tf = NSTextField(labelWithString: "")
+                        tf.translatesAutoresizingMaskIntoConstraints = false
+                        tf.isBordered = false
+                        tf.drawsBackground = false
+                        tf.lineBreakMode = .byTruncatingTail
+                        tf.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+                        tf.setContentHuggingPriority(.required, for: .horizontal)
+                        tf.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                        newCell.addSubview(tf)
+                        newCell.textField = tf
+
+                        let toggleBtn = NSButton()
+                        toggleBtn.translatesAutoresizingMaskIntoConstraints = false
+                        toggleBtn.isBordered = false
+                        toggleBtn.bezelStyle = .regularSquare
+                        toggleBtn.setButtonType(.momentaryChange)
+                        toggleBtn.imagePosition = .imageOnly
+                        toggleBtn.title = ""
+                        toggleBtn.tag = 901
+                        toggleBtn.target = self
+                        toggleBtn.action = #selector(onSmartVideoDisclosureClicked)
+                        newCell.addSubview(toggleBtn)
+
+                        NSLayoutConstraint.activate([
+                            imgView.leadingAnchor.constraint(equalTo: newCell.leadingAnchor, constant: 8),
+                            imgView.centerYAnchor.constraint(equalTo: newCell.centerYAnchor),
+                            imgView.widthAnchor.constraint(equalToConstant: 15),
+                            imgView.heightAnchor.constraint(equalToConstant: 15),
+
+                            tf.leadingAnchor.constraint(equalTo: imgView.trailingAnchor, constant: 6),
+                            tf.centerYAnchor.constraint(equalTo: newCell.centerYAnchor),
+
+                            toggleBtn.leadingAnchor.constraint(equalTo: tf.trailingAnchor, constant: 4),
+                            toggleBtn.trailingAnchor.constraint(lessThanOrEqualTo: newCell.trailingAnchor, constant: -6),
+                            toggleBtn.centerYAnchor.constraint(equalTo: newCell.centerYAnchor),
+                            toggleBtn.widthAnchor.constraint(equalToConstant: 14),
+                            toggleBtn.heightAnchor.constraint(equalToConstant: 16)
+                        ])
+                        cell = newCell
+                    }
+                    let count = mediaItems.filter { $0.hasVideo }.count
+                    if let toggleBtn = cell?.viewWithTag(901) as? NSButton {
+                        let chevIcon: LucideIcon = isSmartVideoExpanded ? .chevronDown : .chevronRight
+                        let chevColor = videoFPSBuckets.isEmpty ? NSColor.tertiaryLabelColor : NSColor(calibratedWhite: 0.72, alpha: 1.0)
+                        toggleBtn.image = Lucide.image(chevIcon, size: 11, color: chevColor)
+                        toggleBtn.toolTip = isSmartVideoExpanded ? "Nascondi sottocartelle FPS" : "Mostra sottocartelle per FPS"
+                    }
+                    cell?.imageView?.image = Lucide.image(.film, size: 14, color: .systemIndigo)
+                    cell?.textField?.stringValue = "Video (\(count))"
+                    cell?.textField?.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+                    cell?.textField?.textColor = NSColor(calibratedWhite: 0.85, alpha: 1.0)
+                    return cell
+                }
+
+                let cell = makeSidebarCell(for: tableView, indent: 2)
+                switch kind {
+                case .video:
+                    break
+                case .audio:
+                    let count = mediaItems.filter { $0.hasAudio && !$0.hasVideo }.count
+                    cell.imageView?.image = Lucide.image(.music, size: 14, color: .systemGreen)
+                    cell.textField?.stringValue = "Audio (\(count))"
+                case .timelines:
+                    let count = EditorProject.shared.timelines.filter { !$0.isSelection }.count
+                    cell.imageView?.image = Lucide.image(.clapperboard, size: 14, color: .systemCyan)
+                    cell.textField?.stringValue = "Timeline (\(count))"
+                case .selections:
+                    let count = EditorProject.shared.timelines.filter { $0.isSelection }.count
+                    cell.imageView?.image = Lucide.image(.sparkles, size: 14, color: .systemPurple)
+                    cell.textField?.stringValue = "Selezioni (\(count))"
+                case .musicLibrary:
+                    let count = MusicLibraryManager.shared.tracks.count
+                    cell.imageView?.image = Lucide.image(.volume2, size: 14, color: .systemOrange)
+                    cell.textField?.stringValue = "Libreria musicale (\(count))"
+                }
+                cell.textField?.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+                cell.textField?.textColor = NSColor(calibratedWhite: 0.85, alpha: 1.0)
+                return cell
+
+            case .smartVideoFPS(_, let label, let count):
+                let cell = makeSidebarCell(for: tableView, indent: 16)
+                cell.imageView?.image = Lucide.image(.film, size: 12, color: NSColor.systemIndigo.withAlphaComponent(0.85))
+                cell.textField?.stringValue = "\(label) fps (\(count))"
+                cell.textField?.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+                cell.textField?.textColor = NSColor(calibratedWhite: 0.78, alpha: 1.0)
+                return cell
+
+            default:
+                return nil
             }
-            cell.textField?.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-            cell.textField?.textColor = .secondaryLabelColor
-            return cell
         }
 
         // Content Table View
@@ -3021,7 +3993,10 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                 }
             case .media(let m):
                 cell?.imageView?.image = Lucide.image(m.hasVideo ? .film : .music, size: 14, color: m.hasVideo ? .systemIndigo : .systemGreen)
-                if m.hasProxy {
+                if !m.isMediaAvailableOnDisk {
+                    cell?.textField?.stringValue = "\(m.name) [Offline]"
+                    cell?.textField?.textColor = .systemRed
+                } else if m.hasProxy {
                     cell?.textField?.stringValue = "\(m.name) [P]"
                     cell?.textField?.textColor = .systemTeal
                 } else {
@@ -3086,30 +4061,68 @@ public final class MediaPoolViewController: NSViewController, NSTableViewDataSou
                     textField?.stringValue = tr.formattedDuration
                     textField?.textColor = .secondaryLabelColor
                 }
-            case "Codec":
+            case "Resolution":
                 switch listItem {
                 case .timeline(let tl, _):
-                    if tl.isSelection {
-                        let count = tl.videoTracks.first?.clips.count ?? 0
-                        textField?.stringValue = "Selezione (\(count) clip • 1V+1A)"
-                    } else {
-                        textField?.stringValue = "Timeline (\(tl.format.name))"
-                    }
+                    textField?.stringValue = tl.isSelection ? "1V+1A" : "\(Int(tl.format.size.width))×\(Int(tl.format.size.height))"
                     textField?.textColor = .secondaryLabelColor
                 case .media(let m):
-                    if m.hasVideo {
-                        textField?.stringValue = "\(m.videoCodec) (\(Int(m.resolution.width))x\(Int(m.resolution.height)))"
-                    } else {
-                        textField?.stringValue = "Audio (\(m.audioTrackCount) ch)"
-                    }
-                    textField?.textColor = .labelColor
+                    textField?.stringValue = (m.hasVideo && m.resolution.width > 0)
+                        ? "\(Int(m.resolution.width))×\(Int(m.resolution.height))"
+                        : "—"
+                    textField?.textColor = m.hasVideo ? .labelColor : .tertiaryLabelColor
+                case .folder, .musicTrack:
+                    textField?.stringValue = ""
+                }
+            case "FileFormat":
+                switch listItem {
+                case .timeline(let tl, _):
+                    textField?.stringValue = tl.isSelection ? "Selezione" : "Timeline"
+                    textField?.textColor = .secondaryLabelColor
+                case .media(let m):
+                    textField?.stringValue = formatExtensionLabel(for: m)
+                    textField?.textColor = .secondaryLabelColor
                 case .folder:
                     textField?.stringValue = "Cartella"
                     textField?.textColor = .secondaryLabelColor
                 case .musicTrack(let tr):
+                    let ext = tr.url.pathExtension.uppercased()
+                    textField?.stringValue = ext.isEmpty ? "AUDIO" : ext
+                    textField?.textColor = .secondaryLabelColor
+                }
+            case "Codec":
+                switch listItem {
+                case .timeline(let tl, _):
+                    textField?.stringValue = tl.format.name
+                    textField?.textColor = .secondaryLabelColor
+                case .media(let m):
+                    textField?.stringValue = m.hasVideo ? m.videoCodec : "Audio (\(m.audioTrackCount) ch)"
+                    textField?.textColor = .labelColor
+                case .folder:
+                    textField?.stringValue = ""
+                case .musicTrack(let tr):
                     let loc = tr.relativeSubfolder.isEmpty ? tr.sourceFolderName : "\(tr.sourceFolderName)/\(tr.relativeSubfolder)"
                     textField?.stringValue = "Libreria • \(loc)"
                     textField?.textColor = .secondaryLabelColor
+                }
+            case "FPS":
+                switch listItem {
+                case .timeline(let tl, _):
+                    textField?.stringValue = tl.isSelection ? "—" : TimelineModel.formatFPSLabel(tl.format.fps)
+                    textField?.textColor = .secondaryLabelColor
+                case .media(let m):
+                    textField?.stringValue = (m.hasVideo && m.frameRate > 0) ? TimelineModel.formatFPSLabel(m.frameRate) : "—"
+                    textField?.textColor = m.hasVideo ? .labelColor : .tertiaryLabelColor
+                case .folder, .musicTrack:
+                    textField?.stringValue = ""
+                }
+            case "Usage":
+                if case .media(let m) = listItem {
+                    let u = usageText(for: m.id)
+                    textField?.stringValue = u.text
+                    textField?.textColor = u.isActive ? .systemCyan : .secondaryLabelColor
+                } else {
+                    textField?.stringValue = ""
                 }
             case "MusicArtist":
                 if case .musicTrack(let tr) = listItem {

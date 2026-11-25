@@ -1457,4 +1457,472 @@ public final class AudioBeatDetector {
         }
         return bestIdx
     }
+
+    // MARK: - Classic Marker Propagation (Modalità Classica da Marcatori M)
+
+    public struct ClassicMarkerPropagationResult: Sendable {
+        public let markers: [Double]
+        public let estimatedBPM: Double
+        public let averageInterval: Double
+        public let userMarkerCount: Int
+        public let beatsPerMarkerStep: Int?
+        public let alignedWithAI: Bool
+        public let peakLockedCount: Int
+    }
+
+    private struct PeakOnsetProfile {
+        let onsetScores: [Double]
+        let peaks: [Float]
+        let binsPerSecond: Double
+        let durationSeconds: Double
+        let globalNoiseFloor: Double
+        let aiBeats: [Double]
+        let aiDownbeats: [Double]
+        let aiStrongPeaks: [StrongPeakCandidate]
+
+        init(waveform: WaveformData?, ai: SavedBeatAnalysis?) {
+            self.aiBeats = ai?.beatSeconds.sorted() ?? []
+            self.aiDownbeats = ai?.downbeatSeconds.sorted() ?? []
+            self.aiStrongPeaks = ai?.strongPeaks.sorted(by: { $0.timeSeconds < $1.timeSeconds }) ?? []
+
+            guard let wf = waveform, !wf.peaks.isEmpty, wf.binsPerSecond > 0 else {
+                self.onsetScores = []
+                self.peaks = []
+                self.binsPerSecond = 200.0
+                self.durationSeconds = ai?.durationSeconds ?? 0.0
+                self.globalNoiseFloor = 0.0
+                return
+            }
+
+            self.peaks = wf.peaks
+            self.binsPerSecond = wf.binsPerSecond
+            self.durationSeconds = wf.durationSeconds
+
+            let n = wf.peaks.count
+            let rms = wf.rms
+            let preWinStart = max(6, Int((0.090 * wf.binsPerSecond).rounded()))
+            let preWinEnd = max(2, Int((0.015 * wf.binsPerSecond).rounded()))
+            let attWin = max(2, Int((0.025 * wf.binsPerSecond).rounded()))
+            let peakJumpLookback = max(4, Int((0.055 * wf.binsPerSecond).rounded()))
+
+            var scores = [Double](repeating: 0.0, count: n)
+            var prefixRms = [Double](repeating: 0.0, count: n + 1)
+            for i in 0..<n {
+                prefixRms[i + 1] = prefixRms[i] + Double(i < rms.count ? rms[i] : wf.peaks[i])
+            }
+
+            var bCursor = 0
+            var dbCursor = 0
+            var spCursor = 0
+
+            for i in 2..<n {
+                let pStart = max(0, i - preWinStart)
+                let pEnd = max(pStart, i - preWinEnd)
+                let preCount = max(1, pEnd - pStart + 1)
+                let preRms = (prefixRms[pEnd + 1] - prefixRms[pStart]) / Double(preCount)
+
+                let aEnd = min(n - 1, i + attWin)
+                let attCount = max(1, aEnd - i + 1)
+                let attRms = (prefixRms[aEnd + 1] - prefixRms[i]) / Double(attCount)
+
+                var prePeak: Float = 0
+                let pkBack0 = max(0, i - peakJumpLookback)
+                let pkBack1 = max(pkBack0, i - 2)
+                for j in pkBack0...pkBack1 where wf.peaks[j] > prePeak {
+                    prePeak = wf.peaks[j]
+                }
+
+                var attPeak: Float = 0
+                let attPkEnd = min(n - 1, i + max(2, attWin / 2))
+                for j in i...attPkEnd where wf.peaks[j] > attPeak {
+                    attPeak = wf.peaks[j]
+                }
+
+                let rmsJump = max(0.0, attRms - preRms)
+                let peakJump = max(0.0, Double(attPeak) - Double(prePeak) * 0.85)
+                let ratio = (Double(attPeak) + 0.6 * attRms) / max(0.025, preRms + 0.015)
+                let loudnessGate = min(1.0, Double(attPeak) * 1.45)
+
+                var baseScore = loudnessGate * (0.58 * peakJump + 0.42 * rmsJump) * min(2.6, 0.55 + 0.45 * ratio)
+
+                // Boost su picchi/downbeat/beat AI nelle vicinanze (±35ms)
+                let t = Double(i) / wf.binsPerSecond
+                while dbCursor < aiDownbeats.count && aiDownbeats[dbCursor] < t - 0.035 { dbCursor += 1 }
+                while bCursor < aiBeats.count && aiBeats[bCursor] < t - 0.035 { bCursor += 1 }
+                while spCursor < aiStrongPeaks.count && aiStrongPeaks[spCursor].timeSeconds < t - 0.035 { spCursor += 1 }
+
+                if dbCursor < aiDownbeats.count && abs(aiDownbeats[dbCursor] - t) <= 0.035 {
+                    baseScore *= 1.35
+                } else if bCursor < aiBeats.count && abs(aiBeats[bCursor] - t) <= 0.030 {
+                    baseScore *= 1.18
+                }
+                if spCursor < aiStrongPeaks.count && abs(aiStrongPeaks[spCursor].timeSeconds - t) <= 0.035 {
+                    baseScore *= (1.0 + 0.50 * aiStrongPeaks[spCursor].strength)
+                }
+
+                scores[i] = baseScore
+            }
+
+            let nonZero = scores.filter { $0 > 0.0001 }.sorted()
+            let p65 = nonZero.isEmpty ? 0.0 : nonZero[min(nonZero.count - 1, Int(Double(nonZero.count) * 0.65))]
+            self.onsetScores = scores
+            self.globalNoiseFloor = max(0.0015, p65 * 0.16)
+        }
+
+        func snapToPeak(near targetTime: Double, searchRadius: Double) -> (time: Double, snapped: Bool) {
+            if !onsetScores.isEmpty, binsPerSecond > 0 {
+                let n = onsetScores.count
+                let lo = max(0, Int(((targetTime - searchRadius) * binsPerSecond).rounded(.down)))
+                let hi = min(n - 1, Int(((targetTime + searchRadius) * binsPerSecond).rounded(.up)))
+                guard hi >= lo else { return (targetTime, false) }
+
+                var windowScores: [Double] = []
+                windowScores.reserveCapacity(hi - lo + 1)
+                for i in lo...hi { windowScores.append(onsetScores[i]) }
+                let sortedWin = windowScores.sorted()
+                let localMedian = sortedWin[sortedWin.count / 3]
+                let minRequired = max(globalNoiseFloor, localMedian * 1.45)
+
+                let sigma = max(0.06, searchRadius * 0.78)
+                var bestIdx = -1
+                var bestWeighted = 0.0
+
+                for i in lo...hi {
+                    let s = onsetScores[i]
+                    guard s >= minRequired else { continue }
+                    let t = Double(i) / binsPerSecond
+                    let dt = t - targetTime
+                    let prox = exp(-0.5 * (dt / sigma) * (dt / sigma))
+                    let w = s * prox
+                    if w > bestWeighted {
+                        bestWeighted = w
+                        bestIdx = i
+                    }
+                }
+
+                if bestIdx >= 0 {
+                    // Affina sul massimo della cresta del transiente entro [-5ms .. +15ms] per allineamento visivo esatto sul picco
+                    let crestLo = max(0, bestIdx - 1)
+                    let crestHi = min(n - 1, bestIdx + max(2, Int((0.015 * binsPerSecond).rounded())))
+                    var peakIdx = bestIdx
+                    var peakVal = peaks[bestIdx]
+                    for j in crestLo...crestHi {
+                        if peaks[j] > peakVal * 1.04 {
+                            peakVal = peaks[j]
+                            peakIdx = j
+                        }
+                    }
+                    let refinedTime = Double(peakIdx) / binsPerSecond
+                    return (refinedTime, true)
+                }
+            }
+
+            // Fallback se la waveform non è ancora disponibile: usa picchi/beat AI vicini
+            var bestAI: Double? = nil
+            var bestScore = 0.0
+            let sigma = max(0.06, searchRadius * 0.75)
+            for cand in aiStrongPeaks where abs(cand.timeSeconds - targetTime) <= searchRadius {
+                let dt = cand.timeSeconds - targetTime
+                let sc = (0.3 + cand.strength) * exp(-0.5 * (dt / sigma) * (dt / sigma))
+                if sc > bestScore {
+                    bestScore = sc
+                    bestAI = cand.timeSeconds
+                }
+            }
+            if let found = bestAI {
+                return (found, true)
+            }
+            for b in aiBeats where abs(b - targetTime) <= min(searchRadius, 0.16) {
+                let dt = b - targetTime
+                let sc = 0.25 * exp(-0.5 * (dt / sigma) * (dt / sigma))
+                if sc > bestScore {
+                    bestScore = sc
+                    bestAI = b
+                }
+            }
+            if let found = bestAI {
+                return (found, true)
+            }
+            return (targetTime, false)
+        }
+    }
+
+    /// Legge 2+ marcatori manuali (`M`) come riferimento di spaziatura, aggancia con precisione ogni battuta ai picchi reali
+    /// della forma d'onda (e opzionalmente ai beat/picchi dell'analisi AI), e propaga avanti e indietro lungo l'intero brano.
+    public func propagateBeatsFromMarkers(
+        manualMarkers: [Double],
+        sourceIn: Double,
+        sourceOut: Double,
+        waveform: WaveformData? = nil,
+        aiAnalysis: SavedBeatAnalysis? = nil
+    ) -> ClassicMarkerPropagationResult? {
+        let sIn = max(0.0, sourceIn)
+        let sOut = max(sIn, sourceOut)
+        guard sOut - sIn >= 0.25 else { return nil }
+
+        // 1. Filtra e deduplica marcatori manuali nella finestra attiva
+        let sortedRaw = manualMarkers
+            .filter { $0 >= sIn - 0.01 && $0 <= sOut + 0.01 }
+            .map { max(sIn, min(sOut, $0)) }
+            .sorted()
+
+        var clean: [Double] = []
+        for m in sortedRaw {
+            if let last = clean.last, m - last < 0.15 { continue }
+            clean.append(m)
+        }
+        guard clean.count >= 2 else { return nil }
+
+        // 2. Costruisci profilo dei picchi reali (forma d'onda 5ms + eventuale AI)
+        let peakProfile = PeakOnsetProfile(waveform: waveform, ai: aiAnalysis)
+
+        // 3. Stima spaziatura grezza iniziale e aggancia i marcatori utente sui picchi reali circostanti
+        let (roughPeriod, _) = estimateUserPeriodAndAnchor(from: clean)
+        guard roughPeriod >= 0.18 else { return nil }
+
+        let userSnapRadius = min(0.28, max(0.14, 0.24 * roughPeriod))
+        var snappedUserMarkers: [Double] = []
+        var initialSnappedCount = 0
+        for m in clean {
+            let res = peakProfile.snapToPeak(near: m, searchRadius: userSnapRadius)
+            let clamped = max(sIn, min(sOut, res.time))
+            if let last = snappedUserMarkers.last, clamped - last < 0.15 { continue }
+            snappedUserMarkers.append(clamped)
+            if res.snapped { initialSnappedCount += 1 }
+        }
+        guard snappedUserMarkers.count >= 2 else { return nil }
+
+        let (refinedPeriod, _) = estimateUserPeriodAndAnchor(from: snappedUserMarkers)
+        guard refinedPeriod >= 0.18 else { return nil }
+
+        // 4. Calibra cadenza nominale (confrontando con BPM/battiti AI se disponibile)
+        var nominalStep = refinedPeriod
+        var beatsPerStep: Int? = nil
+        var alignedWithAI = false
+        var aiBeatPeriod: Double? = nil
+
+        if let ai = aiAnalysis, ai.bpm > 20.0 {
+            let bp = 60.0 / ai.bpm
+            aiBeatPeriod = bp
+            let ratio = refinedPeriod / bp
+            let baseK = max(1, Int(ratio.rounded()))
+            for k in [baseK, max(1, baseK - 1), baseK + 1] {
+                let candidateStep = Double(k) * bp
+                if abs(refinedPeriod - candidateStep) / max(0.18, refinedPeriod) <= 0.14 {
+                    nominalStep = candidateStep
+                    beatsPerStep = k
+                    alignedWithAI = true
+                    break
+                }
+            }
+        }
+
+        // Raggio di ricerca per step: abbastanza ampio per correggere micro-variazioni, stretto abbastanza da non saltare al beat adiacente
+        let baseStepRadius: Double
+        if let bp = aiBeatPeriod, nominalStep >= 1.45 * bp {
+            baseStepRadius = min(0.24, max(0.12, 0.40 * bp))
+        } else {
+            baseStepRadius = min(0.24, max(0.11, 0.20 * nominalStep))
+        }
+
+        var equivBPM = 60.0 / nominalStep
+        while equivBPM < 70.0 { equivBPM *= 2.0 }
+        while equivBPM > 170.0 { equivBPM /= 2.0 }
+        equivBPM = (equivBPM * 10.0).rounded() / 10.0
+        let finalBPM = alignedWithAI ? (((aiAnalysis?.bpm ?? equivBPM) * 10.0).rounded() / 10.0) : equivBPM
+
+        // 5. Propagazione a catena chiusa sui picchi reali
+        var totalPeakLocks = initialSnappedCount
+
+        // 5a. Riempi eventuali intervalli saltati all'interno dei marcatori utente
+        var interiorMarkers: [Double] = [snappedUserMarkers[0]]
+        for idx in 1..<snappedUserMarkers.count {
+            let prev = snappedUserMarkers[idx - 1]
+            let next = snappedUserMarkers[idx]
+            let span = next - prev
+            if span > 1.38 * nominalStep {
+                let subSteps = max(2, Int((span / nominalStep).rounded()))
+                let subStep = span / Double(subSteps)
+                for s in 1..<subSteps {
+                    let pred = prev + Double(s) * subStep
+                    let snap = peakProfile.snapToPeak(near: pred, searchRadius: baseStepRadius)
+                    if snap.snapped { totalPeakLocks += 1 }
+                    interiorMarkers.append(max(sIn, min(sOut, snap.time)))
+                }
+            }
+            interiorMarkers.append(next)
+        }
+
+        // 5b. Propaga INDIETRO dal primo marcatore fino a sourceIn agganciando ogni picco
+        var backwardPrefix: [Double] = []
+        do {
+            var lastConfirmed = interiorMarkers[0]
+            var adaptiveStep = nominalStep
+            var missedStreak = 0
+
+            while true {
+                let pred = lastConfirmed - Double(missedStreak + 1) * adaptiveStep
+                if pred < sIn - 0.12 { break }
+                let clampedPred = max(sIn, pred)
+                let radius = min(0.28, baseStepRadius + Double(min(3, missedStreak)) * 0.025)
+                let snap = peakProfile.snapToPeak(near: clampedPred, searchRadius: radius)
+                let chosen = max(sIn, min(lastConfirmed - 0.16, snap.time))
+
+                if snap.snapped && chosen >= sIn - 0.001 && chosen < lastConfirmed - 0.16 {
+                    if missedStreak == 0 {
+                        let measured = lastConfirmed - chosen
+                        if abs(measured - nominalStep) / nominalStep <= 0.10 {
+                            adaptiveStep = min(nominalStep * 1.07, max(nominalStep * 0.93, 0.80 * adaptiveStep + 0.20 * measured))
+                        }
+                    }
+                    lastConfirmed = chosen
+                    missedStreak = 0
+                    totalPeakLocks += 1
+                    backwardPrefix.append(chosen)
+                } else {
+                    if clampedPred < sIn - 0.001 { break }
+                    missedStreak += 1
+                    backwardPrefix.append(clampedPred)
+                    if clampedPred <= sIn + 0.05 { break }
+                }
+            }
+        }
+
+        // 5c. Propaga AVANTI dall'ultimo marcatore fino a sourceOut agganciando ogni picco
+        var forwardSuffix: [Double] = []
+        do {
+            var lastConfirmed = interiorMarkers[interiorMarkers.count - 1]
+            var adaptiveStep = nominalStep
+            var missedStreak = 0
+
+            while true {
+                let pred = lastConfirmed + Double(missedStreak + 1) * adaptiveStep
+                if pred > sOut + 0.12 { break }
+                let clampedPred = min(sOut, pred)
+                let radius = min(0.28, baseStepRadius + Double(min(3, missedStreak)) * 0.025)
+                let snap = peakProfile.snapToPeak(near: clampedPred, searchRadius: radius)
+                let chosen = min(sOut, max(lastConfirmed + 0.16, snap.time))
+
+                if snap.snapped && chosen <= sOut + 0.001 && chosen > lastConfirmed + 0.16 {
+                    if missedStreak == 0 {
+                        let measured = chosen - lastConfirmed
+                        if abs(measured - nominalStep) / nominalStep <= 0.10 {
+                            adaptiveStep = min(nominalStep * 1.07, max(nominalStep * 0.93, 0.80 * adaptiveStep + 0.20 * measured))
+                        }
+                    }
+                    lastConfirmed = chosen
+                    missedStreak = 0
+                    totalPeakLocks += 1
+                    forwardSuffix.append(chosen)
+                } else {
+                    if clampedPred > sOut + 0.001 { break }
+                    missedStreak += 1
+                    forwardSuffix.append(clampedPred)
+                    if clampedPred >= sOut - 0.05 { break }
+                }
+            }
+        }
+
+        let combined = (backwardPrefix.reversed() + interiorMarkers + forwardSuffix).sorted()
+        var finalMarkers: [Double] = []
+        finalMarkers.reserveCapacity(combined.count)
+        for p in combined {
+            let clamped = max(sIn, min(sOut, p))
+            if let last = finalMarkers.last, clamped - last < 0.15 { continue }
+            finalMarkers.append(clamped)
+        }
+        guard finalMarkers.count >= 2 else { return nil }
+
+        let avgInt: Double
+        if finalMarkers.count >= 2 {
+            avgInt = (finalMarkers.last! - finalMarkers.first!) / Double(finalMarkers.count - 1)
+        } else {
+            avgInt = nominalStep
+        }
+
+        return ClassicMarkerPropagationResult(
+            markers: finalMarkers,
+            estimatedBPM: finalBPM,
+            averageInterval: avgInt,
+            userMarkerCount: clean.count,
+            beatsPerMarkerStep: beatsPerStep,
+            alignedWithAI: alignedWithAI,
+            peakLockedCount: totalPeakLocks
+        )
+    }
+
+    private func estimateUserPeriodAndAnchor(from markers: [Double]) -> (period: Double, anchor: Double) {
+        if markers.count == 2 {
+            return (markers[1] - markers[0], markers[0])
+        }
+
+        var diffs: [Double] = []
+        diffs.reserveCapacity(markers.count - 1)
+        for i in 0..<(markers.count - 1) {
+            diffs.append(markers[i + 1] - markers[i])
+        }
+        let sortedDiffs = diffs.sorted()
+        let medianDiff = sortedDiffs[sortedDiffs.count / 2]
+
+        // Trova l'unità base (gestisce anche intervalli doppi/tripli se l'editor ha saltato una battuta)
+        var unit0 = medianDiff
+        let maxRatioDiff = (sortedDiffs.last ?? medianDiff) / max(0.18, sortedDiffs.first ?? medianDiff)
+        if maxRatioDiff > 1.38 {
+            var candidates = diffs.filter { $0 >= 0.22 }
+            candidates.append(medianDiff)
+            var bestScore = Double.greatestFiniteMagnitude
+            for cand in candidates {
+                var score = 0.0
+                for d in diffs {
+                    let ratio = d / cand
+                    let k = max(1.0, min(4.0, ratio.rounded()))
+                    score += abs(ratio - k) + 0.04 * (k - 1.0)
+                }
+                if score < bestScore {
+                    bestScore = score
+                    unit0 = cand
+                }
+            }
+        }
+
+        func linearFit(_ points: [(k: Double, m: Double)]) -> (period: Double, anchor: Double)? {
+            guard points.count >= 2 else { return nil }
+            let n = Double(points.count)
+            let meanK = points.reduce(0.0) { $0 + $1.k } / n
+            let meanM = points.reduce(0.0) { $0 + $1.m } / n
+            var num = 0.0
+            var den = 0.0
+            for pt in points {
+                let dk = pt.k - meanK
+                num += dk * (pt.m - meanM)
+                den += dk * dk
+            }
+            guard den > 0.5 else { return nil }
+            let p = num / den
+            let a = meanM - p * meanK
+            return (p, a)
+        }
+
+        let origin = markers[0]
+        let pass1Points: [(k: Double, m: Double)] = markers.map {
+            (Double(((($0 - origin) / unit0)).rounded()), $0)
+        }
+        guard let fit1 = linearFit(pass1Points), fit1.period >= 0.18 else {
+            return (unit0, origin)
+        }
+
+        let tol = max(0.18, 0.30 * fit1.period)
+        var inliers: [(k: Double, m: Double)] = []
+        for m in markers {
+            let k = ((m - fit1.anchor) / fit1.period).rounded()
+            let residual = abs(m - (fit1.anchor + k * fit1.period))
+            if residual <= tol {
+                inliers.append((k, m))
+            }
+        }
+        if let fit2 = linearFit(inliers), fit2.period >= 0.18 {
+            return fit2
+        }
+        return fit1
+    }
 }

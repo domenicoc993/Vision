@@ -123,12 +123,19 @@ public enum KeyboardShortcutCatalog {
             modifiers: [.command]
         ),
         KeyboardShortcutBinding(
-            id: "ctrl_f",
+            id: "cmd_f",
             section: "GENERALE",
-            keysLabel: "⌃ F",
+            keysLabel: "⌘ F",
             description: "Schermo intero Viewer",
             primaryKeyIds: ["key-f"],
-            modifiers: [.control]
+            modifiers: [.command]
+        ),
+        KeyboardShortcutBinding(
+            id: "z_fit",
+            section: "GENERALE",
+            keysLabel: "Z",
+            description: "Riporta zoom Viewer su 'Adatta'",
+            primaryKeyIds: ["key-z"]
         ),
         KeyboardShortcutBinding(
             id: "cmd_a",
@@ -445,6 +452,22 @@ public enum KeyboardShortcutCatalog {
             description: "Scambia clip con la gabbia successiva",
             primaryKeyIds: ["key-arrow-right"],
             modifiers: [.command]
+        ),
+        KeyboardShortcutBinding(
+            id: "cmd_shift_left_select",
+            section: "GABBIE RITMATE",
+            keysLabel: "⇧ ⌘ ←",
+            description: "Seleziona clip precedente",
+            primaryKeyIds: ["key-arrow-left"],
+            modifiers: [.command, .shift]
+        ),
+        KeyboardShortcutBinding(
+            id: "cmd_shift_right_select",
+            section: "GABBIE RITMATE",
+            keysLabel: "⇧ ⌘ →",
+            description: "Seleziona clip successiva",
+            primaryKeyIds: ["key-arrow-right"],
+            modifiers: [.command, .shift]
         )
     ]
 

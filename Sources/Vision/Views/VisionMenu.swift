@@ -404,23 +404,31 @@ public final class VisionMenu: NSObject {
         container.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(stack)
 
+        let widthConstraint = container.widthAnchor.constraint(equalToConstant: measuredWidth)
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 6),
             stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -6),
             stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            container.widthAnchor.constraint(equalToConstant: measuredWidth)
+            widthConstraint
         ])
 
         container.layoutSubtreeIfNeeded()
-        let contentHeight = min(460, max(36, container.fittingSize.height))
+        let totalHeight = max(36, container.fittingSize.height)
+        let contentHeight = min(460, totalHeight)
+
+        widthConstraint.isActive = false
+        container.translatesAutoresizingMaskIntoConstraints = true
+        container.autoresizingMask = [.width]
+        container.frame = NSRect(x: 0, y: 0, width: measuredWidth, height: totalHeight)
 
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: measuredWidth, height: contentHeight))
         scroll.drawsBackground = false
-        scroll.hasVerticalScroller = container.fittingSize.height > 460
+        scroll.hasVerticalScroller = totalHeight > 460
         scroll.hasHorizontalScroller = false
         scroll.autohidesScrollers = true
         scroll.documentView = container
+        scroll.contentView.scroll(to: .zero)
         scroll.wantsLayer = true
         scroll.layer?.cornerRadius = 10
         scroll.layer?.masksToBounds = true
@@ -596,7 +604,7 @@ public final class VisionMenu: NSObject {
                 return event
             }
             if let owningMenu = self.menuOwning(event.window) {
-                if NSApp.modalWindow != nil,
+                if (NSApp.modalWindow != nil || owningMenu.panel?.parent?.isSheet == true),
                    event.type == .leftMouseDown,
                    let rowView = owningMenu.hitRowView(atWindowPoint: event.locationInWindow) {
                     rowView.mouseDown(with: event)
@@ -677,20 +685,20 @@ public final class VisionDropdownButton: NSView {
         setupUI()
     }
 
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    public override func hitTest(_ point: NSPoint) -> NSView? {
+        guard isEnabled, !isHidden, alphaValue > 0.01 else { return nil }
+        let local = convert(point, from: superview)
+        return bounds.contains(local) ? bgButton : nil
+    }
+
     private func setupUI() {
         wantsLayer = true
         layer?.cornerRadius = 7
         layer?.borderWidth = 1
         layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
         layer?.backgroundColor = NSColor(calibratedWhite: 0.145, alpha: 1.0).cgColor
-
-        bgButton.title = ""
-        bgButton.isBordered = false
-        bgButton.bezelStyle = .regularSquare
-        bgButton.target = self
-        bgButton.action = #selector(onClicked)
-        bgButton.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(bgButton)
 
         leadingIconView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(leadingIconView)
@@ -705,6 +713,15 @@ public final class VisionDropdownButton: NSView {
         chevronView.image = Lucide.image(.chevronDown, size: 13, color: NSColor(calibratedWhite: 0.68, alpha: 1.0))
         chevronView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(chevronView)
+
+        bgButton.title = ""
+        bgButton.isBordered = false
+        bgButton.setButtonType(.momentaryChange)
+        bgButton.bezelStyle = .regularSquare
+        bgButton.target = self
+        bgButton.action = #selector(onClicked)
+        bgButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(bgButton)
 
         let lw = leadingIconView.widthAnchor.constraint(equalToConstant: 0)
         leadingIconWidthConstraint = lw

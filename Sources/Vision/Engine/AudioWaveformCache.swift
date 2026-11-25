@@ -74,10 +74,35 @@ public final class AudioWaveformCache {
 
     public init() {}
 
+    public func invalidate(url: URL) {
+        lock.lock()
+        cache.removeValue(forKey: url)
+        inProgress.remove(url)
+        lock.unlock()
+    }
+
     public func waveformData(for url: URL) -> WaveformData? {
         lock.lock()
         defer { lock.unlock() }
         return cache[url]
+    }
+
+    /// Restituisce la forma d'onda già in cache oppure la estrae in modo sincrono (per snap preciso ai picchi).
+    public func ensureWaveformDataSync(for url: URL) -> WaveformData? {
+        if let cached = waveformData(for: url) {
+            return cached
+        }
+        guard let extracted = extractWaveform(from: url, binsPerSecond: Self.defaultBinsPerSecond),
+              !extracted.peaks.isEmpty else {
+            return nil
+        }
+        lock.lock()
+        cache[url] = extracted
+        lock.unlock()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .waveformReadyNotification, object: url)
+        }
+        return extracted
     }
 
     public func waveform(for url: URL) -> [Float]? {

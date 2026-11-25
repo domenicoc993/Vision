@@ -1,6 +1,149 @@
 import AppKit
 import CoreMedia
 
+/// Reusable inline rename text field overlay shared by Media Pool table rows and grid cards.
+@MainActor
+public final class InlineRenameSession: NSObject, NSTextFieldDelegate {
+    private static var activeSession: InlineRenameSession?
+    private weak var textField: NSTextField?
+    private weak var maskedView: NSView?
+    private var outsideClickMonitor: Any?
+    private let initialText: String
+    private let onCommit: (String) -> Void
+    private var finished = false
+    private var isArmed = false
+
+    public static func begin(
+        in hostView: NSView,
+        frame: NSRect,
+        font: NSFont,
+        initialText: String,
+        maskedView: NSView? = nil,
+        onCommit: @escaping (String) -> Void
+    ) {
+        activeSession?.cancel()
+
+        let tf = NSTextField(frame: frame)
+        tf.stringValue = initialText
+        tf.font = font
+        tf.textColor = .white
+        tf.backgroundColor = NSColor(calibratedWhite: 0.10, alpha: 1.0)
+        tf.drawsBackground = true
+        tf.isEditable = true
+        tf.isSelectable = true
+        tf.isEnabled = true
+        tf.isBordered = false
+        tf.isBezeled = false
+        tf.focusRingType = .none
+        tf.wantsLayer = true
+        tf.layer?.cornerRadius = 4
+        tf.layer?.borderWidth = 1.5
+        tf.layer?.borderColor = NSColor.systemCyan.cgColor
+        tf.lineBreakMode = .byTruncatingTail
+        tf.usesSingleLineMode = true
+
+        let session = InlineRenameSession(
+            textField: tf,
+            maskedView: maskedView,
+            initialText: initialText,
+            onCommit: onCommit
+        )
+        activeSession = session
+        tf.delegate = session
+        maskedView?.isHidden = true
+        hostView.addSubview(tf, positioned: .above, relativeTo: nil)
+
+        // Defer firstResponder & text selection until after context-menu dismissal finishes unwinding
+        DispatchQueue.main.async { [weak session, weak hostView, weak tf] in
+            guard let session = session, !session.finished,
+                  let hostView = hostView, let tf = tf,
+                  let window = hostView.window else {
+                session?.cancel()
+                return
+            }
+            window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(tf)
+            tf.selectText(nil)
+            if let editor = tf.currentEditor() as? NSTextView {
+                editor.selectedRange = NSRange(location: 0, length: (tf.stringValue as NSString).length)
+            }
+            session.isArmed = true
+            session.outsideClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak session, weak tf] event in
+                guard let session = session, session.isArmed, !session.finished, let tf = tf else { return event }
+                if event.window !== tf.window {
+                    session.commit()
+                    return event
+                }
+                let pt = tf.convert(event.locationInWindow, from: nil)
+                if !tf.bounds.contains(pt) {
+                    session.commit()
+                }
+                return event
+            }
+        }
+    }
+
+    private init(
+        textField: NSTextField,
+        maskedView: NSView?,
+        initialText: String,
+        onCommit: @escaping (String) -> Void
+    ) {
+        self.textField = textField
+        self.maskedView = maskedView
+        self.initialText = initialText
+        self.onCommit = onCommit
+        super.init()
+    }
+
+    public func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) ||
+           commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)) {
+            commit()
+            return true
+        }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            cancel()
+            return true
+        }
+        return false
+    }
+
+    public func controlTextDidEndEditing(_ obj: Notification) {
+        guard isArmed else { return }
+        commit()
+    }
+
+    private func commit() {
+        guard !finished else { return }
+        finished = true
+        let trimmed = textField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        cleanup()
+        if !trimmed.isEmpty && trimmed != initialText {
+            onCommit(trimmed)
+        }
+    }
+
+    public func cancel() {
+        guard !finished else { return }
+        finished = true
+        cleanup()
+    }
+
+    private func cleanup() {
+        if let monitor = outsideClickMonitor {
+            NSEvent.removeMonitor(monitor)
+            outsideClickMonitor = nil
+        }
+        if InlineRenameSession.activeSession === self {
+            InlineRenameSession.activeSession = nil
+        }
+        maskedView?.isHidden = false
+        textField?.delegate = nil
+        textField?.removeFromSuperview()
+    }
+}
+
 public enum GridCardItem: Equatable {
     case timeline(TimelineModel, index: Int)
     case folder(MediaFolder)
@@ -67,7 +210,11 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
     public var onDeleteTimeline: ((Int) -> Void)?
     public var onOpenFolder: ((MediaFolder) -> Void)?
     public var onRenameFolder: ((MediaFolder) -> Void)?
+    public var onRelinkFolder: ((MediaFolder) -> Void)?
     public var onDeleteFolder: ((MediaFolder) -> Void)?
+    public var onRenameMedia: ((MediaItem) -> Void)?
+    public var onRelinkMedia: (([MediaItem]) -> Void)?
+    public var onReplaceMediaSource: ((MediaItem) -> Void)?
     public var onDropItemsIntoFolder: (([UUID], UUID) -> Void)?
     public var onDropURLsIntoFolder: (([URL], UUID) -> Void)?
 
@@ -237,11 +384,15 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
             proxyBadgeBg.isHidden = true
 
         case .media(let m):
-            titleLabel.stringValue = m.name
-            titleLabel.textColor = .labelColor
+            let isAvailable = m.isMediaAvailableOnDisk
+            titleLabel.stringValue = isAvailable ? m.name : "[Offline] \(m.name)"
+            titleLabel.textColor = isAvailable ? .labelColor : .systemRed
             durBadgeLabel.stringValue = m.formattedDuration
             seqBadgeLabel.stringValue = "#\(sequenceNumber)"
             proxyBadgeBg.isHidden = !m.hasProxy
+            if !isAvailable {
+                self.toolTip = "File non trovato: \(m.url.path)\nTasto destro > Ricollega clip..."
+            }
 
             if m.hasVideo {
                 let cached = ThumbnailCache.shared.thumbnail(
@@ -281,6 +432,33 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
                 imageView.image = Lucide.image(.music, size: 34, color: .systemOrange)
             }
         }
+    }
+
+    public func refreshMediaThumbnail() {
+        if case .media(let m) = gridItem, m.hasVideo {
+            if let thumb = ThumbnailCache.shared.thumbnail(
+                for: m.effectiveURL,
+                durationSeconds: CMTimeGetSeconds(m.duration),
+                fallbackImage: m.thumbnail
+            ) {
+                imageView.image = thumb
+            }
+        }
+    }
+
+    public func beginInlineTitleRename(initialText: String, onCommit: @escaping (String) -> Void) {
+        layoutSubtreeIfNeeded()
+        var rect = titleLabel.frame.insetBy(dx: -3, dy: -2)
+        rect.size.height = max(rect.height, 20)
+        rect = rect.intersection(bounds.insetBy(dx: 2, dy: 1))
+        InlineRenameSession.begin(
+            in: self,
+            frame: rect,
+            font: titleLabel.font ?? NSFont.systemFont(ofSize: 10, weight: .medium),
+            initialText: initialText,
+            maskedView: titleLabel,
+            onCommit: onCommit
+        )
     }
 
     public func refreshThumbnailIfMatches(urlPath: String) {
@@ -528,6 +706,9 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
             items.append(.action(title: "Rinomina cartella...", icon: .pencil) { [weak self] in
                 self?.onRenameFolder?(f)
             })
+            items.append(.action(title: "Ricollega clip...", icon: .link, iconColor: .systemCyan) { [weak self] in
+                self?.onRelinkFolder?(f)
+            })
             items.append(.separator)
             if multiCount > 1 {
                 items.append(.action(title: "Elimina \(multiCount) elementi dal Media Pool...", icon: .trash, isDestructive: true) { [weak self] in
@@ -555,6 +736,27 @@ public final class MediaThumbnailCardView: NSView, NSDraggingSource {
                     }
                 }
                 items.append(.submenu(title: "Orientamento clip", icon: .rotateCw, items: orientChildren))
+            }
+
+            if targetItems.count == 1 && multiCount <= 1 {
+                items.append(.action(title: "Rinomina...", icon: .pencil) { [weak self] in
+                    self?.onRenameMedia?(item)
+                })
+            }
+
+            if multiCount <= 1 || targetItems.count >= 1 {
+                items.append(.action(
+                    title: targetItems.count > 1 ? "Ricollega \(targetItems.count) clip..." : "Ricollega clip...",
+                    icon: .link,
+                    iconColor: .systemCyan
+                ) { [weak self] in
+                    self?.onRelinkMedia?(targetItems)
+                })
+                if targetItems.count == 1 {
+                    items.append(.action(title: "Sostituisci sorgente...", icon: .arrowLeftRight) { [weak self] in
+                        self?.onReplaceMediaSource?(item)
+                    })
+                }
             }
 
             if !EditorProject.shared.folders.isEmpty || EditorProject.shared.activeFolderId != nil {
@@ -677,7 +879,11 @@ public final class MediaThumbnailGridView: NSView {
     public var onDeleteTimeline: ((Int) -> Void)?
     public var onOpenFolder: ((MediaFolder) -> Void)?
     public var onRenameFolder: ((MediaFolder) -> Void)?
+    public var onRelinkFolder: ((MediaFolder) -> Void)?
     public var onDeleteFolder: ((MediaFolder) -> Void)?
+    public var onRenameMedia: ((MediaItem) -> Void)?
+    public var onRelinkMedia: (([MediaItem]) -> Void)?
+    public var onReplaceMediaSource: ((MediaItem) -> Void)?
     public var onDropItemsIntoFolder: (([UUID], UUID) -> Void)?
     public var onDropURLsIntoFolder: (([URL], UUID) -> Void)?
 
@@ -982,8 +1188,20 @@ public final class MediaThumbnailGridView: NSView {
             card.onRenameFolder = { [weak self] f in
                 self?.onRenameFolder?(f)
             }
+            card.onRelinkFolder = { [weak self] f in
+                self?.onRelinkFolder?(f)
+            }
             card.onDeleteFolder = { [weak self] f in
                 self?.onDeleteFolder?(f)
+            }
+            card.onRenameMedia = { [weak self] m in
+                self?.onRenameMedia?(m)
+            }
+            card.onRelinkMedia = { [weak self] items in
+                self?.onRelinkMedia?(items)
+            }
+            card.onReplaceMediaSource = { [weak self] m in
+                self?.onReplaceMediaSource?(m)
             }
             card.onDropItemsIntoFolder = { [weak self] ids, fId in
                 self?.onDropItemsIntoFolder?(ids, fId)
@@ -1004,6 +1222,18 @@ public final class MediaThumbnailGridView: NSView {
         for card in cardViews {
             card.isSelected = selectedItemIds.contains(card.gridItem.id)
         }
+    }
+
+    public func refreshAllThumbnails() {
+        for card in cardViews {
+            card.refreshMediaThumbnail()
+        }
+    }
+
+    public func beginInlineRename(forItemId id: UUID, initialText: String, onCommit: @escaping (String) -> Void) {
+        guard let card = cardViews.first(where: { $0.gridItem.id == id }) else { return }
+        scrollToVisible(card.frame)
+        card.beginInlineTitleRename(initialText: initialText, onCommit: onCommit)
     }
 
     private func layoutCards() {

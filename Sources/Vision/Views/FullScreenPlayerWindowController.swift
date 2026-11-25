@@ -5,13 +5,14 @@ import AVFoundation
 public final class FullScreenPlayerWindowController: NSWindowController {
     private let playbackController: PlaybackController
     private let playerView = AVPlayerView()
+    private let freezeFrameOverlay = NSView()
 
     private let playPauseButton = IconActionButton(toolTip: "Play / Pausa (Spazio)", isToggleMode: false)
     private let stopButton = IconActionButton(toolTip: "Stop (Torna all'inizio)", isToggleMode: false)
     private let lutButton = IconActionButton(toolTip: "LUT (ON/OFF)")
     private let muteButton = IconActionButton(toolTip: "Audio / Muto")
-    private let exitButton = IconActionButton(toolTip: "Esci da Schermo Intero (Esc / ⌃F)", isToggleMode: false)
-    private let timeSlider = NSSlider()
+    private let exitButton = IconActionButton(toolTip: "Esci da Schermo Intero (Esc / ⌘F)", isToggleMode: false)
+    private let timeSlider = VisionSlider()
     private let timecodeLabel = NSTextField(labelWithString: "00:00:00:00")
     private let durationLabel = NSTextField(labelWithString: "00:00:00:00")
     private let floatingBar = NSView()
@@ -58,6 +59,14 @@ public final class FullScreenPlayerWindowController: NSWindowController {
         }
         contentView.addSubview(playerView)
 
+        freezeFrameOverlay.translatesAutoresizingMaskIntoConstraints = false
+        freezeFrameOverlay.wantsLayer = true
+        freezeFrameOverlay.layer?.backgroundColor = NSColor.black.cgColor
+        freezeFrameOverlay.layer?.contentsGravity = .resizeAspect
+        freezeFrameOverlay.layer?.masksToBounds = true
+        freezeFrameOverlay.isHidden = true
+        contentView.addSubview(freezeFrameOverlay)
+
         // 2. Floating Bottom Transport Bar
         floatingBar.translatesAutoresizingMaskIntoConstraints = false
         floatingBar.wantsLayer = true
@@ -74,6 +83,11 @@ public final class FullScreenPlayerWindowController: NSWindowController {
             playerView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             playerView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             playerView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+
+            freezeFrameOverlay.topAnchor.constraint(equalTo: contentView.topAnchor),
+            freezeFrameOverlay.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            freezeFrameOverlay.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            freezeFrameOverlay.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
 
             floatingBar.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
             floatingBar.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -32),
@@ -184,6 +198,20 @@ public final class FullScreenPlayerWindowController: NSWindowController {
             self?.playPauseButton.image = Lucide.template(icon, size: 18)
         }
 
+        playbackController.addWillReplaceItemObserver(self) { [weak self] cgImage in
+            guard let self = self else { return }
+            if let cg = cgImage {
+                self.freezeFrameOverlay.layer?.contents = cg
+                self.freezeFrameOverlay.isHidden = false
+            } else {
+                self.freezeFrameOverlay.isHidden = false
+            }
+        }
+        playbackController.addReadyFrameObserver(self) { [weak self] in
+            self?.freezeFrameOverlay.isHidden = true
+            self?.freezeFrameOverlay.layer?.contents = nil
+        }
+
         updateLUTFilter()
         NotificationCenter.default.addObserver(
             forName: LUTEngine.stateChangedNotification,
@@ -217,16 +245,20 @@ public final class FullScreenPlayerWindowController: NSWindowController {
         // Handle escape / spacebar in fullscreen
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self = self, self.window?.isKeyWindow == true else { return event }
+            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if mods.contains([.control, .command]) {
+                return event
+            }
 
-            if event.keyCode == 53 { // ESC
+            if event.keyCode == 53 && mods.isEmpty { // ESC
                 self.closeFullScreen()
                 return nil
             }
-            if event.keyCode == 49 { // Spacebar
+            if event.keyCode == 49 && !mods.contains(.command) && !mods.contains(.control) && !mods.contains(.option) { // Spacebar
                 self.playbackController.togglePlayPause()
                 return nil
             }
-            if event.modifierFlags.contains(.control) && event.keyCode == 3 { // Control + F
+            if mods.contains(.command) && !mods.contains(.control) && !mods.contains(.option) && !mods.contains(.shift) && event.keyCode == 3 { // Cmd + F
                 self.closeFullScreen()
                 return nil
             }

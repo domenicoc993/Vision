@@ -19,8 +19,13 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
     public var onCanvasWidthChanged: (() -> Void)?
     public var onExportTimelineRequested: (() -> Void)?
     public var onOpenBeatFinderForClip: ((TimelineClip) -> Void)?
-    public var onLiveSlipPreview: (() -> Void)?
+    public var onSlipDualPreviewUpdate: ((_ url: URL, _ inSeconds: Double, _ outSeconds: Double, _ fps: Double, _ clipName: String) -> Void)?
+    public var onSlipDualPreviewEnd: (() -> Void)?
+    public var onUserPlayheadScrubbed: (() -> Void)?
+    public var onShowWarningToast: ((String) -> Void)?
     public var onImportDroppedURLsToTimeline: ((_ urls: [URL], _ atTime: CMTime, _ targetTrackIndex: Int, _ isTargetVideo: Bool) -> Void)?
+    public var onClipDoubleClicked: ((TimelineClip) -> Void)?
+    public var onRelinkMediaItemRequested: ((MediaItem) -> Void)?
 
     public let headerWidth: CGFloat = 104
     public let rulerHeight: CGFloat = 26
@@ -29,7 +34,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
     public let minVideoRowHeight: CGFloat = 23
     public let maxVideoRowHeight: CGFloat = 92
     public let minAudioRowHeight: CGFloat = 20
-    public let maxAudioRowHeight: CGFloat = 80
+    public let maxAudioRowHeight: CGFloat = 120
 
     private struct TrackResizeTarget: Equatable {
         let trackId: Int
@@ -38,6 +43,12 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
     private var resizingTrack: TrackResizeTarget? = nil
     private var trackResizeInitialScreenY: CGFloat = 0
     private var trackResizeInitialHeight: CGFloat = 0
+
+    // Movable Center Divider between Video & Audio (nil = exact 50% viewport center)
+    private var customSeparatorOffsetY: CGFloat? = nil
+    private var isDraggingCenterDivider = false
+    private var centerDividerInitialScreenY: CGFloat = 0
+    private var centerDividerInitialOffsetY: CGFloat = 0
 
     // Internal Clip Dragging state
     private struct DraggedClipInitialState {
@@ -99,9 +110,11 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
     private var activeTrimClipId: UUID? = nil
     private var activeTrimIsStart: Bool = false
     private var activeTrimIsVideo: Bool = true
+    private var trimStartAnchorX: CGFloat = 0
+    private var trimInitialEdgeTimeSec: Double = 0
 
     // Interactive Marker & Bar Drag/Delete state
-    private struct MarkerTarget: Equatable {
+    fileprivate struct MarkerTarget: Equatable {
         enum Kind: Equatable {
             case clipManual(clipId: UUID, isVideo: Bool, sourceSec: Double)
             case clipBeat(clipId: UUID, sourceSec: Double)
@@ -122,8 +135,10 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
     private var cageReorderTargetBlocked: Bool = false
 
     private var isFloatingSlipActive: Bool = false
+    private var isSlipDragging: Bool = false
     private var slipClipId: UUID? = nil
     private var slipInitialSourceIn: Double = 0.0
+    private var slipDragAnchorSourceIn: Double = 0.0
     private var slipCurrentSourceIn: Double = 0.0
     private var slipSourceDur: Double = 0.0
     private var slipBoundsMin: Double = 0.0
@@ -132,6 +147,8 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
     private var slipDragInitialX: CGFloat = 0.0
     private var slipClipTimelineStartSec: Double = 0.0
     private var slipClipFrame: CGRect = .zero
+    private var slipLastHudRect: CGRect = .zero
+    private var slipIsExtract: Bool = false
     private var lastLiveSlipPreviewTime: CFAbsoluteTime = 0.0
 
     public var widthConstraint: NSLayoutConstraint?
@@ -141,9 +158,12 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
     private let playheadHandleLayer = CALayer()
 
     public override var isFlipped: Bool { true }
+    public override var acceptsFirstResponder: Bool { true }
     public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     private static let cachedLockBadgeImage: NSImage = Lucide.image(.lock, size: 9, color: .black)
+    private static let cachedCheckBadgeImage: NSImage = Lucide.image(.check, size: 9, color: .black)
+    private static let cachedSnailBadgeImage: NSImage = Lucide.image(.snail, size: 10, color: .black)
 
     public init(model: TimelineModel, playbackController: PlaybackController) {
         self.model = model
@@ -165,6 +185,17 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             name: NSApplication.didResignActiveNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(onModelSelectionChanged(_:)),
+            name: TimelineModel.selectionChangedNotification,
+            object: nil
+        )
+    }
+
+    @objc private func onModelSelectionChanged(_ notification: Notification) {
+        guard (notification.object as AnyObject?) === self.model else { return }
+        needsDisplay = true
     }
 
     required init?(coder: NSCoder) {
@@ -193,20 +224,158 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
 
     public func handleTabKeyStateChanged(isDown: Bool) {
         isTabKeyHeld = isDown
-        if !isDown && isFloatingSlipActive {
+        if isDown {
+            if !isFloatingSlipActive, let target = resolveSlipTargetClipAndFrame() {
+                beginFloatingSlip(
+                    for: target.clip,
+                    displayStart: target.displayStart,
+                    clipFrame: target.frame,
+                    startDragging: false,
+                    dragX: target.frame.midX
+                )
+            }
+        } else if isFloatingSlipActive {
             finishFloatingSlipIfActive()
         }
+    }
+
+    private func slipHUDWidth() -> CGFloat {
+        let totalRange = max(0.05, slipBoundsMax - slipBoundsMin)
+        return max(190.0, min(460.0, max(slipClipFrame.width + 60.0, 160.0 + CGFloat(totalRange) * 7.0)))
+    }
+
+    private func resolveSlipTargetClipAndFrame() -> (clip: TimelineClip, displayStart: CMTime, frame: CGRect)? {
+        let sepY = separatorY
+        let phSec = CMTimeGetSeconds(playbackController.currentTime)
+
+        func frameFor(_ dStart: CMTime, _ clip: TimelineClip, _ trackY: CGFloat, _ trackH: CGFloat) -> CGRect {
+            let clipX = headerWidth + CGFloat(CMTimeGetSeconds(dStart) * pixelsPerSecond)
+            let clipW = max(4.0, CGFloat(CMTimeGetSeconds(clip.duration) * pixelsPerSecond))
+            return CGRect(x: clipX, y: trackY + 2, width: clipW, height: trackH - 4)
+        }
+
+        // 1. Priorità a clip selezionata (prima video, poi audio)
+        if !model.selectedClipIds.isEmpty {
+            for track in model.videoTracks where !track.isLocked {
+                let trackH = heightForVideoTrack(track.id)
+                let trackY = yForVideoTrack(track.id, sepY: sepY)
+                for (clip, dStart) in model.displayedClips(isVideo: true, trackIndex: track.id)
+                where model.selectedClipIds.contains(clip.id) && !clip.isEffectivelyLocked {
+                    return (clip, dStart, frameFor(dStart, clip, trackY, trackH))
+                }
+            }
+            for track in model.audioTracks where !track.isLocked {
+                let trackH = heightForAudioTrack(track.id)
+                let trackY = yForAudioTrack(track.id, sepY: sepY)
+                for (clip, dStart) in model.displayedClips(isVideo: false, trackIndex: track.id)
+                where model.selectedClipIds.contains(clip.id) && !clip.isEffectivelyLocked {
+                    return (clip, dStart, frameFor(dStart, clip, trackY, trackH))
+                }
+            }
+        }
+
+        // 2. Fallback alla clip sotto la testina (dalla traccia video superiore verso il basso)
+        for track in model.videoTracks.reversed() where !track.isLocked {
+            let trackH = heightForVideoTrack(track.id)
+            let trackY = yForVideoTrack(track.id, sepY: sepY)
+            for (clip, dStart) in model.displayedClips(isVideo: true, trackIndex: track.id) where !clip.isEffectivelyLocked {
+                let s = CMTimeGetSeconds(dStart)
+                let e = s + CMTimeGetSeconds(clip.duration)
+                if phSec >= s - 0.005 && phSec <= e + 0.005 {
+                    return (clip, dStart, frameFor(dStart, clip, trackY, trackH))
+                }
+            }
+        }
+        for track in model.audioTracks where !track.isLocked {
+            let trackH = heightForAudioTrack(track.id)
+            let trackY = yForAudioTrack(track.id, sepY: sepY)
+            for (clip, dStart) in model.displayedClips(isVideo: false, trackIndex: track.id) where !clip.isEffectivelyLocked {
+                let s = CMTimeGetSeconds(dStart)
+                let e = s + CMTimeGetSeconds(clip.duration)
+                if phSec >= s - 0.005 && phSec <= e + 0.005 {
+                    return (clip, dStart, frameFor(dStart, clip, trackY, trackH))
+                }
+            }
+        }
+        return nil
+    }
+
+    @discardableResult
+    private func beginFloatingSlip(
+        for clip: TimelineClip,
+        displayStart: CMTime,
+        clipFrame: CGRect,
+        startDragging: Bool,
+        dragX: CGFloat
+    ) -> Bool {
+        guard !clip.isEffectivelyLocked,
+              let slipInfo = model.slipClipSelectionBounds(clipId: clip.id) else {
+            return false
+        }
+        isFloatingSlipActive = true
+        isSlipDragging = startDragging
+        slipClipId = clip.id
+        slipInitialSourceIn = slipInfo.sourceIn
+        slipDragAnchorSourceIn = slipInfo.sourceIn
+        slipCurrentSourceIn = slipInfo.sourceIn
+        slipSourceDur = slipInfo.sourceDur
+        slipBoundsMin = slipInfo.boundsMin
+        slipBoundsMax = slipInfo.boundsMax
+        slipMarkers = slipInfo.markers
+        slipIsExtract = slipInfo.isExtract
+        slipDragInitialX = dragX
+        slipClipTimelineStartSec = CMTimeGetSeconds(displayStart)
+        slipClipFrame = clipFrame
+        emitSlipDualPreview(forClipId: clip.id, currentSourceIn: slipInfo.sourceIn, sourceDur: slipInfo.sourceDur)
+        needsDisplay = true
+        return true
+    }
+
+    private func emitSlipDualPreview(forClipId clipId: UUID, currentSourceIn: Double, sourceDur: Double) {
+        let outSec = currentSourceIn + sourceDur
+        var targetClip: TimelineClip? = model.videoTracks.lazy.flatMap(\.clips).first(where: { $0.id == clipId })
+        if targetClip == nil, let aClip = model.audioTracks.lazy.flatMap(\.clips).first(where: { $0.id == clipId }) {
+            if let lId = aClip.linkGroupId {
+                targetClip = model.videoTracks.lazy.flatMap(\.clips).first(where: { $0.linkGroupId == lId })
+            }
+            if targetClip == nil {
+                let paired = model.resolveSelectionCompanionClipIds(for: [clipId])
+                targetClip = model.videoTracks.lazy.flatMap(\.clips).first(where: { paired.contains($0.id) })
+            }
+            if targetClip == nil && aClip.mediaItem.hasVideo {
+                targetClip = aClip
+            }
+        }
+        guard let vClip = targetClip, vClip.mediaItem.hasVideo else { return }
+        let fps = vClip.mediaItem.frameRate > 0 ? Double(vClip.mediaItem.frameRate) : Double(model.format.fps)
+        onSlipDualPreviewUpdate?(vClip.mediaItem.effectiveURL, currentSourceIn, outSec, fps, vClip.mediaItem.name)
+    }
+
+    public func refreshFloatingSlipBoundsIfActive() {
+        guard isFloatingSlipActive, let clipId = slipClipId,
+              let slipInfo = model.slipClipSelectionBounds(clipId: clipId) else { return }
+        slipCurrentSourceIn = slipInfo.sourceIn
+        slipSourceDur = slipInfo.sourceDur
+        slipBoundsMin = slipInfo.boundsMin
+        slipBoundsMax = slipInfo.boundsMax
+        slipMarkers = slipInfo.markers
+        slipIsExtract = slipInfo.isExtract
+        emitSlipDualPreview(forClipId: clipId, currentSourceIn: slipInfo.sourceIn, sourceDur: slipInfo.sourceDur)
+        needsDisplay = true
     }
 
     private func finishFloatingSlipIfActive() {
         guard isFloatingSlipActive else { return }
         let changed = abs(slipCurrentSourceIn - slipInitialSourceIn) > 0.002
         isFloatingSlipActive = false
+        isSlipDragging = false
         slipClipId = nil
+        slipLastHudRect = .zero
+        onSlipDualPreviewEnd?()
         updateWidth()
         needsDisplay = true
         if changed {
-            notifyModified("Slip Estratto Selezione (Tab+Drag)")
+            notifyModified(slipIsExtract ? "Slip Estratto Selezione (Tab+Drag)" : "Slip Clip (Tab+Drag)")
         }
     }
 
@@ -262,8 +431,17 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         return max(0, maxTrackIndex)
     }
 
+    private var stickyRulerTopY: CGFloat {
+        max(0.0, visibleRect.minY)
+    }
+
+    private func centerDividerHitTest(at localPoint: CGPoint, sepY: CGFloat) -> Bool {
+        guard localPoint.y > stickyRulerTopY + rulerHeight else { return false }
+        return abs(localPoint.y - sepY) <= 4.5
+    }
+
     private func trackResizeHitTest(at localPoint: CGPoint, sepY: CGFloat) -> TrackResizeTarget? {
-        guard localPoint.y > rulerHeight else { return nil }
+        guard localPoint.y > stickyRulerTopY + rulerHeight else { return nil }
         for track in model.videoTracks {
             let borderY = yForVideoTrack(track.id, sepY: sepY)
             if abs(localPoint.y - borderY) <= 3.5 {
@@ -293,10 +471,49 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         }
     }
 
-    // Centered Divider coordinate: exactly at 50% between ruler and bottom of the panel
+    private var visibleViewportHeight: CGFloat {
+        let h = enclosingScrollView?.contentView.bounds.height ?? bounds.height
+        return max(180, h)
+    }
+
+    private var totalVideoTracksHeight: CGFloat {
+        model.videoTracks.reduce(0) { $0 + heightForVideoTrack($1.id) }
+    }
+
+    private var totalAudioTracksHeight: CGFloat {
+        model.audioTracks.reduce(0) { $0 + heightForAudioTrack($1.id) }
+    }
+
+    private func clampedSeparatorOffsetY(forViewportHeight viewportH: CGFloat) -> CGFloat {
+        let usableH = max(80, viewportH - rulerHeight)
+        let minOff = min(24.0, usableH * 0.25)
+        let maxOff = max(minOff, usableH - 28.0)
+        let raw = customSeparatorOffsetY ?? (usableH * 0.5)
+        return max(minOff, min(maxOff, raw))
+    }
+
+    private func topVideoOverflow(forViewportHeight viewportH: CGFloat) -> CGFloat {
+        let desiredOffset = clampedSeparatorOffsetY(forViewportHeight: viewportH)
+        return max(0.0, totalVideoTracksHeight - desiredOffset)
+    }
+
+    // Center divider between Video & Audio (default: exact 50% between ruler and bottom of viewport; shifts down on top overflow)
+    public func separatorY(forViewportHeight viewportH: CGFloat) -> CGFloat {
+        let desiredOffset = clampedSeparatorOffsetY(forViewportHeight: viewportH)
+        let topOverflow = max(0.0, totalVideoTracksHeight - desiredOffset)
+        return rulerHeight + desiredOffset + topOverflow
+    }
+
     public var separatorY: CGFloat {
-        let availableHeight = max(180, bounds.height)
-        return rulerHeight + (availableHeight - rulerHeight) / 2.0
+        separatorY(forViewportHeight: visibleViewportHeight)
+    }
+
+    public func calculatedTotalHeight(forViewportHeight viewportH: CGFloat) -> CGFloat {
+        let desiredOffset = clampedSeparatorOffsetY(forViewportHeight: viewportH)
+        let topOverflow = max(0.0, totalVideoTracksHeight - desiredOffset)
+        let sepY = rulerHeight + desiredOffset + topOverflow
+        let audioBottom = sepY + 4.0 + totalAudioTracksHeight + 8.0
+        return max(viewportH + topOverflow, audioBottom)
     }
 
     public var totalContentSeconds: Double {
@@ -333,12 +550,13 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         let playheadX = headerWidth + CGFloat(safeSec * pixelsPerSecond)
         let totalHeight = max(bounds.height, rulerHeight)
         let stickyHeaderRight = max(0, visibleRect.minX) + headerWidth
+        let visTopY = stickyRulerTopY
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         playheadContainerLayer.isHidden = (playheadX < stickyHeaderRight)
-        playheadContainerLayer.frame = CGRect(x: playheadX - 5, y: 0, width: 10, height: totalHeight)
-        playheadLineLayer.frame = CGRect(x: 4.25, y: 0, width: 1.5, height: totalHeight)
+        playheadContainerLayer.frame = CGRect(x: playheadX - 5, y: visTopY, width: 10, height: max(0, totalHeight - visTopY))
+        playheadLineLayer.frame = CGRect(x: 4.25, y: 0, width: 1.5, height: max(0, totalHeight - visTopY))
         playheadHandleLayer.frame = CGRect(x: 0, y: 0, width: 10, height: rulerHeight - 2)
         CATransaction.commit()
     }
@@ -373,6 +591,11 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         // 1. Background (clamped to dirtyRect)
         ctx.setFillColor(NSColor(calibratedWhite: 0.075, alpha: 1.0).cgColor)
         ctx.fill(dirtyRect)
+
+        // Clip tracks & center divider below the sticky ruler so scrolled tracks never bleed above it
+        let tracksTopY = stickyRulerTopY + rulerHeight
+        ctx.saveGState()
+        ctx.clip(to: CGRect(x: 0, y: tracksTopY, width: bounds.width, height: max(0, bounds.height - tracksTopY)))
 
         // 2. Video Tracks stack UPWARDS from separatorY
         for track in model.videoTracks {
@@ -455,6 +678,12 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
 
         // 2b. Selected clip borders always rendered on top of adjacent clips (both before and after)
         drawSelectedClipBorders(sepY: sepY, visibleRect: visibleRect, ctx: ctx)
+        ctx.restoreGState()
+
+        // 2c. Evidenziazione Ghost delle zone completamente vuote (rettangolo rosso dall'alto al basso)
+        if model.isEmptyGapsHighlighted {
+            drawEmptyTimelineGaps(bounds: bounds, drawMinX: drawMinX, drawMaxX: drawMaxX, ctx: ctx)
+        }
 
         // 3. Time Ruler on top + Rhythmic Grid
         let stickyHeaderX = max(0, visibleRect.minX)
@@ -474,7 +703,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             ctx.setStrokeColor(NSColor.systemCyan.cgColor)
             ctx.setLineWidth(1.5)
             ctx.strokeLineSegments(between: [
-                CGPoint(x: snapX, y: rulerHeight),
+                CGPoint(x: snapX, y: stickyRulerTopY + rulerHeight),
                 CGPoint(x: snapX, y: bounds.height)
             ])
         }
@@ -529,7 +758,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
 
     private func drawFloatingSlipHUD(in bounds: CGRect, ctx: CGContext) {
         let totalRange = max(0.05, slipBoundsMax - slipBoundsMin)
-        let hudW = max(230.0, min(420.0, max(slipClipFrame.width + 70.0, 250.0)))
+        let hudW = slipHUDWidth()
         let hudH: CGFloat = 42.0
         var hudX = slipClipFrame.midX - hudW * 0.5
         let minVisX = max(headerWidth + 8.0, visibleRect.minX + headerWidth + 8.0)
@@ -540,6 +769,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             hudY = slipClipFrame.maxY + 6.0
         }
         let hudRect = CGRect(x: hudX, y: hudY, width: hudW, height: hudH)
+        slipLastHudRect = hudRect
 
         ctx.saveGState()
         let bgPath = CGPath(roundedRect: hudRect, cornerWidth: 6, cornerHeight: 6, transform: nil)
@@ -558,12 +788,13 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         ctx.addPath(trackPath)
         ctx.fillPath()
 
-        // Highlighted window [slipCurrentSourceIn .. slipCurrentSourceIn + slipSourceDur]
+        // Highlighted window [slipCurrentSourceIn .. slipCurrentSourceIn + slipSourceDur], proporzionale al range
         let normStart = max(0.0, min(1.0, (slipCurrentSourceIn - slipBoundsMin) / totalRange))
-        let normDur = max(0.02, min(1.0 - normStart, slipSourceDur / totalRange))
+        let normDur = max(0.0, min(1.0 - normStart, slipSourceDur / totalRange))
         let winX = trackRect.minX + CGFloat(normStart) * trackRect.width
-        let winW = max(8.0, CGFloat(normDur) * trackRect.width)
-        let winRect = CGRect(x: winX, y: trackRect.minY, width: winW, height: trackRect.height)
+        let winW = max(8.0, min(trackRect.width, CGFloat(normDur) * trackRect.width))
+        let clampedWinX = min(trackRect.maxX - winW, max(trackRect.minX, winX))
+        let winRect = CGRect(x: clampedWinX, y: trackRect.minY, width: winW, height: trackRect.height)
         let winPath = CGPath(roundedRect: winRect, cornerWidth: 3, cornerHeight: 3, transform: nil)
         ctx.setFillColor(NSColor.systemCyan.withAlphaComponent(0.55).cgColor)
         ctx.addPath(winPath)
@@ -587,12 +818,54 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
 
         let startRel = max(0.0, slipCurrentSourceIn - slipBoundsMin)
         let endRel = min(totalRange, startRel + slipSourceDur)
-        let infoStr = String(format: "SLIP ESTRATTO  •  %.1fs – %.1fs / %.1fs", startRel, endRel, totalRange)
+        let prefix = slipIsExtract ? "SLIP SELEZIONE" : "SLIP ORIGINALE"
+        let infoStr = String(format: "%@  •  %.1fs – %.1fs / %.1fs", prefix, startRel, endRel, totalRange)
         let infoAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .semibold),
             .foregroundColor: NSColor.white
         ]
         (infoStr as NSString).draw(at: CGPoint(x: hudRect.minX + 10, y: hudRect.minY + 4), withAttributes: infoAttrs)
+        ctx.restoreGState()
+    }
+
+    private func drawEmptyTimelineGaps(bounds: CGRect, drawMinX: CGFloat, drawMaxX: CGFloat, ctx: CGContext) {
+        let gaps = model.emptyTimelineGapIntervals()
+        guard !gaps.isEmpty, drawMaxX > drawMinX else { return }
+        let topY = stickyRulerTopY + rulerHeight
+        let height = max(0, bounds.height - topY)
+        guard height > 0 else { return }
+
+        ctx.saveGState()
+        for gap in gaps {
+            let rawStartX = headerWidth + CGFloat(gap.start * pixelsPerSecond)
+            let rawEndX = headerWidth + CGFloat(gap.end * pixelsPerSecond)
+            let clampedStartX = max(drawMinX, rawStartX)
+            let clampedEndX = min(drawMaxX, max(clampedStartX, rawEndX))
+            let rectW = rawEndX - rawStartX
+            guard rawEndX >= drawMinX - 2, rawStartX <= drawMaxX + 2 else { continue }
+
+            let visW = max(min(2.0, max(0.0, drawMaxX - clampedStartX)), clampedEndX - clampedStartX)
+            guard visW > 0 else { continue }
+
+            let gapRect = CGRect(x: clampedStartX, y: topY, width: visW, height: height)
+            ctx.setFillColor(NSColor.systemRed.withAlphaComponent(0.28).cgColor)
+            ctx.fill(gapRect)
+
+            ctx.setStrokeColor(NSColor.systemRed.withAlphaComponent(0.82).cgColor)
+            ctx.setLineWidth(1.25)
+            var edgeLines: [CGPoint] = []
+            if rawStartX >= drawMinX && rawStartX <= drawMaxX {
+                edgeLines.append(CGPoint(x: rawStartX, y: topY))
+                edgeLines.append(CGPoint(x: rawStartX, y: bounds.height))
+            }
+            if rectW >= 3.0 && rawEndX >= drawMinX && rawEndX <= drawMaxX {
+                edgeLines.append(CGPoint(x: rawEndX, y: topY))
+                edgeLines.append(CGPoint(x: rawEndX, y: bounds.height))
+            }
+            if !edgeLines.isEmpty {
+                ctx.strokeLineSegments(between: edgeLines)
+            }
+        }
         ctx.restoreGState()
     }
 
@@ -685,7 +958,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
 
         let isSelected = model.selectedClipIds.contains(clip.id)
 
-        // Clip background (selection does NOT alter fill color; priority 1/2/3 applies blue shades)
+        // Clip background (selection does NOT alter fill color; custom colorTag overrides priority/default)
         let baseColor: NSColor
         if clip.isOrphan {
             baseColor = NSColor(calibratedRed: 0.65, green: 0.15, blue: 0.15, alpha: 1.0)
@@ -693,6 +966,10 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             baseColor = NSColor.darkGray.withAlphaComponent(0.4)
         } else if isTrackLocked {
             baseColor = isVideo ? NSColor(calibratedRed: 0.28, green: 0.18, blue: 0.22, alpha: 1.0) : NSColor(calibratedRed: 0.18, green: 0.22, blue: 0.28, alpha: 1.0)
+        } else if clip.isApproved {
+            baseColor = NSColor(calibratedRed: 0.13, green: 0.49, blue: 0.27, alpha: 1.0)
+        } else if let customColor = clip.colorTag?.nsColor {
+            baseColor = customColor
         } else if let p = clip.priority, let pColor = priorityColor(for: p) {
             baseColor = pColor
         } else if isVideo {
@@ -728,6 +1005,11 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                 ctx.setLineWidth(1.5)
                 ctx.addPath(path)
                 ctx.strokePath()
+            } else if clip.isApproved {
+                ctx.setStrokeColor(NSColor(calibratedRed: 0.30, green: 0.90, blue: 0.52, alpha: 1.0).cgColor)
+                ctx.setLineWidth(1.8)
+                ctx.addPath(path)
+                ctx.strokePath()
             } else if clip.isLocked {
                 ctx.setStrokeColor(NSColor.systemOrange.cgColor)
                 ctx.setLineWidth(1.6)
@@ -751,7 +1033,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             label.draw(in: textRect, withAttributes: attrs)
         }
 
-        // Badges: BeatMarkers (♪), Speed (50%), Span (2x/3x), Lock, Priority (1/2/3), Cage (G1, G2...)
+        // Badges: BeatMarkers (♪), Speed (Snail), Span (2x/3x), Approved (✓), Lock, Priority (1/2/3/4), Cage (G1, G2...)
         var badgeX = x + w - 4
 
         if !isVideo && !clip.beatMarkers.isEmpty && w > 48 {
@@ -766,7 +1048,15 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             badgeX -= 3
         }
 
-        if clip.speed != 1.0 && w > 42 {
+        if clip.speed < 0.99 && w > 24 {
+            badgeX -= 16
+            let snailPill = CGRect(x: badgeX, y: y + 2, width: 14, height: 12)
+            ctx.setFillColor(NSColor.systemYellow.cgColor)
+            ctx.addPath(CGPath(roundedRect: snailPill, cornerWidth: 2, cornerHeight: 2, transform: nil))
+            ctx.fillPath()
+            Self.cachedSnailBadgeImage.draw(in: CGRect(x: badgeX + 2.0, y: y + 3.0, width: 10, height: 10))
+            badgeX -= 3
+        } else if clip.speed > 1.01 && w > 42 {
             let speedText = "\(Int(clip.speed * 100))%"
             let sSize = (speedText as NSString).size(withAttributes: Self.badgeDarkAttrs)
             badgeX -= (sSize.width + 6)
@@ -778,15 +1068,40 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             badgeX -= 3
         }
 
-        if clip.span > 1 && w > 58 {
-            let spanText = "\(clip.span)x"
-            let spSize = (spanText as NSString).size(withAttributes: Self.badgeWhiteAttrs)
-            badgeX -= (spSize.width + 6)
-            let badgeRect = CGRect(x: badgeX, y: y + 2, width: spSize.width + 6, height: 12)
-            ctx.setFillColor(NSColor.systemCyan.cgColor)
-            ctx.addPath(CGPath(roundedRect: badgeRect, cornerWidth: 2, cornerHeight: 2, transform: nil))
+        // Badge temporaneo Xx solo durante il drag / trim in Modalità Gabbie ON
+        if model.isCageLockActive {
+            let isActivelyTrimmingThis = (isTrimmingEdge && activeTrimClipId == clip.id)
+            let isActivelyDraggingThis = (isDraggingClip && (draggedClipId == clip.id || multiDragInitialStates.contains(where: { $0.id == clip.id })))
+            if isActivelyTrimmingThis || isActivelyDraggingThis {
+                let cages = model.activeCageIntervals()
+                let sSec = CMTimeGetSeconds(displayStart)
+                let eSec = sSec + CMTimeGetSeconds(clip.duration)
+                let overlapCages = cages.filter { min(eSec, $0.endSeconds) - max(sSec, $0.startSeconds) > 0.02 }.count
+                let liveSpan = max(clip.span, overlapCages)
+                if (isActivelyTrimmingThis && liveSpan >= 1) || liveSpan >= 2 {
+                    let spanText = "\(max(1, liveSpan))x"
+                    let spSize = (spanText as NSString).size(withAttributes: Self.badgeWhiteAttrs)
+                    let pillW = spSize.width + 6
+                    if badgeX - pillW > x + 4 {
+                        badgeX -= pillW
+                        let badgeRect = CGRect(x: badgeX, y: y + 2, width: pillW, height: 12)
+                        ctx.setFillColor(NSColor.systemCyan.cgColor)
+                        ctx.addPath(CGPath(roundedRect: badgeRect, cornerWidth: 2, cornerHeight: 2, transform: nil))
+                        ctx.fillPath()
+                        (spanText as NSString).draw(at: CGPoint(x: badgeX + 3, y: y + 2), withAttributes: Self.badgeWhiteAttrs)
+                        badgeX -= 3
+                    }
+                }
+            }
+        }
+
+        if clip.isApproved && w > 22 {
+            badgeX -= 16
+            let okPill = CGRect(x: badgeX, y: y + 2, width: 14, height: 12)
+            ctx.setFillColor(NSColor(calibratedRed: 0.35, green: 0.92, blue: 0.54, alpha: 0.96).cgColor)
+            ctx.addPath(CGPath(roundedRect: okPill, cornerWidth: 2, cornerHeight: 2, transform: nil))
             ctx.fillPath()
-            (spanText as NSString).draw(at: CGPoint(x: badgeX + 3, y: y + 2), withAttributes: Self.badgeWhiteAttrs)
+            Self.cachedCheckBadgeImage.draw(in: CGRect(x: badgeX + 2.5, y: y + 3.5, width: 9, height: 9))
             badgeX -= 3
         }
 
@@ -827,6 +1142,20 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             ctx.addPath(CGPath(roundedRect: badgeRect, cornerWidth: 2, cornerHeight: 2, transform: nil))
             ctx.fillPath()
             (cText as NSString).draw(at: CGPoint(x: badgeX + 3, y: y + 2), withAttributes: Self.badgeCageAttrs)
+            badgeX -= 3
+        }
+
+        if isVideo && !model.isClipFrameRateCompatible(clip) && w > 44 {
+            let fpsText = "⚠ \(TimelineModel.formatFPSLabel(clip.mediaItem.frameRate))fps"
+            let fSize = (fpsText as NSString).size(withAttributes: Self.badgeDarkAttrs)
+            if badgeX - (fSize.width + 6) > x + 4 {
+                badgeX -= (fSize.width + 6)
+                let badgeRect = CGRect(x: badgeX, y: y + 2, width: fSize.width + 6, height: 12)
+                ctx.setFillColor(NSColor.systemYellow.withAlphaComponent(0.95).cgColor)
+                ctx.addPath(CGPath(roundedRect: badgeRect, cornerWidth: 2, cornerHeight: 2, transform: nil))
+                ctx.fillPath()
+                (fpsText as NSString).draw(at: CGPoint(x: badgeX + 3, y: y + 2), withAttributes: Self.badgeDarkAttrs)
+            }
         }
 
         // Draw [ or ] edge brackets on hover or active edge trimming
@@ -867,6 +1196,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         case 1: return NSColor(calibratedRed: 0.36, green: 0.72, blue: 0.98, alpha: 1.0) // 1 — Blu chiaro
         case 2: return NSColor(calibratedRed: 0.16, green: 0.45, blue: 0.85, alpha: 1.0) // 2 — Blu medio
         case 3: return NSColor(calibratedRed: 0.08, green: 0.22, blue: 0.48, alpha: 1.0) // 3 — Blu scuro
+        case 4: return NSColor(calibratedRed: 0.56, green: 0.24, blue: 0.74, alpha: 1.0) // 4 — Dialogo / Intera (Viola)
         default: return nil
         }
     }
@@ -1141,15 +1471,20 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
     }
 
     private func drawHeaders(ctx: CGContext, bounds: CGRect, sepY: CGFloat, originX: CGFloat) {
+        let rulerTop = stickyRulerTopY
+        let rulerBottom = rulerTop + rulerHeight
         // Left Column background (sticky al bordo sinistro visibile)
-        let headerRect = CGRect(x: originX, y: 0, width: headerWidth, height: bounds.height)
+        let headerRect = CGRect(x: originX, y: rulerBottom, width: headerWidth, height: max(0, bounds.height - rulerBottom))
         ctx.setFillColor(NSColor(calibratedWhite: 0.095, alpha: 1.0).cgColor)
         ctx.fill(headerRect)
+
+        ctx.saveGState()
+        ctx.clip(to: CGRect(x: originX, y: rulerBottom, width: headerWidth + 1, height: max(0, bounds.height - rulerBottom)))
 
         ctx.setStrokeColor(NSColor(calibratedWhite: 0.18, alpha: 1.0).cgColor)
         ctx.setLineWidth(1.0)
         ctx.strokeLineSegments(between: [
-            CGPoint(x: originX + headerWidth, y: 0),
+            CGPoint(x: originX + headerWidth, y: rulerBottom),
             CGPoint(x: originX + headerWidth, y: bounds.height)
         ])
 
@@ -1166,6 +1501,18 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             let trackY = yForAudioTrack(track.id, sepY: sepY)
             drawTrackHeaderItem(name: track.name, isVideo: false, isLocked: track.isLocked, isEnabled: track.isEnabled, originX: originX, y: trackY, height: trackH, ctx: ctx)
         }
+
+        // Divisore centrale visibile anche nella colonna header (tra Video e Audio)
+        let headerSepRect = CGRect(x: originX, y: sepY - 2, width: headerWidth, height: 4)
+        ctx.setFillColor(NSColor(calibratedWhite: 0.04, alpha: 1.0).cgColor)
+        ctx.fill(headerSepRect)
+        ctx.setStrokeColor(NSColor(calibratedWhite: 0.24, alpha: 1.0).cgColor)
+        ctx.setLineWidth(1.5)
+        ctx.strokeLineSegments(between: [
+            CGPoint(x: originX, y: sepY),
+            CGPoint(x: originX + headerWidth, y: sepY)
+        ])
+        ctx.restoreGState()
     }
 
     private static let lockActiveIcon = Lucide.image(.lock, size: 13, color: .systemOrange)
@@ -1205,36 +1552,46 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
     }
 
     private func drawRuler(ctx: CGContext, bounds: CGRect, visibleMinX: CGFloat) {
+        let rulerTop = stickyRulerTopY
+        let rulerBottom = rulerTop + rulerHeight
         let rulerStartX = visibleMinX + headerWidth
         let rulerEndX = min(bounds.width, visibleRect.maxX + 4)
         let rulerW = max(0, rulerEndX - rulerStartX)
-        let rulerRect = CGRect(x: rulerStartX, y: 0, width: rulerW, height: rulerHeight)
+        let rulerRect = CGRect(x: rulerStartX, y: rulerTop, width: rulerW, height: rulerHeight)
         ctx.setFillColor(NSColor(calibratedWhite: 0.115, alpha: 1.0).cgColor)
         ctx.fill(rulerRect)
 
         ctx.setStrokeColor(NSColor(calibratedWhite: 0.22, alpha: 1.0).cgColor)
         ctx.setLineWidth(1.0)
         ctx.strokeLineSegments(between: [
-            CGPoint(x: rulerStartX, y: rulerHeight),
-            CGPoint(x: rulerEndX, y: rulerHeight)
+            CGPoint(x: rulerStartX, y: rulerBottom),
+            CGPoint(x: rulerEndX, y: rulerBottom)
         ])
 
-        let candidateSteps: [Double] = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600]
+        let fps: Double = max(1.0, Double(model.format.fps))
+        let frameSec: Double = 1.0 / fps
+        let rawCandidates: [Double] = [frameSec, frameSec * 2.0, frameSec * 5.0, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600]
+        var candidateSteps: [Double] = []
+        for s in rawCandidates where (candidateSteps.last.map { s > $0 + 0.0001 } ?? true) {
+            candidateSteps.append(s)
+        }
         let stepSec: Double = candidateSteps.first(where: { $0 * pixelsPerSecond >= 78.0 }) ?? 3600.0
-        let subStepSec: Double = stepSec / 5.0
+        let subStepSec: Double = stepSec < 0.99
+            ? (stepSec <= frameSec * 1.05 ? stepSec : frameSec)
+            : (stepSec == 1.0 && frameSec * pixelsPerSecond >= 8.0 ? frameSec : stepSec / 5.0)
         let totalSeconds = totalContentSeconds
         let visStartSec = max(0.0, Double(visibleMinX) / pixelsPerSecond)
         let visEndSec = min(totalSeconds, Double(max(rulerStartX, visibleRect.maxX) - headerWidth) / pixelsPerSecond + stepSec)
 
-        // Sotto-tacche secondarie (solo se sufficientemente distanziate)
-        if subStepSec * pixelsPerSecond >= 6.0 {
+        // Sotto-tacche secondarie (o singoli frame a zoom elevato)
+        if subStepSec < stepSec - 0.0001 && subStepSec * pixelsPerSecond >= 6.0 {
             var st = max(0.0, floor(visStartSec / subStepSec) * subStepSec)
             var subSegments: [CGPoint] = []
             while st <= visEndSec {
                 let sx = headerWidth + CGFloat(st * pixelsPerSecond)
                 if sx >= rulerStartX && sx <= rulerEndX {
-                    subSegments.append(CGPoint(x: sx, y: rulerHeight - 4))
-                    subSegments.append(CGPoint(x: sx, y: rulerHeight))
+                    subSegments.append(CGPoint(x: sx, y: rulerBottom - 4))
+                    subSegments.append(CGPoint(x: sx, y: rulerBottom))
                 }
                 st += subStepSec
             }
@@ -1245,26 +1602,41 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             }
         }
 
-        // Tacche principali ed etichette tempo
+        // Tacche principali ed etichette tempo (con frame :FF a zoom profondo)
         var t = max(0.0, floor(visStartSec / stepSec) * stepSec)
+        let showFrameTC = stepSec < 0.99
+        let fpsInt = max(1, Int(fps.rounded()))
         ctx.setStrokeColor(NSColor(calibratedWhite: 0.55, alpha: 1.0).cgColor)
         ctx.setLineWidth(1.0)
         while t <= visEndSec {
             let x = headerWidth + CGFloat(t * pixelsPerSecond)
             if x >= rulerStartX && x <= rulerEndX {
                 ctx.strokeLineSegments(between: [
-                    CGPoint(x: x, y: rulerHeight - 8),
-                    CGPoint(x: x, y: rulerHeight)
+                    CGPoint(x: x, y: rulerBottom - 8),
+                    CGPoint(x: x, y: rulerBottom)
                 ])
 
-                let totalSecInt = Int(t.rounded())
-                let hrs = totalSecInt / 3600
-                let mins = (totalSecInt % 3600) / 60
-                let secs = totalSecInt % 60
-                let label = hrs > 0
-                    ? String(format: "%d:%02d:%02d", hrs, mins, secs)
-                    : String(format: "%02d:%02d", mins, secs)
-                (label as NSString).draw(at: CGPoint(x: x + 2, y: 2), withAttributes: Self.rulerTimeAttrs)
+                let label: String
+                if showFrameTC {
+                    let frameIndex = max(0, Int((t * fps).rounded()))
+                    let ff = frameIndex % fpsInt
+                    let totalSecInt = frameIndex / fpsInt
+                    let hrs = totalSecInt / 3600
+                    let mins = (totalSecInt % 3600) / 60
+                    let secs = totalSecInt % 60
+                    label = hrs > 0
+                        ? String(format: "%d:%02d:%02d:%02d", hrs, mins, secs, ff)
+                        : String(format: "%02d:%02d:%02d", mins, secs, ff)
+                } else {
+                    let totalSecInt = Int(t.rounded())
+                    let hrs = totalSecInt / 3600
+                    let mins = (totalSecInt % 3600) / 60
+                    let secs = totalSecInt % 60
+                    label = hrs > 0
+                        ? String(format: "%d:%02d:%02d", hrs, mins, secs)
+                        : String(format: "%02d:%02d", mins, secs)
+                }
+                (label as NSString).draw(at: CGPoint(x: x + 2, y: rulerTop + 2), withAttributes: Self.rulerTimeAttrs)
             }
             t += stepSec
         }
@@ -1282,19 +1654,19 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
 
                 if endX >= cageVisMinX && startX <= cageVisMaxX {
                     if startX >= headerWidth && startX <= cageVisMaxX {
-                        dashedLines.append(CGPoint(x: startX, y: rulerHeight))
+                        dashedLines.append(CGPoint(x: startX, y: rulerBottom))
                         dashedLines.append(CGPoint(x: startX, y: bounds.height))
                     }
 
-                    // Badge numerico gabbia nel righello
-                    if w >= 16 && startX >= rulerStartX - 24 {
-                        let badgeRect = CGRect(x: startX + 2, y: rulerHeight - 11, width: min(w - 4, 22), height: 10)
+                    // Badge numerico gabbia nel righello (visibile solo a modalità gabbia attiva)
+                    if model.isCageLockActive && w >= 16 && startX >= rulerStartX - 24 {
+                        let badgeRect = CGRect(x: startX + 2, y: rulerBottom - 11, width: min(w - 4, 22), height: 10)
                         ctx.setFillColor(NSColor.systemCyan.withAlphaComponent(0.25).cgColor)
                         ctx.addPath(CGPath(roundedRect: badgeRect, cornerWidth: 2, cornerHeight: 2, transform: nil))
                         ctx.fillPath()
 
                         let cLabel = "\(cage.index + 1)"
-                        (cLabel as NSString).draw(at: CGPoint(x: startX + 4, y: rulerHeight - 11.5), withAttributes: Self.rulerCageIndexAttrs)
+                        (cLabel as NSString).draw(at: CGPoint(x: startX + 4, y: rulerBottom - 11.5), withAttributes: Self.rulerCageIndexAttrs)
                     }
                 }
             }
@@ -1302,24 +1674,27 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             if let lastCage = liveCages.last {
                 let endX = headerWidth + CGFloat(lastCage.endSeconds * pixelsPerSecond)
                 if endX >= cageVisMinX && endX <= cageVisMaxX {
-                    dashedLines.append(CGPoint(x: endX, y: rulerHeight))
+                    dashedLines.append(CGPoint(x: endX, y: rulerBottom))
                     dashedLines.append(CGPoint(x: endX, y: bounds.height))
                 }
             }
 
             if !dashedLines.isEmpty {
                 ctx.saveGState()
-                ctx.setStrokeColor(NSColor.systemCyan.withAlphaComponent(0.35).cgColor)
+                let lineAlpha: CGFloat = model.isCageLockActive ? 0.35 : 0.05
+                ctx.setStrokeColor(NSColor.systemCyan.withAlphaComponent(lineAlpha).cgColor)
                 ctx.setLineWidth(1.0)
                 ctx.setLineDash(phase: 0, lengths: [4, 4])
                 ctx.strokeLineSegments(between: dashedLines)
                 ctx.restoreGState()
             }
 
-            // Etichetta BPM / conteggio gabbie in alto a sinistra nel righello
-            let bpmPrefix = model.effectiveDetectedBPM.map { "\(String(format: "%.1f", $0)) BPM • " } ?? ""
-            let bpmTag = "🎵 \(bpmPrefix)\(liveCages.count) gabbie"
-            (bpmTag as NSString).draw(at: CGPoint(x: headerWidth + 6, y: 2), withAttributes: Self.rulerBpmTagAttrs)
+            // Etichetta BPM / conteggio gabbie in alto a sinistra nel righello (solo se modalità gabbia attiva)
+            if model.isCageLockActive {
+                let bpmPrefix = model.effectiveDetectedBPM.map { "\(String(format: "%.1f", $0)) BPM • " } ?? ""
+                let bpmTag = "🎵 \(bpmPrefix)\(liveCages.count) gabbie"
+                (bpmTag as NSString).draw(at: CGPoint(x: headerWidth + 6, y: rulerTop + 2), withAttributes: Self.rulerBpmTagAttrs)
+            }
         }
     }
 
@@ -1457,7 +1832,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             let trackH = heightForVideoTrack(track.id)
             let trackY = yForVideoTrack(track.id, sepY: sepY)
             if localPoint.y >= trackY && localPoint.y <= trackY + trackH {
-                for (clip, dStart) in model.displayedClips(isVideo: true, trackIndex: track.id) where !clip.isLocked {
+                for (clip, dStart) in model.displayedClips(isVideo: true, trackIndex: track.id) where !clip.isEffectivelyLocked {
                     let clipX = headerWidth + CGFloat(CMTimeGetSeconds(dStart) * pixelsPerSecond)
                     let clipW = CGFloat(CMTimeGetSeconds(clip.duration) * pixelsPerSecond)
                     if localPoint.x >= clipX - 2 && localPoint.x <= clipX + edgeMargin {
@@ -1480,7 +1855,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                 let trackH = heightForAudioTrack(track.id)
                 let trackY = yForAudioTrack(track.id, sepY: sepY)
                 if localPoint.y >= trackY && localPoint.y <= trackY + trackH {
-                    for (clip, dStart) in model.displayedClips(isVideo: false, trackIndex: track.id) where !clip.isLocked {
+                    for (clip, dStart) in model.displayedClips(isVideo: false, trackIndex: track.id) where !clip.isEffectivelyLocked {
                         let clipX = headerWidth + CGFloat(CMTimeGetSeconds(dStart) * pixelsPerSecond)
                         let clipW = CGFloat(CMTimeGetSeconds(clip.duration) * pixelsPerSecond)
                         if localPoint.x >= clipX - 2 && localPoint.x <= clipX + edgeMargin {
@@ -1509,10 +1884,8 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             case .start: NSCursor.resizeLeft.set()
             case .end: NSCursor.resizeRight.set()
             }
-        } else if trackResizeHitTest(at: localPoint, sepY: sepY) != nil {
+        } else if centerDividerHitTest(at: localPoint, sepY: sepY) || trackResizeHitTest(at: localPoint, sepY: sepY) != nil {
             NSCursor.resizeUpDown.set()
-        } else if isPointInHandPanZone(localPoint) {
-            NSCursor.openHand.set()
         } else {
             NSCursor.arrow.set()
         }
@@ -1521,7 +1894,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
     public override func cursorUpdate(with event: NSEvent) {
         let localPoint = convert(event.locationInWindow, from: nil)
         let sepY = separatorY
-        if resizingTrack != nil {
+        if isDraggingCenterDivider || resizingTrack != nil {
             NSCursor.resizeUpDown.set()
         } else if isHandPanning {
             NSCursor.closedHand.set()
@@ -1532,29 +1905,11 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             case .start: NSCursor.resizeLeft.set()
             case .end: NSCursor.resizeRight.set()
             }
-        } else if trackResizeHitTest(at: localPoint, sepY: sepY) != nil {
+        } else if centerDividerHitTest(at: localPoint, sepY: sepY) || trackResizeHitTest(at: localPoint, sepY: sepY) != nil {
             NSCursor.resizeUpDown.set()
-        } else if isPointInHandPanZone(localPoint) {
-            NSCursor.openHand.set()
         } else {
             NSCursor.arrow.set()
         }
-    }
-
-    private func isPointInHandPanZone(_ localPoint: CGPoint) -> Bool {
-        let stickyHeaderRight = max(0, visibleRect.minX) + headerWidth
-        guard localPoint.x >= stickyHeaderRight, localPoint.y > rulerHeight else { return false }
-        let sepY = separatorY
-
-        let highestOccupiedV = model.videoTracks.filter { !$0.clips.isEmpty }.map(\.id).max() ?? -1
-        let topOccupiedVideoY = highestOccupiedV >= 0 ? yForVideoTrack(highestOccupiedV, sepY: sepY) : sepY
-
-        let highestOccupiedA = model.audioTracks.filter { !$0.clips.isEmpty }.map(\.id).max() ?? -1
-        let bottomOccupiedAudioY = highestOccupiedA >= 0
-            ? (yForAudioTrack(highestOccupiedA, sepY: sepY) + heightForAudioTrack(highestOccupiedA))
-            : (sepY + 4)
-
-        return localPoint.y < topOccupiedVideoY - 3.5 || localPoint.y > bottomOccupiedAudioY + 3.5
     }
 
     private func prepareDragSelectionState() {
@@ -1565,7 +1920,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         var addedIds: Set<UUID> = []
 
         func appendClipIfUnlocked(_ clip: TimelineClip, isVideo: Bool) {
-            guard !clip.isLocked, addedIds.insert(clip.id).inserted else { return }
+            guard !clip.isEffectivelyLocked, addedIds.insert(clip.id).inserted else { return }
             states.append(DraggedClipInitialState(
                 id: clip.id,
                 isVideo: isVideo,
@@ -1615,6 +1970,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
 
     // MARK: - Mouse & Drag Handlers
     public override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
         onSectionActivated?()
         let localPoint = convert(event.locationInWindow, from: nil)
         let isShift = event.modifierFlags.contains(.shift)
@@ -1636,10 +1992,20 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             needsDisplay = true
         }
 
+        // 0b. Clicking inside active Tab Slip HUD bar drags it directly
+        if isTabKeyHeld && isFloatingSlipActive && !slipLastHudRect.isEmpty && slipLastHudRect.contains(localPoint) {
+            isSlipDragging = true
+            slipDragInitialX = localPoint.x
+            slipDragAnchorSourceIn = slipCurrentSourceIn
+            needsDisplay = true
+            return
+        }
+
         // 1. Clicked in Ruler: Scrub playhead
-        if localPoint.y <= rulerHeight {
+        if localPoint.y <= stickyRulerTopY + rulerHeight {
             guard localPoint.x >= stickyHeaderRight else { return }
             isScrubbingRuler = true
+            onUserPlayheadScrubbed?()
             let targetX = max(headerWidth, localPoint.x)
             let targetSeconds = max(0, Double(targetX - headerWidth) / pixelsPerSecond)
             let targetTime = CMTime(seconds: targetSeconds, preferredTimescale: 600)
@@ -1651,7 +2017,28 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             return
         }
 
-        // 2. Track Height Border Drag / Double-Click Reset (before header buttons & clips)
+        // 2a. Center Video/Audio Divider Drag / Double-Click Reset to exact center
+        if centerDividerHitTest(at: localPoint, sepY: sepY) {
+            if event.clickCount == 2 {
+                customSeparatorOffsetY = nil
+                onCanvasWidthChanged?()
+                if let clipView = enclosingScrollView?.contentView {
+                    let maxOriginY = max(0.0, frame.height - clipView.bounds.height)
+                    let targetY = min(maxOriginY, topVideoOverflow(forViewportHeight: visibleViewportHeight))
+                    clipView.scroll(to: NSPoint(x: clipView.bounds.origin.x, y: targetY))
+                    enclosingScrollView?.reflectScrolledClipView(clipView)
+                }
+                needsDisplay = true
+                return
+            }
+            isDraggingCenterDivider = true
+            centerDividerInitialScreenY = NSEvent.mouseLocation.y
+            centerDividerInitialOffsetY = clampedSeparatorOffsetY(forViewportHeight: visibleViewportHeight)
+            NSCursor.resizeUpDown.set()
+            return
+        }
+
+        // 2b. Track Height Border Drag / Double-Click Reset (before header buttons & clips)
         if let resizeHit = trackResizeHitTest(at: localPoint, sepY: sepY) {
             if event.clickCount == 2 {
                 if resizeHit.isVideo {
@@ -1659,6 +2046,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                 } else {
                     model.audioTrackHeights.removeValue(forKey: resizeHit.trackId)
                 }
+                onCanvasWidthChanged?()
                 needsDisplay = true
                 return
             }
@@ -1737,10 +2125,35 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                                 model.selectedClipIds = newSelection
                             }
 
-                            if clip.isLocked {
-                                DebugLogger.shared.log("Clip '\(clip.mediaItem.name)' bloccata (L per sbloccare).", level: .info)
+                            if event.clickCount == 2 {
+                                onClipDoubleClicked?(clip)
                                 needsDisplay = true
                                 return
+                            }
+
+                            if clip.isEffectivelyLocked {
+                                let msg = clip.isApproved
+                                    ? "Clip '\(clip.mediaItem.name)' approvata OK (\\ per sbloccare)."
+                                    : "Clip '\(clip.mediaItem.name)' bloccata (L per sbloccare)."
+                                DebugLogger.shared.log(msg, level: .info)
+                                needsDisplay = true
+                                return
+                            }
+
+                            // Tab + Click/Drag -> SEMPRE prioritario su edge trimming: slip interno senza mai cambiare i bordi
+                            if isTabKeyHeld {
+                                if isFloatingSlipActive && slipClipId == clip.id {
+                                    isSlipDragging = true
+                                    slipDragInitialX = localPoint.x
+                                    slipDragAnchorSourceIn = slipCurrentSourceIn
+                                    slipClipFrame = CGRect(x: clipX, y: trackY + 2, width: clipW, height: trackH - 4)
+                                    needsDisplay = true
+                                    return
+                                }
+                                let frame = CGRect(x: clipX, y: trackY + 2, width: clipW, height: trackH - 4)
+                                if beginFloatingSlip(for: clip, displayStart: dStart, clipFrame: frame, startDragging: true, dragX: localPoint.x) {
+                                    return
+                                }
                             }
 
                             let edgeMargin: CGFloat = 8.0
@@ -1750,6 +2163,8 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                                 activeTrimClipId = clip.id
                                 activeTrimIsStart = true
                                 activeTrimIsVideo = true
+                                trimStartAnchorX = localPoint.x
+                                trimInitialEdgeTimeSec = CMTimeGetSeconds(clip.timelineStart)
                                 dragInitialPoint = localPoint
                                 needsDisplay = true
                                 return
@@ -1759,30 +2174,14 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                                 activeTrimClipId = clip.id
                                 activeTrimIsStart = false
                                 activeTrimIsVideo = true
+                                trimStartAnchorX = localPoint.x
+                                trimInitialEdgeTimeSec = CMTimeGetSeconds(clip.timelineEnd)
                                 dragInitialPoint = localPoint
                                 needsDisplay = true
                                 return
                             }
 
                             if model.isSmartFilterActive {
-                                needsDisplay = true
-                                return
-                            }
-
-                            // Tab + Click/Drag -> Barra flottante Slip dentro estratto Selezione
-                            if isTabKeyHeld, let slipInfo = model.slipClipSelectionBounds(clipId: clip.id) {
-                                isFloatingSlipActive = true
-                                slipClipId = clip.id
-                                slipInitialSourceIn = slipInfo.sourceIn
-                                slipCurrentSourceIn = slipInfo.sourceIn
-                                slipSourceDur = slipInfo.sourceDur
-                                slipBoundsMin = slipInfo.boundsMin
-                                slipBoundsMax = slipInfo.boundsMax
-                                slipMarkers = slipInfo.markers
-                                slipDragInitialX = localPoint.x
-                                slipClipTimelineStartSec = CMTimeGetSeconds(clip.timelineStart)
-                                slipClipFrame = CGRect(x: clipX, y: trackY + 2, width: clipW, height: trackH - 4)
-                                playbackController.seek(to: clip.timelineStart, frameAccurate: true)
                                 needsDisplay = true
                                 return
                             }
@@ -1855,10 +2254,35 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                                 model.selectedClipIds = newSelection
                             }
 
-                            if clip.isLocked {
-                                DebugLogger.shared.log("Clip '\(clip.mediaItem.name)' bloccata (L per sbloccare).", level: .info)
+                            if event.clickCount == 2 {
+                                onClipDoubleClicked?(clip)
                                 needsDisplay = true
                                 return
+                            }
+
+                            if clip.isEffectivelyLocked {
+                                let msg = clip.isApproved
+                                    ? "Clip '\(clip.mediaItem.name)' approvata OK (\\ per sbloccare)."
+                                    : "Clip '\(clip.mediaItem.name)' bloccata (L per sbloccare)."
+                                DebugLogger.shared.log(msg, level: .info)
+                                needsDisplay = true
+                                return
+                            }
+
+                            // Tab + Click/Drag -> SEMPRE prioritario su edge trimming anche su tracce audio
+                            if isTabKeyHeld {
+                                if isFloatingSlipActive && slipClipId == clip.id {
+                                    isSlipDragging = true
+                                    slipDragInitialX = localPoint.x
+                                    slipDragAnchorSourceIn = slipCurrentSourceIn
+                                    slipClipFrame = CGRect(x: clipX, y: trackY + 2, width: clipW, height: trackH - 4)
+                                    needsDisplay = true
+                                    return
+                                }
+                                let frame = CGRect(x: clipX, y: trackY + 2, width: clipW, height: trackH - 4)
+                                if beginFloatingSlip(for: clip, displayStart: dStart, clipFrame: frame, startDragging: true, dragX: localPoint.x) {
+                                    return
+                                }
                             }
 
                             let edgeMargin: CGFloat = 8.0
@@ -1868,6 +2292,8 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                                 activeTrimClipId = clip.id
                                 activeTrimIsStart = true
                                 activeTrimIsVideo = false
+                                trimStartAnchorX = localPoint.x
+                                trimInitialEdgeTimeSec = CMTimeGetSeconds(clip.timelineStart)
                                 dragInitialPoint = localPoint
                                 needsDisplay = true
                                 return
@@ -1877,6 +2303,8 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                                 activeTrimClipId = clip.id
                                 activeTrimIsStart = false
                                 activeTrimIsVideo = false
+                                trimStartAnchorX = localPoint.x
+                                trimInitialEdgeTimeSec = CMTimeGetSeconds(clip.timelineEnd)
                                 dragInitialPoint = localPoint
                                 needsDisplay = true
                                 return
@@ -1924,16 +2352,8 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             }
         }
 
-        // 5. Empty area above last occupied Video track or below last occupied Audio track -> Hand Pan
-        if isPointInHandPanZone(localPoint), let clipView = enclosingScrollView?.contentView {
-            isHandPanning = true
-            handPanInitialScreenPoint = NSEvent.mouseLocation
-            handPanInitialOrigin = clipView.bounds.origin
-            NSCursor.closedHand.set()
-            return
-        }
-
-        // 6. Clicked on Empty Timeline Canvas (occupied rows): Start Marquee Rubber-Band Selection
+        // 5. Clicked on Empty Timeline Canvas: Start Marquee Rubber-Band Selection
+        // (Timeline grabbing is triggered via middle mouse button drag)
         isMarqueeSelecting = true
         marqueeStartPoint = localPoint
         marqueeCurrentPoint = localPoint
@@ -1945,9 +2365,69 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         needsDisplay = true
     }
 
+    public override func otherMouseDown(with event: NSEvent) {
+        guard event.buttonNumber == 2 else {
+            super.otherMouseDown(with: event)
+            return
+        }
+        window?.makeFirstResponder(self)
+        onSectionActivated?()
+        guard let clipView = enclosingScrollView?.contentView else { return }
+        isHandPanning = true
+        handPanInitialScreenPoint = NSEvent.mouseLocation
+        handPanInitialOrigin = clipView.bounds.origin
+        NSCursor.closedHand.set()
+    }
+
+    public override func otherMouseDragged(with event: NSEvent) {
+        guard event.buttonNumber == 2, isHandPanning, let clipView = enclosingScrollView?.contentView else {
+            super.otherMouseDragged(with: event)
+            return
+        }
+        let currentScreen = NSEvent.mouseLocation
+        let dx = currentScreen.x - handPanInitialScreenPoint.x
+        let maxOriginX = max(0.0, frame.width - clipView.bounds.width)
+        let targetX = max(0.0, min(maxOriginX, handPanInitialOrigin.x - dx))
+        clipView.scroll(to: NSPoint(x: targetX, y: clipView.bounds.origin.y))
+        enclosingScrollView?.reflectScrolledClipView(clipView)
+        NSCursor.closedHand.set()
+    }
+
+    public override func otherMouseUp(with event: NSEvent) {
+        guard event.buttonNumber == 2 else {
+            super.otherMouseUp(with: event)
+            return
+        }
+        if isHandPanning {
+            isHandPanning = false
+            NSCursor.arrow.set()
+        }
+    }
+
     public override func mouseDragged(with event: NSEvent) {
         let localPoint = convert(event.locationInWindow, from: nil)
         let sepY = separatorY
+
+        if isDraggingCenterDivider {
+            let viewportH = visibleViewportHeight
+            let prevOverflow = topVideoOverflow(forViewportHeight: viewportH)
+            let dy = NSEvent.mouseLocation.y - centerDividerInitialScreenY
+            let usableH = max(80, viewportH - rulerHeight)
+            let minOff = min(24.0, usableH * 0.25)
+            let maxOff = max(minOff, usableH - 28.0)
+            customSeparatorOffsetY = max(minOff, min(maxOff, centerDividerInitialOffsetY - dy))
+            let newOverflow = topVideoOverflow(forViewportHeight: viewportH)
+            onCanvasWidthChanged?()
+            if abs(newOverflow - prevOverflow) > 0.25, let clipView = enclosingScrollView?.contentView {
+                let maxOriginY = max(0.0, frame.height - clipView.bounds.height)
+                let targetY = max(0.0, min(maxOriginY, clipView.bounds.origin.y + (newOverflow - prevOverflow)))
+                clipView.scroll(to: NSPoint(x: clipView.bounds.origin.x, y: targetY))
+                enclosingScrollView?.reflectScrolledClipView(clipView)
+            }
+            NSCursor.resizeUpDown.set()
+            needsDisplay = true
+            return
+        }
 
         if let rt = resizingTrack {
             let screenY = NSEvent.mouseLocation.y
@@ -1959,6 +2439,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                 let clamped = max(minAudioRowHeight, min(maxAudioRowHeight, trackResizeInitialHeight - dy))
                 model.audioTrackHeights[rt.trackId] = Double(clamped)
             }
+            onCanvasWidthChanged?()
             NSCursor.resizeUpDown.set()
             needsDisplay = true
             return
@@ -1969,26 +2450,22 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             let dx = currentScreen.x - handPanInitialScreenPoint.x
             let maxOriginX = max(0.0, frame.width - clipView.bounds.width)
             let targetX = max(0.0, min(maxOriginX, handPanInitialOrigin.x - dx))
-            clipView.scroll(to: NSPoint(x: targetX, y: 0))
+            clipView.scroll(to: NSPoint(x: targetX, y: clipView.bounds.origin.y))
             enclosingScrollView?.reflectScrolledClipView(clipView)
             NSCursor.closedHand.set()
             return
         }
 
-        if isFloatingSlipActive, let clipId = slipClipId {
+        if isFloatingSlipActive, isSlipDragging, let clipId = slipClipId {
             let totalRange = max(0.05, slipBoundsMax - slipBoundsMin)
-            let hudW = max(230.0, min(420.0, max(slipClipFrame.width + 70.0, 250.0)))
+            let hudW = slipHUDWidth()
             let trackW = max(120.0, hudW - 20.0)
             let dx = localPoint.x - slipDragInitialX
             let deltaSec = Double(dx / trackW) * totalRange
-            let desiredIn = slipInitialSourceIn + deltaSec
+            let desiredIn = slipDragAnchorSourceIn + deltaSec
             if let res = model.slipClipWithinSelection(clipId: clipId, newSourceIn: desiredIn) {
                 slipCurrentSourceIn = res.newIn
-                let now = CFAbsoluteTimeGetCurrent()
-                if now - lastLiveSlipPreviewTime > 0.12 {
-                    lastLiveSlipPreviewTime = now
-                    onLiveSlipPreview?()
-                }
+                emitSlipDualPreview(forClipId: clipId, currentSourceIn: res.newIn, sourceDur: slipSourceDur)
                 needsDisplay = true
             }
             return
@@ -2092,40 +2569,71 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         }
 
         if isTrimmingEdge, let clipId = activeTrimClipId {
-            if model.isCageLockActive && activeTrimIsVideo && !model.activeCageBoundaries().isEmpty {
+            if model.isCageLockActive && model.isSnappingActive && activeTrimIsVideo && !model.activeCageIntervals().isEmpty {
                 let targetX = max(headerWidth, localPoint.x)
                 let cursorSec = max(0, Double(targetX - headerWidth) / pixelsPerSecond)
-                if let targetBoundary = model.nearestCageBoundary(to: cursorSec) {
-                    var currentEdgeSec: Double?
-                    for track in model.videoTracks {
-                        if let c = track.clips.first(where: { $0.id == clipId }) {
-                            let startSec = CMTimeGetSeconds(c.timelineStart)
-                            currentEdgeSec = activeTrimIsStart ? startSec : (startSec + CMTimeGetSeconds(c.duration))
-                            break
-                        }
+                let didTrim = model.trimClipEdgeInCages(
+                    clipId: clipId,
+                    isStart: activeTrimIsStart,
+                    targetTimeSeconds: cursorSec
+                )
+                if didTrim {
+                    didTrimCurrentEdge = true
+                    dragInitialPoint = localPoint
+                    updateWidth()
+                    needsDisplay = true
+                }
+            } else if !activeTrimIsVideo && model.isSnappingActive {
+                let rawEdgeSec = max(0.0, trimInitialEdgeTimeSec + Double(localPoint.x - trimStartAnchorX) / pixelsPerSecond)
+                let snapThresholdSec = 10.0 / pixelsPerSecond
+                var focalPts = model.timelineFocalPoints(excludingClipIds: [clipId])
+                let playheadSec = CMTimeGetSeconds(playbackController.currentTime)
+                if playheadSec.isFinite && playheadSec >= 0 {
+                    focalPts.append(playheadSec)
+                }
+
+                var bestPt: Double? = nil
+                var bestDiff = snapThresholdSec
+                for pt in focalPts {
+                    let diff = abs(rawEdgeSec - pt)
+                    if diff < bestDiff {
+                        bestDiff = diff
+                        bestPt = pt
                     }
-                    if let edgeSec = currentEdgeSec {
-                        let deltaSec = targetBoundary - edgeSec
-                        if abs(deltaSec) >= 0.001 {
-                            let didTrim = model.trimClipEdge(
-                                clipId: clipId,
-                                isStart: activeTrimIsStart,
-                                deltaSeconds: deltaSec,
-                                isVideo: activeTrimIsVideo
-                            )
-                            if didTrim {
-                                didTrimCurrentEdge = true
-                                dragInitialPoint = localPoint
-                                updateWidth()
-                                needsDisplay = true
-                            }
+                }
+
+                let desiredEdgeSec = bestPt ?? rawEdgeSec
+                activeSnapLineTime = bestPt.map { CMTime(seconds: $0, preferredTimescale: 600) }
+
+                var currentEdgeSec: Double? = nil
+                for track in model.audioTracks {
+                    if let c = track.clips.first(where: { $0.id == clipId }) {
+                        currentEdgeSec = activeTrimIsStart ? CMTimeGetSeconds(c.timelineStart) : CMTimeGetSeconds(c.timelineEnd)
+                        break
+                    }
+                }
+                if let curEdge = currentEdgeSec {
+                    let deltaSec = desiredEdgeSec - curEdge
+                    if abs(deltaSec) >= 0.0005 {
+                        let didTrim = model.trimClipEdge(
+                            clipId: clipId,
+                            isStart: activeTrimIsStart,
+                            deltaSeconds: deltaSec,
+                            isVideo: false
+                        )
+                        if didTrim {
+                            didTrimCurrentEdge = true
+                            dragInitialPoint = localPoint
+                            updateWidth()
                         }
                     }
                 }
+                needsDisplay = true
             } else {
+                activeSnapLineTime = nil
                 let deltaX = localPoint.x - dragInitialPoint.x
                 let deltaSec = Double(deltaX) / pixelsPerSecond
-                if abs(deltaSec) >= 0.005 {
+                if abs(deltaSec) >= 0.001 {
                     let didTrim = model.trimClipEdge(
                         clipId: clipId,
                         isStart: activeTrimIsStart,
@@ -2144,6 +2652,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         }
 
         if isScrubbingRuler {
+            onUserPlayheadScrubbed?()
             let targetX = max(headerWidth, localPoint.x)
             let targetSeconds = max(0, Double(targetX - headerWidth) / pixelsPerSecond)
             let targetTime = CMTime(seconds: targetSeconds, preferredTimescale: 600)
@@ -2165,7 +2674,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                 if let hoveredCage = cages.first(where: { cursorSec >= $0.startSeconds && cursorSec <= $0.endSeconds })
                     ?? model.nearestCageStart(to: cursorSec) {
                     cageReorderTargetIndex = hoveredCage.index
-                    let lockedClips = (dragInitialTrackIndex < model.videoTracks.count ? model.videoTracks[dragInitialTrackIndex].clips : []).filter { $0.isLocked }
+                    let lockedClips = (dragInitialTrackIndex < model.videoTracks.count ? model.videoTracks[dragInitialTrackIndex].clips : []).filter { $0.isEffectivelyLocked }
                     cageReorderTargetBlocked = lockedClips.contains { lc in
                         let ls = CMTimeGetSeconds(lc.timelineStart)
                         let le = CMTimeGetSeconds(lc.timelineEnd)
@@ -2182,14 +2691,39 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             var newTime = CMTime(seconds: rawSeconds, preferredTimescale: 600)
 
             var clipDuration = CMTime(seconds: 1.0, preferredTimescale: 600)
+            var draggedClipObj: TimelineClip? = nil
             if draggedClipIsVideo {
                 for track in model.videoTracks {
-                    if let c = track.clips.first(where: { $0.id == clipId }) { clipDuration = c.duration; break }
+                    if let c = track.clips.first(where: { $0.id == clipId }) { clipDuration = c.duration; draggedClipObj = c; break }
                 }
             } else {
                 for track in model.audioTracks {
-                    if let c = track.clips.first(where: { $0.id == clipId }) { clipDuration = c.duration; break }
+                    if let c = track.clips.first(where: { $0.id == clipId }) { clipDuration = c.duration; draggedClipObj = c; break }
                 }
+            }
+
+            // Target Track calculation (computed before snap so audio beat-snapping knows target track vs other tracks)
+            var targetTrackIndex = dragInitialTrackIndex
+            let maxVAllowed = min(model.maxVideoTracks - 1, preDragVideoTrackCount)
+            let maxAAllowed = min(model.maxAudioTracks - 1, preDragAudioTrackCount)
+
+            if draggedClipIsVideo {
+                targetTrackIndex = videoTrackIndex(atY: localPoint.y, sepY: sepY, maxTrackIndex: maxVAllowed)
+                if targetTrackIndex == model.videoTracks.count && targetTrackIndex <= maxVAllowed {
+                    model.ensureVideoTrack(id: targetTrackIndex)
+                    onCanvasWidthChanged?()
+                }
+            } else {
+                targetTrackIndex = audioTrackIndex(atY: localPoint.y, sepY: sepY, maxTrackIndex: maxAAllowed)
+                if targetTrackIndex == model.audioTracks.count && targetTrackIndex <= maxAAllowed {
+                    model.ensureAudioTrack(id: targetTrackIndex)
+                    onCanvasWidthChanged?()
+                }
+            }
+
+            if (draggedClipIsVideo && model.videoTracks[targetTrackIndex].isLocked) ||
+               (!draggedClipIsVideo && model.audioTracks[targetTrackIndex].isLocked) {
+                targetTrackIndex = dragInitialTrackIndex
             }
 
             // Snapping / Cage Lock calculation
@@ -2203,7 +2737,15 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                 }
             } else {
                 let snapThreshold = 10.0 / pixelsPerSecond
-                let snapRes = model.snap(startTime: newTime, duration: clipDuration, playhead: playbackController.currentTime, thresholdSeconds: snapThreshold)
+                let snapRes = model.snap(
+                    startTime: newTime,
+                    duration: clipDuration,
+                    playhead: playbackController.currentTime,
+                    thresholdSeconds: snapThreshold,
+                    draggedClip: draggedClipObj,
+                    targetTrackIndex: targetTrackIndex,
+                    isVideo: draggedClipIsVideo
+                )
                 if snapRes.didSnap {
                     newTime = snapRes.snappedTime
                     activeSnapLineTime = snapRes.snapPoint
@@ -2216,28 +2758,6 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
             let rawDeltaSec = CMTimeGetSeconds(newTime) - CMTimeGetSeconds(dragInitialStartTime)
             let clampedDeltaSec = max(-multiDragMinStartSeconds, rawDeltaSec)
             let effectiveNewTime = CMTime(seconds: max(0.0, CMTimeGetSeconds(dragInitialStartTime) + clampedDeltaSec), preferredTimescale: 600)
-
-            // Target Track calculation (capped to at most +1 extra track beyond preDragTrackCount)
-            var targetTrackIndex = dragInitialTrackIndex
-            let maxVAllowed = min(model.maxVideoTracks - 1, preDragVideoTrackCount)
-            let maxAAllowed = min(model.maxAudioTracks - 1, preDragAudioTrackCount)
-
-            if draggedClipIsVideo {
-                targetTrackIndex = videoTrackIndex(atY: localPoint.y, sepY: sepY, maxTrackIndex: maxVAllowed)
-                if targetTrackIndex == model.videoTracks.count && targetTrackIndex <= maxVAllowed {
-                    model.ensureVideoTrack(id: targetTrackIndex)
-                }
-            } else {
-                targetTrackIndex = audioTrackIndex(atY: localPoint.y, sepY: sepY, maxTrackIndex: maxAAllowed)
-                if targetTrackIndex == model.audioTracks.count && targetTrackIndex <= maxAAllowed {
-                    model.ensureAudioTrack(id: targetTrackIndex)
-                }
-            }
-
-            if (draggedClipIsVideo && model.videoTracks[targetTrackIndex].isLocked) ||
-               (!draggedClipIsVideo && model.audioTracks[targetTrackIndex].isLocked) {
-                targetTrackIndex = dragInitialTrackIndex
-            }
 
             // Compute vertical delta across selected same-media clips safely
             var trackDelta = targetTrackIndex - dragInitialTrackIndex
@@ -2387,24 +2907,29 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         let localPoint = convert(event.locationInWindow, from: nil)
         activeSnapLineTime = nil
 
-        if resizingTrack != nil {
+        if isDraggingCenterDivider || resizingTrack != nil {
+            isDraggingCenterDivider = false
             resizingTrack = nil
+            onCanvasWidthChanged?()
             NSCursor.arrow.set()
             return
         }
 
         if isFloatingSlipActive {
-            finishFloatingSlipIfActive()
+            if isSlipDragging {
+                isSlipDragging = false
+                slipDragAnchorSourceIn = slipCurrentSourceIn
+                needsDisplay = true
+            }
+            if !isTabKeyHeld {
+                finishFloatingSlipIfActive()
+            }
             return
         }
 
         if isHandPanning {
             isHandPanning = false
-            if isPointInHandPanZone(localPoint) {
-                NSCursor.openHand.set()
-            } else {
-                NSCursor.arrow.set()
-            }
+            NSCursor.arrow.set()
             return
         }
 
@@ -2536,13 +3061,14 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         }
 
         // Convert vertical mouse wheel scrolling into smooth horizontal timeline scrolling
-        if abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX) && abs(event.scrollingDeltaX) < 0.5,
-           let clipView = enclosingScrollView?.contentView {
+        if let clipView = enclosingScrollView?.contentView,
+           frame.height <= clipView.bounds.height + 1.0,
+           abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX) && abs(event.scrollingDeltaX) < 0.5 {
             let step = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 14.0
             let maxX = max(0, frame.width - clipView.bounds.width)
             let targetX = max(0, min(maxX, clipView.bounds.origin.x - step))
             if abs(targetX - clipView.bounds.origin.x) > 0.01 {
-                clipView.scroll(to: NSPoint(x: targetX, y: 0))
+                clipView.scroll(to: NSPoint(x: targetX, y: clipView.bounds.origin.y))
                 enclosingScrollView?.reflectScrolledClipView(clipView)
             }
             return
@@ -2556,6 +3082,8 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
     }
 
     public override func rightMouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        onSectionActivated?()
         let localPoint = convert(event.locationInWindow, from: nil)
         guard localPoint.y > rulerHeight else { return }
 
@@ -2603,173 +3131,16 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         }
 
         if let hit = clickedClip {
-            let clip = hit.clip
-            model.selectedClipId = clip.id
-            needsDisplay = true
-
-            let clickedDisplaySec = max(0.0, Double(localPoint.x - headerWidth) / pixelsPerSecond)
-            let clickedTimelineSec = CMTimeGetSeconds(clip.timelineStart) + (clickedDisplaySec - CMTimeGetSeconds(hit.displayStart))
-            var items: [VisionMenuItem] = [
-                .header(clip.mediaItem.name)
-            ]
-
-            if let mHit = markerHit {
-                let deleteTitle: String
-                switch mHit.kind {
-                case .clipBeat: deleteTitle = "Elimina questo Beat Marker"
-                case .clipManual: deleteTitle = "Elimina questo marcatore"
-                case .timelineCageBar: deleteTitle = "Elimina questa sbarra ritmica"
-                }
-                items.append(.action(
-                    title: deleteTitle,
-                    icon: .trash,
-                    shortcut: "⌫",
-                    isDestructive: true
-                ) { [weak self] in
-                    guard let self else { return }
-                    self.selectedMarker = mHit
-                    if self.deleteSelectedMarker() {
-                        self.notifyModified("Elimina Marcatore")
-                    }
-                })
-                items.append(.separator)
-            }
-
-            items.append(.action(
-                title: clip.isLocked ? "Sblocca clip (proteggi da Auto-Fill)" : "Blocca clip (proteggi da Auto-Fill)",
-                icon: clip.isLocked ? .unlock : .lock,
-                iconColor: .systemOrange,
-                shortcut: "L"
-            ) { [weak self] in
-                guard let self else { return }
-                let res = self.model.toggleClipLock(clipId: clip.id)
-                if res.toggledCount > 0 {
-                    self.needsDisplay = true
-                    self.notifyModified(res.isNowLocked ? "Blocca Clip (L)" : "Sblocca Clip (L)")
-                }
-            })
-            items.append(.separator)
-
-            let applyPriority: (Int?, String) -> Void = { [weak self] priority, label in
-                guard let self else { return }
-                if self.model.setClipPriority(clipId: clip.id, priority: priority).updatedCount > 0 {
-                    self.needsDisplay = true
-                    self.notifyModified(label)
-                }
-            }
-            let priorityChildren: [VisionMenuItem] = [
-                .action(
-                    title: "1 — Hero (Priorità alta)",
-                    icon: .flag,
-                    iconColor: priorityColor(for: 1),
-                    shortcut: "1",
-                    isSelected: clip.priority == 1
-                ) {
-                    applyPriority(1, "Priorità Clip (Hero)")
-                },
-                .action(
-                    title: "2 — Buona",
-                    icon: .flag,
-                    iconColor: priorityColor(for: 2),
-                    shortcut: "2",
-                    isSelected: clip.priority == 2
-                ) {
-                    applyPriority(2, "Priorità Clip (Buona)")
-                },
-                .action(
-                    title: "3 — Secondaria / Filler",
-                    icon: .flag,
-                    iconColor: priorityColor(for: 3),
-                    shortcut: "3",
-                    isSelected: clip.priority == 3
-                ) {
-                    applyPriority(3, "Priorità Clip (Filler)")
-                },
-                .separator,
-                .action(
-                    title: "Rimuovi priorità",
-                    shortcut: "0",
-                    isSelected: clip.priority == nil
-                ) {
-                    applyPriority(nil, "Rimuovi Priorità Clip")
-                }
-            ]
-            items.append(.submenu(title: "Priorità clip", icon: .flag, iconColor: clip.priority.flatMap { priorityColor(for: $0) }, items: priorityChildren))
-            items.append(.separator)
-
-            items.append(.action(title: "Aggiungi / Rimuovi marcatore qui", icon: .bookmark, iconColor: .systemOrange, shortcut: "M") { [weak self] in
-                if self?.model.toggleMarker(clipId: clip.id, at: clickedTimelineSec) == true {
-                    self?.needsDisplay = true
-                    self?.notifyModified("Marcatore Clip")
-                }
-            })
-
-            if !clip.markers.isEmpty {
-                items.append(.action(title: "Copia timestamp marcatori (\(clip.markers.count))", icon: .copy) { [weak self] in
-                    self?.copyClipMarkers(clipId: clip.id)
-                })
-                items.append(.action(title: "Pulisci marcatori clip (\(clip.markers.count))", icon: .trash, shortcut: "⌥M", isDestructive: true) { [weak self] in
-                    if self?.model.clearMarkers(clipId: clip.id) == true {
-                        self?.needsDisplay = true
-                        self?.notifyModified("Rimuovi Marcatori Clip")
-                        DebugLogger.shared.log("Marcatori rimossi dalla clip.", level: .info)
-                    }
-                })
-            }
-
-            if hit.isVideo {
-                items.append(.separator)
-                items.append(.action(
-                    title: abs(clip.speed - 0.5) < 0.01 ? "Velocità 100% (in Gabbia)" : "Slow-Mo 50% (in Gabbia)",
-                    icon: .zap,
-                    iconColor: .systemCyan,
-                    shortcut: "R",
-                    isEnabled: !clip.isLocked
-                ) { [weak self] in
-                    guard let self else { return }
-                    if self.model.toggleClipSpeed(clipId: clip.id) != nil {
-                        self.needsDisplay = true
-                        self.notifyModified("Slow Motion in Gabbia (R)")
-                    }
-                })
-                if !model.activeCageIntervals().isEmpty {
-                    items.append(.action(
-                        title: clip.span > 1 ? "Riduci Slow-Mo a 1 Gabbia (100%)" : "Slow-Mo 50% su 2 Gabbie",
-                        icon: .sparkles,
-                        iconColor: .systemOrange,
-                        shortcut: "⌘R",
-                        isEnabled: !clip.isLocked
-                    ) { [weak self] in
-                        guard let self else { return }
-                        let res = self.model.toggleSlowMoMultiCage(clipId: clip.id)
-                        if res.didChange {
-                            self.needsDisplay = true
-                            self.notifyModified(res.newSpan > 1 ? "Slow-Mo 2 Gabbie (⌘R)" : "Riduci a 1 Gabbia (⌘R)")
-                        }
-                    })
-                }
-                items.append(.separator)
-                let orientChildren: [VisionMenuItem] = ClipOrientation.allCases.map { orient in
-                    .action(title: orient.rawValue, isSelected: clip.orientation == orient) { [weak self] in
-                        self?.model.setClipOrientation(id: clip.id, orientation: orient)
-                        DebugLogger.shared.log("Orientamento clip aggiornato a: \(orient.rawValue)", level: .info)
-                        self?.needsDisplay = true
-                        self?.notifyModified("Orientamento Clip")
-                    }
-                }
-                items.append(.submenu(title: "Orientamento clip", icon: .rotateCw, items: orientChildren))
-            } else {
-                items.append(.separator)
-                items.append(.action(
-                    title: "Beat Finder (Analisi & Sbarre)...",
-                    icon: .wandSparkles,
-                    iconColor: .systemCyan
-                ) { [weak self] in
-                    self?.onOpenBeatFinderForClip?(clip)
-                })
-            }
-
-            VisionMenu(items: items).show(for: event, in: self)
+            presentClipContextMenu(
+                for: hit.clip,
+                displayStart: hit.displayStart,
+                isVideo: hit.isVideo,
+                clickedTimelineSeconds: CMTimeGetSeconds(hit.clip.timelineStart) + (max(0.0, Double(localPoint.x - headerWidth) / pixelsPerSecond) - CMTimeGetSeconds(hit.displayStart)),
+                markerHit: markerHit,
+                extraTopItems: [],
+                event: event,
+                in: self
+            )
             return
         }
 
@@ -2838,6 +3209,300 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         }
     }
 
+    /// Costruisce e mostra il menu contestuale completo della Timeline per una clip (riusato anche da Timeline Grid).
+    fileprivate func presentClipContextMenu(
+        for clip: TimelineClip,
+        displayStart: CMTime? = nil,
+        isVideo: Bool,
+        clickedTimelineSeconds: Double? = nil,
+        markerHit: MarkerTarget? = nil,
+        extraTopItems: [VisionMenuItem] = [],
+        event: NSEvent,
+        in sourceView: NSView
+    ) {
+        if !model.selectedClipIds.contains(clip.id) {
+            model.selectedClipIds = model.linkedSelectionIds(for: [clip.id])
+        }
+        let targetIds: Set<UUID> = model.selectedClipIds.contains(clip.id) && model.selectedClipIds.count > 1
+            ? model.selectedClipIds
+            : [clip.id]
+        needsDisplay = true
+
+        let clickedTimelineSec: Double = {
+            if let explicit = clickedTimelineSeconds { return explicit }
+            let realPlayhead = model.isSmartFilterActive
+                ? CMTimeGetSeconds(model.realTimelineTime(forDisplayedTime: playbackController.accurateCurrentTime))
+                : CMTimeGetSeconds(playbackController.accurateCurrentTime)
+            let cs = CMTimeGetSeconds(clip.timelineStart)
+            let ce = CMTimeGetSeconds(clip.timelineEnd)
+            if realPlayhead >= cs && realPlayhead <= ce {
+                return realPlayhead
+            }
+            return cs
+        }()
+
+        var items: [VisionMenuItem] = [
+            .header(targetIds.count > 1 ? "\(targetIds.count) clip selezionate" : clip.mediaItem.name)
+        ]
+
+        if !extraTopItems.isEmpty {
+            items.append(contentsOf: extraTopItems)
+            items.append(.separator)
+        }
+
+        if let mHit = markerHit {
+            let deleteTitle: String
+            switch mHit.kind {
+            case .clipBeat: deleteTitle = "Elimina questo Beat Marker"
+            case .clipManual: deleteTitle = "Elimina questo marcatore"
+            case .timelineCageBar: deleteTitle = "Elimina questa sbarra ritmica"
+            }
+            items.append(.action(
+                title: deleteTitle,
+                icon: .trash,
+                shortcut: "⌫",
+                isDestructive: true
+            ) { [weak self] in
+                guard let self else { return }
+                self.selectedMarker = mHit
+                if self.deleteSelectedMarker() {
+                    self.notifyModified("Elimina Marcatore")
+                }
+            })
+            items.append(.separator)
+        }
+
+        items.append(.action(
+            title: clip.isApproved ? "Rimuovi approvazione (✓)" : "Approva clip (✓)",
+            icon: .check,
+            iconColor: .systemGreen,
+            shortcut: "\\"
+        ) { [weak self] in
+            guard let self else { return }
+            let res = self.model.toggleClipApproved(clipId: clip.id)
+            if res.toggledCount > 0 {
+                self.needsDisplay = true
+                self.notifyModified(res.isNowApproved ? "Approva Clip (\\)" : "Rimuovi Approvazione (\\)")
+            }
+        })
+
+        items.append(.action(
+            title: clip.isLocked ? "Sblocca clip (proteggi da Auto-Fill)" : "Blocca clip (proteggi da Auto-Fill)",
+            icon: clip.isLocked ? .unlock : .lock,
+            iconColor: .systemOrange,
+            shortcut: "L",
+            isEnabled: !clip.isApproved
+        ) { [weak self] in
+            guard let self else { return }
+            let res = self.model.toggleClipLock(clipId: clip.id)
+            if res.toggledCount > 0 {
+                self.needsDisplay = true
+                self.notifyModified(res.isNowLocked ? "Blocca Clip (L)" : "Sblocca Clip (L)")
+            }
+        })
+
+        let anchorScreenPoint = sourceView.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
+        let anchorScreenRect = NSRect(origin: anchorScreenPoint, size: NSSize(width: 2, height: 2))
+        items.append(.action(
+            title: "Colore clip...",
+            icon: .palette,
+            iconColor: clip.colorTag?.nsColor ?? .systemCyan,
+            shortcut: "C"
+        ) { [weak self] in
+            self?.presentColorPalette(forClipIds: targetIds, anchorScreenRect: anchorScreenRect)
+        })
+        items.append(.separator)
+
+        let applyPriority: (Int?, String) -> Void = { [weak self] priority, label in
+            guard let self else { return }
+            if self.model.setClipPriority(clipId: clip.id, priority: priority).updatedCount > 0 {
+                self.needsDisplay = true
+                self.notifyModified(label)
+            }
+        }
+        let priorityChildren: [VisionMenuItem] = [
+            .action(
+                title: "4 — Dialogo / Intera (Massima)",
+                icon: .flag,
+                iconColor: priorityColor(for: 4),
+                shortcut: "4",
+                isSelected: clip.priority == 4
+            ) {
+                applyPriority(4, "Priorità 4 — Dialogo / Intera")
+            },
+            .separator,
+            .action(
+                title: "1 — Hero (Priorità alta)",
+                icon: .flag,
+                iconColor: priorityColor(for: 1),
+                shortcut: "1",
+                isSelected: clip.priority == 1
+            ) {
+                applyPriority(1, "Priorità Clip (Hero)")
+            },
+            .action(
+                title: "2 — Buona",
+                icon: .flag,
+                iconColor: priorityColor(for: 2),
+                shortcut: "2",
+                isSelected: clip.priority == 2
+            ) {
+                applyPriority(2, "Priorità Clip (Buona)")
+            },
+            .action(
+                title: "3 — Secondaria / Filler",
+                icon: .flag,
+                iconColor: priorityColor(for: 3),
+                shortcut: "3",
+                isSelected: clip.priority == 3
+            ) {
+                applyPriority(3, "Priorità Clip (Filler)")
+            },
+            .separator,
+            .action(
+                title: "Rimuovi priorità",
+                shortcut: "0",
+                isSelected: clip.priority == nil
+            ) {
+                applyPriority(nil, "Rimuovi Priorità Clip")
+            }
+        ]
+        items.append(.submenu(title: "Priorità clip", icon: .flag, iconColor: clip.priority.flatMap { priorityColor(for: $0) }, items: priorityChildren))
+        items.append(.separator)
+
+        items.append(.action(title: "Aggiungi / Rimuovi marcatore qui", icon: .bookmark, iconColor: .systemOrange, shortcut: "M") { [weak self] in
+            if self?.model.toggleMarker(clipId: clip.id, at: clickedTimelineSec) == true {
+                self?.needsDisplay = true
+                self?.notifyModified("Marcatore Clip")
+            }
+        })
+
+        if !clip.markers.isEmpty {
+            items.append(.action(title: "Copia timestamp marcatori (\(clip.markers.count))", icon: .copy) { [weak self] in
+                self?.copyClipMarkers(clipId: clip.id)
+            })
+            items.append(.action(title: "Pulisci marcatori clip (\(clip.markers.count))", icon: .trash, shortcut: "⌥M", isDestructive: true) { [weak self] in
+                if self?.model.clearMarkers(clipId: clip.id) == true {
+                    self?.needsDisplay = true
+                    self?.notifyModified("Rimuovi Marcatori Clip")
+                    DebugLogger.shared.log("Marcatori rimossi dalla clip.", level: .info)
+                }
+            })
+        }
+
+        if isVideo {
+            items.append(.separator)
+            let reqSlowMoFPS = TimelineModel.formatFPSLabel(model.format.fps * 2.0)
+            let canSlowMo = model.canSlowMoClip(clip)
+            let isAlreadySlowed = clip.speed < 0.99
+
+            items.append(.action(
+                title: isAlreadySlowed ? "Velocità 100% (in Gabbia)" : (canSlowMo ? "Slow-Mo 50% (in Gabbia)" : "Slow-Mo 50% (richiede ≥ \(reqSlowMoFPS)fps)"),
+                icon: .zap,
+                iconColor: .systemCyan,
+                shortcut: "R",
+                isEnabled: !clip.isEffectivelyLocked && (isAlreadySlowed || canSlowMo)
+            ) { [weak self] in
+                guard let self else { return }
+                let res = self.model.toggleClipSpeedDetailed(clipId: clip.id)
+                if res.newSpeed != nil {
+                    self.needsDisplay = true
+                    self.notifyModified("Slow Motion in Gabbia (R)")
+                } else if let msg = res.errorMessage {
+                    self.onShowWarningToast?(msg)
+                }
+            })
+            let canRippleSlowMo = isAlreadySlowed || canSlowMo
+            items.append(.action(
+                title: isAlreadySlowed ? "Velocità 100% con scarto" : (canSlowMo ? "Slow-Mo 50% con scarto" : "Slow-Mo 50% con scarto (richiede ≥ \(reqSlowMoFPS)fps)"),
+                icon: .sparkles,
+                iconColor: .systemOrange,
+                shortcut: "⌘R",
+                isEnabled: !clip.isEffectivelyLocked && canRippleSlowMo
+            ) { [weak self] in
+                guard let self else { return }
+                let res = self.model.toggleSlowMoMultiCage(clipId: clip.id)
+                if res.didChange {
+                    self.needsDisplay = true
+                    self.notifyModified(res.newSpeed < 0.99 ? "Slow Motion 50% con scarto (⌘R)" : "Velocità 100% con scarto (⌘R)")
+                } else if let msg = res.errorMessage {
+                    self.onShowWarningToast?(msg)
+                }
+            })
+            if !model.activeCageIntervals().isEmpty {
+                items.append(.action(
+                    title: "Allinea alle Gabbie (±6 frame)",
+                    icon: .tally3,
+                    iconColor: .systemCyan,
+                    shortcut: "⌥G",
+                    isEnabled: !clip.isEffectivelyLocked
+                ) { [weak self] in
+                    guard let self else { return }
+                    let res = self.model.alignSelectedClipsToCages(at: self.playbackController.accurateCurrentTime)
+                    if res.alignedCount > 0 {
+                        self.needsDisplay = true
+                        self.notifyModified("Allinea alle Gabbie (⌥G)")
+                    } else {
+                        self.onShowWarningToast?("Nessuna clip entro ±6 frame da una sbarra (o spazio insufficiente).")
+                    }
+                })
+            }
+            items.append(.separator)
+            let orientChildren: [VisionMenuItem] = ClipOrientation.allCases.map { orient in
+                .action(title: orient.rawValue, isSelected: clip.orientation == orient) { [weak self] in
+                    self?.model.setClipOrientation(id: clip.id, orientation: orient)
+                    DebugLogger.shared.log("Orientamento clip aggiornato a: \(orient.rawValue)", level: .info)
+                    self?.needsDisplay = true
+                    self?.notifyModified("Orientamento Clip")
+                }
+            }
+            items.append(.submenu(title: "Orientamento clip", icon: .rotateCw, items: orientChildren))
+        } else if !model.isSelection {
+            items.append(.separator)
+            items.append(.action(
+                title: "Beat Finder (Analisi & Sbarre)...",
+                icon: .wandSparkles,
+                iconColor: .systemCyan
+            ) { [weak self] in
+                self?.onOpenBeatFinderForClip?(clip)
+            })
+        }
+
+        if targetIds.count == 1 {
+            items.append(.action(title: "Ricollega / Cambia sorgente...", icon: .link, iconColor: .systemCyan) { [weak self] in
+                self?.onRelinkMediaItemRequested?(clip.mediaItem)
+            })
+        }
+
+        items.append(.separator)
+        items.append(.action(
+            title: targetIds.count > 1 ? "Elimina clip selezionate" : "Elimina clip",
+            icon: .trash,
+            shortcut: "⌫",
+            isDestructive: true
+        ) { [weak self] in
+            guard let self else { return }
+            let idsToDelete = Array(targetIds)
+            if targetIds.count == 1, !self.model.activeCageIntervals().isEmpty,
+               self.model.slotRippleDelete(clipId: clip.id) {
+                self.needsDisplay = true
+                self.notifyModified("Elimina Clip Ritmica")
+                return
+            }
+            if self.model.isRippleTrimMode || self.model.isSelection {
+                self.model.removeClipsWithRipple(ids: idsToDelete)
+                self.needsDisplay = true
+                self.notifyModified("Elimina Clip (Ripple)")
+            } else {
+                self.model.removeClipsWithoutRipple(ids: idsToDelete)
+                self.needsDisplay = true
+                self.notifyModified("Elimina Clip")
+            }
+        })
+
+        VisionMenu(items: items).show(for: event, in: sourceView)
+    }
+
     private func addVideoTrackFromContext() {
         guard model.videoTracks.count < model.maxVideoTracks else { return }
         model.ensureVideoTrack(id: model.videoTracks.count)
@@ -2875,6 +3540,57 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
         pb.clearContents()
         pb.setString(formatted, forType: .string)
         DebugLogger.shared.log("Timestamp marcatori copiati (\(clip.markers.count)): \(formatted)", level: .info)
+    }
+
+    public func presentColorPalette(forClipIds targetIds: Set<UUID>, anchorScreenRect: NSRect) {
+        guard !targetIds.isEmpty else { return }
+        let allClips = model.videoTracks.flatMap(\.clips) + model.audioTracks.flatMap(\.clips)
+        let matching = allClips.filter { targetIds.contains($0.id) }
+        guard !matching.isEmpty else { return }
+
+        let distinctColors = Set(matching.map(\.colorTag))
+        let hasMixed = distinctColors.count > 1
+        let currentColor = hasMixed ? nil : (distinctColors.first ?? nil)
+
+        ClipColorPalette.show(
+            currentColor: currentColor,
+            hasMixedColors: hasMixed,
+            targetCount: matching.count,
+            nearScreenRect: anchorScreenRect,
+            parentWindow: self.window
+        ) { [weak self] chosenColor in
+            guard let self = self else { return }
+            let res = self.model.setClipColor(chosenColor, forClipIds: targetIds)
+            if res.updatedCount > 0 {
+                self.needsDisplay = true
+                let actionTitle = chosenColor.map { "Colore Clip (\($0.displayName))" } ?? "Colore Clip (Default)"
+                self.notifyModified(actionTitle)
+                DebugLogger.shared.log("Colore aggiornato: \(res.summary)", level: .info)
+            }
+        }
+    }
+
+    public func rectInCanvas(forClipId clipId: UUID) -> CGRect? {
+        let sepY = separatorY
+        for track in model.videoTracks {
+            let trackH = heightForVideoTrack(track.id)
+            let trackY = yForVideoTrack(track.id, sepY: sepY)
+            for (clip, dStart) in model.displayedClips(isVideo: true, trackIndex: track.id) where clip.id == clipId {
+                let clipX = headerWidth + CGFloat(CMTimeGetSeconds(dStart) * pixelsPerSecond)
+                let clipW = max(8.0, CGFloat(CMTimeGetSeconds(clip.duration) * pixelsPerSecond))
+                return CGRect(x: clipX, y: trackY, width: clipW, height: trackH)
+            }
+        }
+        for track in model.audioTracks {
+            let trackH = heightForAudioTrack(track.id)
+            let trackY = yForAudioTrack(track.id, sepY: sepY)
+            for (clip, dStart) in model.displayedClips(isVideo: false, trackIndex: track.id) where clip.id == clipId {
+                let clipX = headerWidth + CGFloat(CMTimeGetSeconds(dStart) * pixelsPerSecond)
+                let clipW = max(8.0, CGFloat(CMTimeGetSeconds(clip.duration) * pixelsPerSecond))
+                return CGRect(x: clipX, y: trackY, width: clipW, height: trackH)
+            }
+        }
+        return nil
     }
 
     // MARK: - Tracking Areas & Tooltip Support
@@ -2976,6 +3692,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                 )
                 vClip.markers = sClip.markers
                 vClip.priority = sClip.priority
+                vClip.colorTag = sClip.colorTag
                 if !model.hasLockedClipOverlap(start: vClip.timelineStart, end: vClip.timelineEnd, trackIndex: 0, isVideo: true) {
                     model.overwriteAndInsert(incoming: vClip, trackIndex: 0, isVideo: true)
                 }
@@ -2992,6 +3709,7 @@ public final class TimelineCanvasView: NSView, NSViewToolTipOwner {
                     )
                     aClip.markers = sClip.markers
                     aClip.priority = sClip.priority
+                    aClip.colorTag = sClip.colorTag
                     if !model.hasLockedClipOverlap(start: aClip.timelineStart, end: aClip.timelineEnd, trackIndex: 0, isVideo: false) {
                         model.overwriteAndInsert(incoming: aClip, trackIndex: 0, isVideo: false)
                     }
@@ -3175,9 +3893,13 @@ private final class TimelinePillButton: NSView {
     var onClicked: (() -> Void)?
     private let iconView = NSImageView()
     private let titleLabel = NSTextField(labelWithString: "")
+    private let chevronView = NSImageView()
+    private var chevronWidthConstraint: NSLayoutConstraint!
+    private var chevronLeadingConstraint: NSLayoutConstraint!
     private var trackingArea: NSTrackingArea?
     private var isHovered = false
     private var isSelectionStyle = false
+    private var isCompareStyle = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -3193,8 +3915,15 @@ private final class TimelinePillButton: NSView {
         titleLabel.isSelectable = false
         titleLabel.drawsBackground = false
 
+        chevronView.translatesAutoresizingMaskIntoConstraints = false
+        chevronView.isHidden = true
+
         addSubview(iconView)
         addSubview(titleLabel)
+        addSubview(chevronView)
+
+        chevronLeadingConstraint = chevronView.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 0)
+        chevronWidthConstraint = chevronView.widthAnchor.constraint(equalToConstant: 0)
 
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 24),
@@ -3204,8 +3933,14 @@ private final class TimelinePillButton: NSView {
             iconView.heightAnchor.constraint(equalToConstant: 13),
 
             titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 6),
-            titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            chevronLeadingConstraint,
+            chevronWidthConstraint,
+            chevronView.heightAnchor.constraint(equalToConstant: 11),
+            chevronView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            chevronView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
+
             widthAnchor.constraint(lessThanOrEqualToConstant: 240)
         ])
         applyColors()
@@ -3213,14 +3948,19 @@ private final class TimelinePillButton: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func configure(name: String, isSelection: Bool) {
+    func configure(name: String, isSelection: Bool, isCompare: Bool = false, showDropdownIndicator: Bool = false) {
         isSelectionStyle = isSelection
-        titleLabel.stringValue = name
-        iconView.image = Lucide.image(
-            isSelection ? .sparkles : .clapperboard,
-            size: 13,
-            color: isSelection ? .systemPurple : .systemCyan
-        )
+        isCompareStyle = isCompare
+        titleLabel.stringValue = isCompare ? "\(name) (Temporanea)" : name
+        let icon: LucideIcon = isCompare ? .scale : (isSelection ? .sparkles : .clapperboard)
+        let tint: NSColor = isCompare ? .systemYellow : (isSelection ? .systemPurple : .systemCyan)
+        iconView.image = Lucide.image(icon, size: 13, color: tint)
+        chevronView.isHidden = !showDropdownIndicator
+        chevronLeadingConstraint.constant = showDropdownIndicator ? 5 : 0
+        chevronWidthConstraint.constant = showDropdownIndicator ? 11 : 0
+        chevronView.image = showDropdownIndicator
+            ? Lucide.image(.chevronDown, size: 11, color: NSColor(calibratedWhite: 0.78, alpha: 1.0))
+            : nil
         applyColors()
     }
 
@@ -3249,7 +3989,11 @@ private final class TimelinePillButton: NSView {
     }
 
     private func applyColors() {
-        if isSelectionStyle {
+        if isCompareStyle {
+            layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(isHovered ? 0.24 : 0.16).cgColor
+            layer?.borderColor = NSColor.systemYellow.withAlphaComponent(isHovered ? 0.70 : 0.48).cgColor
+            titleLabel.textColor = .systemYellow
+        } else if isSelectionStyle {
             layer?.backgroundColor = NSColor.systemPurple.withAlphaComponent(isHovered ? 0.24 : 0.16).cgColor
             layer?.borderColor = NSColor.systemPurple.withAlphaComponent(isHovered ? 0.65 : 0.45).cgColor
             titleLabel.textColor = NSColor(calibratedWhite: 0.95, alpha: 1.0)
@@ -3271,27 +4015,46 @@ public final class TimelineViewController: NSViewController {
     public var onSectionActivated: (() -> Void)?
     public var onSwitchTimeline: ((TimelineModel) -> Void)?
     public var onExportFCPXML: (() -> Void)?
-    public var onLiveSlipPreview: (() -> Void)?
+    public var onSlipDualPreviewUpdate: ((_ url: URL, _ inSeconds: Double, _ outSeconds: Double, _ fps: Double, _ clipName: String) -> Void)?
+    public var onSlipDualPreviewEnd: (() -> Void)?
+    public var onUserPlayheadScrubbed: (() -> Void)?
+    public var onShowWarningToast: ((String) -> Void)?
     public var onImportDroppedURLsToTimeline: ((_ urls: [URL], _ atTime: CMTime, _ targetTrackIndex: Int, _ isTargetVideo: Bool) -> Void)?
     public var onSmartFilterChanged: (() -> Void)?
+    public var onEnterCompareTimeline: ((TimelineModel) -> Void)?
+    public var onExitCompareTimeline: (() -> Void)?
+    public var onClipDoubleClicked: ((TimelineClip) -> Void)?
+    public var onRelinkMediaItemRequested: ((MediaItem) -> Void)?
 
     private var canvasView: TimelineCanvasView!
     private let scrollView = NSScrollView()
+    private let timelineScrollbar = TimelineHorizontalScrollbarView()
     private let timelineIndicatorBtn = TimelinePillButton()
     private let timecodeLabel = NSTextField(labelWithString: "00:00:00:00")
 
     // Pro NLE Toolbar Controls
+    private let editModeSwitchButton = FlatButton(title: "Con scarto")
     private let linkButton = IconActionButton(toolTip: "Link A/V (⌘L / ⌥L)")
     private let magnetButton = IconActionButton(toolTip: "Magnet / Snapping (N)")
     private let selectionFollowsPlayheadButton = IconActionButton(toolTip: "Seleziona clip sotto la testina (⌥P)")
-    private let cageLockButton = IconActionButton(toolTip: "Modalità Gabbie (Riordina, Tab+Drag Slip, Roll Sbarre)")
+    private let cageLockButton = IconActionButton(toolTip: "Modalità Gabbie (G): Riordina, Tab+Drag Slip, Roll Sbarre")
+    private let sourceBoundsSwitchButton = IconActionButton(toolTip: "Sorgente come Selezione (U)")
     private let rhythmicStudioButton = IconActionButton(toolTip: "Auto-Fill Ritmico da Selezione", isToggleMode: false)
-    private let zoomSlider = NSSlider()
+    private let compareButton = IconActionButton(toolTip: "Modalità Confronta: mostra in una timeline temporanea il materiale non in comune")
+    private let ghostGapsButton = IconActionButton(toolTip: "Evidenzia vuoti video in rosso (ignora tracce audio)")
+    private let compareExitButton = FlatButton(title: "✕ Esci Confronto")
+    private let zoomSlider = VisionSlider(value: 0.5, minValue: 0.0, maxValue: 1.0, defaultValue: 0.5)
+    private let fpsWarningButton = FlatButton(title: "⚠ FPS")
     private let filterButton = IconActionButton(toolTip: "Filtro Smart Selezione", isToggleMode: true)
     private var filterPopover: NSPopover?
+    private var comparePopover: NSPopover?
+    private let warningToastBox = NSView()
+    private let warningToastLabel = NSTextField(labelWithString: "")
+    private var warningToastDismissWork: DispatchWorkItem?
 
     private var lastObservedPlayheadTime: CMTime = .invalid
-    private let maxZoomPPS: Double = 150.0
+    private var suppressPlayheadSelectionUntil: CFAbsoluteTime = 0
+    private let maxZoomPPS: Double = 1800.0
     private let maxAdaptiveFitSeconds: Double = 7200.0 // 2 ore visibili max senza overflow
 
     public init(model: TimelineModel, playbackController: PlaybackController) {
@@ -3346,11 +4109,26 @@ public final class TimelineViewController: NSViewController {
         canvasView.onOpenBeatFinderForClip = { [weak self] clip in
             self?.openBeatFinder(for: clip)
         }
-        canvasView.onLiveSlipPreview = { [weak self] in
-            self?.onLiveSlipPreview?()
+        canvasView.onSlipDualPreviewUpdate = { [weak self] url, inSec, outSec, fps, name in
+            self?.onSlipDualPreviewUpdate?(url, inSec, outSec, fps, name)
+        }
+        canvasView.onSlipDualPreviewEnd = { [weak self] in
+            self?.onSlipDualPreviewEnd?()
+        }
+        canvasView.onUserPlayheadScrubbed = { [weak self] in
+            self?.onUserPlayheadScrubbed?()
+        }
+        canvasView.onShowWarningToast = { [weak self] msg in
+            self?.showWarningToast(msg)
         }
         canvasView.onImportDroppedURLsToTimeline = { [weak self] urls, atTime, trackIdx, isVideo in
             self?.onImportDroppedURLsToTimeline?(urls, atTime, trackIdx, isVideo)
+        }
+        canvasView.onClipDoubleClicked = { [weak self] clip in
+            self?.onClipDoubleClicked?(clip)
+        }
+        canvasView.onRelinkMediaItemRequested = { [weak self] item in
+            self?.onRelinkMediaItemRequested?(item)
         }
         canvasView.onCanvasWidthChanged = { [weak self] in
             self?.syncCanvasFrame()
@@ -3361,10 +4139,8 @@ public final class TimelineViewController: NSViewController {
 
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.documentView = canvasView
-        scrollView.hasHorizontalScroller = true
+        scrollView.hasHorizontalScroller = false
         scrollView.hasVerticalScroller = false
-        scrollView.scrollerStyle = .overlay
-        scrollView.autohidesScrollers = false
         scrollView.drawsBackground = true
         scrollView.backgroundColor = NSColor(calibratedWhite: 0.075, alpha: 1.0)
         scrollView.contentView.postsBoundsChangedNotifications = true
@@ -3375,6 +4151,25 @@ public final class TimelineViewController: NSViewController {
             object: scrollView.contentView
         )
         root.addSubview(scrollView)
+
+        timelineScrollbar.translatesAutoresizingMaskIntoConstraints = false
+        timelineScrollbar.isHidden = true
+        timelineScrollbar.onScrollFractionChanged = { [weak self] fraction in
+            guard let self = self else { return }
+            let clipView = self.scrollView.contentView
+            let maxOriginX = max(0.0, self.canvasView.frame.width - clipView.bounds.width)
+            guard maxOriginX > 0 else { return }
+            let targetX = max(0.0, min(maxOriginX, maxOriginX * fraction))
+            clipView.scroll(to: NSPoint(x: targetX, y: clipView.bounds.origin.y))
+            self.scrollView.reflectScrolledClipView(clipView)
+            self.canvasView.updatePlayheadLayer()
+            self.canvasView.needsDisplay = true
+            self.updateTimelineScrollbar()
+        }
+        timelineScrollbar.onScrollDeltaX = { [weak self] deltaX in
+            self?.scrollHorizontally(by: deltaX)
+        }
+        root.addSubview(timelineScrollbar)
 
         // Pinned top-left timecode badge inside the track headers area (104x26 above V1, left of ruler)
         let timecodeHeaderView = NSView()
@@ -3401,7 +4196,29 @@ public final class TimelineViewController: NSViewController {
         timecodeHeaderView.addSubview(timecodeLabel)
         root.addSubview(timecodeHeaderView)
 
+        warningToastBox.translatesAutoresizingMaskIntoConstraints = false
+        warningToastBox.wantsLayer = true
+        warningToastBox.layer?.backgroundColor = NSColor(calibratedRed: 0.22, green: 0.16, blue: 0.04, alpha: 0.94).cgColor
+        warningToastBox.layer?.borderColor = NSColor.systemYellow.withAlphaComponent(0.75).cgColor
+        warningToastBox.layer?.borderWidth = 1.0
+        warningToastBox.layer?.cornerRadius = 6.0
+        warningToastBox.isHidden = true
+
+        warningToastLabel.translatesAutoresizingMaskIntoConstraints = false
+        warningToastLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        warningToastLabel.textColor = .systemYellow
+        warningToastLabel.lineBreakMode = .byTruncatingTail
+        warningToastBox.addSubview(warningToastLabel)
+        root.addSubview(warningToastBox)
+
         NSLayoutConstraint.activate([
+            warningToastLabel.topAnchor.constraint(equalTo: warningToastBox.topAnchor, constant: 6),
+            warningToastLabel.bottomAnchor.constraint(equalTo: warningToastBox.bottomAnchor, constant: -6),
+            warningToastLabel.leadingAnchor.constraint(equalTo: warningToastBox.leadingAnchor, constant: 12),
+            warningToastLabel.trailingAnchor.constraint(equalTo: warningToastBox.trailingAnchor, constant: -12),
+            warningToastBox.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 8),
+            warningToastBox.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            warningToastBox.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, constant: -40),
             toolbar.topAnchor.constraint(equalTo: root.topAnchor),
             toolbar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             toolbar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -3411,6 +4228,11 @@ public final class TimelineViewController: NSViewController {
             scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+
+            timelineScrollbar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: canvasView.headerWidth),
+            timelineScrollbar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            timelineScrollbar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            timelineScrollbar.heightAnchor.constraint(equalToConstant: 14),
 
             timecodeHeaderView.topAnchor.constraint(equalTo: scrollView.topAnchor),
             timecodeHeaderView.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
@@ -3433,15 +4255,17 @@ public final class TimelineViewController: NSViewController {
 
         playbackController.addTimeObserver(self) { [weak self] time in
             guard let self = self else { return }
-            if self.model.isSelectionFollowsPlayhead {
+            let timeMoved = !self.lastObservedPlayheadTime.isValid || CMTimeCompare(time, self.lastObservedPlayheadTime) != 0
+            self.lastObservedPlayheadTime = time
+            // Attiva "selezione sotto testina" SOLO quando la testina si sposta realmente,
+            // preservando la selezione singola/multipla mentre spostiamo le clip a testina ferma o selezioniamo da Grid.
+            if self.model.isSelectionFollowsPlayhead && timeMoved && CFAbsoluteTimeGetCurrent() >= self.suppressPlayheadSelectionUntil {
                 let prevSelected = self.model.selectedClipIds
                 self.model.updateSelectionAtPlayhead(time: time)
                 if self.model.selectedClipIds != prevSelected {
                     self.canvasView.needsDisplay = true
                 }
             }
-            let timeMoved = !self.lastObservedPlayheadTime.isValid || CMTimeCompare(time, self.lastObservedPlayheadTime) != 0
-            self.lastObservedPlayheadTime = time
             if self.playbackController.isPlaying || timeMoved {
                 self.autoScrollToKeepPlayheadVisible(at: time)
             }
@@ -3464,23 +4288,51 @@ public final class TimelineViewController: NSViewController {
         super.viewDidLayout()
         syncAdaptiveZoomBounds()
         syncCanvasFrame()
+        updateTimelineScrollbar()
     }
 
     @objc private func onScrollViewBoundsChanged(_ note: Notification) {
         canvasView.updatePlayheadLayer()
         canvasView.needsDisplay = true
+        updateTimelineScrollbar()
     }
 
     private func syncCanvasFrame() {
         let clipSize = scrollView.contentView.bounds.size
         guard clipSize.width > 0 else { return }
+        let viewportH = max(180, clipSize.height)
         let targetW = max(clipSize.width, canvasView.calculatedTotalWidth)
-        let targetH = max(180, clipSize.height)
+        let targetH = max(viewportH, canvasView.calculatedTotalHeight(forViewportHeight: viewportH))
+        let needsVScroll = targetH > viewportH + 1.0
+        if scrollView.hasVerticalScroller != needsVScroll {
+            scrollView.hasVerticalScroller = needsVScroll
+            if needsVScroll {
+                scrollView.scrollerStyle = .overlay
+                scrollView.autohidesScrollers = false
+            }
+        }
         if abs(canvasView.frame.width - targetW) > 0.5 || abs(canvasView.frame.height - targetH) > 0.5 || canvasView.frame.origin != .zero {
             canvasView.frame = NSRect(x: 0, y: 0, width: targetW, height: targetH)
             scrollView.reflectScrolledClipView(scrollView.contentView)
             canvasView.needsDisplay = true
         }
+        updateTimelineScrollbar()
+    }
+
+    private func updateTimelineScrollbar() {
+        let clipBounds = scrollView.contentView.bounds
+        let totalW = canvasView.frame.width
+        let headerW = canvasView.headerWidth
+        let maxOriginX = max(0.0, totalW - clipBounds.width)
+        let overflows = maxOriginX > 0.5
+        timelineScrollbar.isHidden = !overflows
+        guard overflows else { return }
+
+        let scrollableContentW = max(1.0, totalW - headerW)
+        let visibleTimelineW = max(1.0, clipBounds.width - headerW)
+        let proportion = min(1.0, visibleTimelineW / scrollableContentW)
+        let fraction = max(0.0, min(1.0, clipBounds.origin.x / maxOriginX))
+        timelineScrollbar.updateState(thumbProportion: proportion, scrollFraction: fraction)
     }
 
     private func autoScrollToKeepPlayheadVisible(at time: CMTime) {
@@ -3498,19 +4350,19 @@ public final class TimelineViewController: NSViewController {
         if playheadX > clipBounds.maxX - edgeMargin {
             let targetOriginX = min(maxOriginX, max(0.0, playheadX - (clipBounds.width - edgeMargin)))
             if abs(targetOriginX - clipBounds.origin.x) > 0.5 {
-                clipView.scroll(to: NSPoint(x: targetOriginX, y: 0))
+                clipView.scroll(to: NSPoint(x: targetOriginX, y: clipBounds.origin.y))
                 scrollView.reflectScrolledClipView(clipView)
             }
         } else if playheadX < clipBounds.minX + headerW + 16.0 {
             let targetOriginX = max(0.0, playheadX - headerW - min(48.0, tracksVisibleW * 0.14))
             if abs(targetOriginX - clipBounds.origin.x) > 0.5 {
-                clipView.scroll(to: NSPoint(x: targetOriginX, y: 0))
+                clipView.scroll(to: NSPoint(x: targetOriginX, y: clipBounds.origin.y))
                 scrollView.reflectScrolledClipView(clipView)
             }
         }
     }
 
-    private func centerViewportOnPlayheadIfOutsideVisibleArea() {
+    public func centerViewportOnPlayheadIfOutsideVisibleArea() {
         let clipView = scrollView.contentView
         let clipBounds = clipView.bounds
         let headerW = canvasView.headerWidth
@@ -3527,75 +4379,104 @@ public final class TimelineViewController: NSViewController {
 
         let targetOriginX = max(0.0, min(maxOriginX, playheadX - (headerW + tracksVisibleW * 0.5)))
         if abs(targetOriginX - clipBounds.origin.x) > 0.5 {
-            clipView.scroll(to: NSPoint(x: targetOriginX, y: 0))
+            clipView.scroll(to: NSPoint(x: targetOriginX, y: clipBounds.origin.y))
             scrollView.reflectScrolledClipView(clipView)
             canvasView.updatePlayheadLayer()
         }
     }
 
     private func setupToolbar(_ toolbar: NSView) {
-        let toolbarScroll = NSScrollView()
-        toolbarScroll.translatesAutoresizingMaskIntoConstraints = false
-        toolbarScroll.drawsBackground = false
-        toolbarScroll.borderType = .noBorder
-        toolbarScroll.hasHorizontalScroller = true
-        toolbarScroll.hasVerticalScroller = false
-        toolbarScroll.autohidesScrollers = true
-        toolbarScroll.scrollerStyle = .overlay
-        toolbarScroll.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let leftStack = NSStackView()
+        leftStack.translatesAutoresizingMaskIntoConstraints = false
+        leftStack.orientation = .horizontal
+        leftStack.spacing = 6
+        leftStack.alignment = .centerY
+        toolbar.addSubview(leftStack)
 
-        let docView = NSView()
-        docView.translatesAutoresizingMaskIntoConstraints = false
+        let centerStack = NSStackView()
+        centerStack.translatesAutoresizingMaskIntoConstraints = false
+        centerStack.orientation = .horizontal
+        centerStack.spacing = 6
+        centerStack.alignment = .centerY
+        toolbar.addSubview(centerStack)
 
-        let stack = NSStackView()
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.orientation = .horizontal
-        stack.spacing = 6
-        stack.alignment = .centerY
-        docView.addSubview(stack)
-        toolbarScroll.documentView = docView
-        toolbar.addSubview(toolbarScroll)
+        let rightStack = NSStackView()
+        rightStack.translatesAutoresizingMaskIntoConstraints = false
+        rightStack.orientation = .horizontal
+        rightStack.spacing = 8
+        rightStack.alignment = .centerY
+        toolbar.addSubview(rightStack)
 
-        filterButton.translatesAutoresizingMaskIntoConstraints = false
-        filterButton.image = Lucide.template(.filter, size: 16)
-        filterButton.activeTintColor = .systemPurple
-        filterButton.target = self
-        filterButton.action = #selector(onFilterButtonClicked)
-        filterButton.isHidden = !model.isSelection
-        filterButton.isToggleActive = model.isSmartFilterActive
-        toolbar.addSubview(filterButton)
+        let centerXConstraint = centerStack.centerXAnchor.constraint(equalTo: toolbar.centerXAnchor)
+        centerXConstraint.priority = .defaultHigh
 
         NSLayoutConstraint.activate([
-            toolbarScroll.topAnchor.constraint(equalTo: toolbar.topAnchor),
-            toolbarScroll.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor),
-            toolbarScroll.trailingAnchor.constraint(equalTo: filterButton.leadingAnchor, constant: -8),
-            toolbarScroll.bottomAnchor.constraint(equalTo: toolbar.bottomAnchor),
+            leftStack.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 10),
+            leftStack.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+            leftStack.trailingAnchor.constraint(lessThanOrEqualTo: centerStack.leadingAnchor, constant: -10),
 
-            filterButton.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -10),
-            filterButton.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-            filterButton.widthAnchor.constraint(equalToConstant: 26),
-            filterButton.heightAnchor.constraint(equalToConstant: 24),
+            centerXConstraint,
+            centerStack.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+            centerStack.trailingAnchor.constraint(lessThanOrEqualTo: rightStack.leadingAnchor, constant: -10),
 
-            docView.topAnchor.constraint(equalTo: toolbarScroll.contentView.topAnchor),
-            docView.bottomAnchor.constraint(equalTo: toolbarScroll.contentView.bottomAnchor),
-            docView.leadingAnchor.constraint(equalTo: toolbarScroll.contentView.leadingAnchor),
-            docView.heightAnchor.constraint(equalTo: toolbarScroll.contentView.heightAnchor),
-
-            stack.leadingAnchor.constraint(equalTo: docView.leadingAnchor, constant: 10),
-            stack.trailingAnchor.constraint(equalTo: docView.trailingAnchor, constant: -8),
-            stack.centerYAnchor.constraint(equalTo: docView.centerYAnchor)
+            rightStack.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -10),
+            rightStack.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor)
         ])
 
-        // Timeline / Selezione pill selector (matching footer style, with indicator icon)
+        // LEFT: Selettore Timeline / Selezione (con ▾ solo se esiste più di una scelta) + Exit Compare + FPS Warning
         timelineIndicatorBtn.translatesAutoresizingMaskIntoConstraints = false
-        timelineIndicatorBtn.configure(name: model.name, isSelection: model.isSelection)
+        timelineIndicatorBtn.configure(
+            name: model.name,
+            isSelection: model.isSelection,
+            isCompare: model.isTemporaryCompare,
+            showDropdownIndicator: EditorProject.shared.timelines.count > 1
+        )
         timelineIndicatorBtn.toolTip = "Timeline o Selezione attiva (Clicca per cambiare)"
         timelineIndicatorBtn.onClicked = { [weak self] in
             self?.onTimelineIndicatorClicked()
         }
-        stack.addArrangedSubview(timelineIndicatorBtn)
+        leftStack.addArrangedSubview(timelineIndicatorBtn)
 
-        // Boxless icon toggles: Link, Magnet, Under-playhead
+        compareExitButton.toolTip = "Chiudi timeline di confronto temporanea"
+        compareExitButton.target = self
+        compareExitButton.action = #selector(onExitCompareClicked)
+        compareExitButton.isAccentActive = true
+        compareExitButton.translatesAutoresizingMaskIntoConstraints = false
+        compareExitButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        compareExitButton.isHidden = !model.isTemporaryCompare
+        leftStack.addArrangedSubview(compareExitButton)
+
+        fpsWarningButton.translatesAutoresizingMaskIntoConstraints = false
+        fpsWarningButton.target = self
+        fpsWarningButton.action = #selector(onFPSWarningClicked)
+        fpsWarningButton.isAccentActive = true
+        fpsWarningButton.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        fpsWarningButton.isHidden = true
+        leftStack.addArrangedSubview(fpsWarningButton)
+
+        // CENTER: Switch [Con scarto] / [Senza scarto] + tutti i button di editing
+        editModeSwitchButton.translatesAutoresizingMaskIntoConstraints = false
+        editModeSwitchButton.target = self
+        editModeSwitchButton.action = #selector(onToggleEditModeClicked)
+        editModeSwitchButton.font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
+        editModeSwitchButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 92).isActive = true
+        editModeSwitchButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        centerStack.addArrangedSubview(editModeSwitchButton)
+        updateEditModeButtons()
+
+        func makeCenterDivider() -> NSBox {
+            let div = NSBox()
+            div.boxType = .separator
+            div.translatesAutoresizingMaskIntoConstraints = false
+            div.widthAnchor.constraint(equalToConstant: 1).isActive = true
+            div.heightAnchor.constraint(equalToConstant: 18).isActive = true
+            return div
+        }
+
+        let editModeDivider = makeCenterDivider()
+        centerStack.addArrangedSubview(editModeDivider)
+
+        // Boxless icon toggles: Link, Magnet, Under-playhead | Gabbia | Sorgente Selezione/Clip
         linkButton.image = Lucide.template(.link, size: 16)
         linkButton.activeTintColor = .systemCyan
         linkButton.target = self
@@ -3603,7 +4484,7 @@ public final class TimelineViewController: NSViewController {
         linkButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
         linkButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         updateLinkButtonTitle()
-        stack.addArrangedSubview(linkButton)
+        centerStack.addArrangedSubview(linkButton)
 
         magnetButton.image = Lucide.template(.magnet, size: 16)
         magnetButton.activeTintColor = .systemCyan
@@ -3612,7 +4493,7 @@ public final class TimelineViewController: NSViewController {
         magnetButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
         magnetButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         updateMagnetButtonTitle()
-        stack.addArrangedSubview(magnetButton)
+        centerStack.addArrangedSubview(magnetButton)
 
         selectionFollowsPlayheadButton.image = Lucide.template(.textCursor, size: 16)
         selectionFollowsPlayheadButton.activeTintColor = .systemCyan
@@ -3621,7 +4502,9 @@ public final class TimelineViewController: NSViewController {
         selectionFollowsPlayheadButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
         selectionFollowsPlayheadButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         updateSelectionFollowsPlayheadButtonTitle()
-        stack.addArrangedSubview(selectionFollowsPlayheadButton)
+        centerStack.addArrangedSubview(selectionFollowsPlayheadButton)
+
+        centerStack.addArrangedSubview(makeCenterDivider())
 
         cageLockButton.image = Lucide.template(.tally3, size: 16)
         cageLockButton.activeTintColor = .systemCyan
@@ -3630,37 +4513,60 @@ public final class TimelineViewController: NSViewController {
         cageLockButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
         cageLockButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
         updateCageLockButtonTitle()
-        stack.addArrangedSubview(cageLockButton)
+        centerStack.addArrangedSubview(cageLockButton)
 
-        let rhythmDivider = NSBox()
-        rhythmDivider.boxType = .separator
-        rhythmDivider.translatesAutoresizingMaskIntoConstraints = false
-        rhythmDivider.widthAnchor.constraint(equalToConstant: 1).isActive = true
-        rhythmDivider.heightAnchor.constraint(equalToConstant: 18).isActive = true
-        stack.addArrangedSubview(rhythmDivider)
+        centerStack.addArrangedSubview(makeCenterDivider())
+
+        sourceBoundsSwitchButton.image = Lucide.template(.caretsFromAxisDashedVertical, size: 16)
+        sourceBoundsSwitchButton.activeTintColor = .systemCyan
+        sourceBoundsSwitchButton.target = self
+        sourceBoundsSwitchButton.action = #selector(onSourceBoundsToggleClicked)
+        sourceBoundsSwitchButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        sourceBoundsSwitchButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        updateSourceBoundsButtonTitle()
+        centerStack.addArrangedSubview(sourceBoundsSwitchButton)
+
+        let rhythmDivider = makeCenterDivider()
+        centerStack.addArrangedSubview(rhythmDivider)
 
         rhythmicStudioButton.image = Lucide.template(.sparkles, size: 16)
         rhythmicStudioButton.toolTip = "Auto-Fill Ritmico"
         rhythmicStudioButton.target = self
         rhythmicStudioButton.action = #selector(onRhythmicStudioClicked)
-        rhythmicStudioButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
-        rhythmicStudioButton.heightAnchor.constraint(equalToConstant: 26).isActive = true
-        stack.addArrangedSubview(rhythmicStudioButton)
+        rhythmicStudioButton.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        rhythmicStudioButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        centerStack.addArrangedSubview(rhythmicStudioButton)
 
-        let rhythmDivider2 = NSBox()
-        rhythmDivider2.boxType = .separator
-        rhythmDivider2.translatesAutoresizingMaskIntoConstraints = false
-        rhythmDivider2.widthAnchor.constraint(equalToConstant: 1).isActive = true
-        rhythmDivider2.heightAnchor.constraint(equalToConstant: 18).isActive = true
-        stack.addArrangedSubview(rhythmDivider2)
+        compareButton.image = Lucide.template(.scale, size: 16)
+        compareButton.activeTintColor = .systemYellow
+        compareButton.isToggleMode = true
+        compareButton.isToggleActive = model.isTemporaryCompare
+        compareButton.target = self
+        compareButton.action = #selector(onCompareClicked)
+        compareButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        compareButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        centerStack.addArrangedSubview(compareButton)
 
-        zoomSlider.minValue = 0.0
-        zoomSlider.maxValue = 1.0
-        zoomSlider.doubleValue = 0.5
-        zoomSlider.isContinuous = true
-        zoomSlider.target = self
-        zoomSlider.action = #selector(onZoomChanged)
-        zoomSlider.widthAnchor.constraint(equalToConstant: 80).isActive = true
+        ghostGapsButton.image = Lucide.template(.ghost, size: 16)
+        ghostGapsButton.activeTintColor = .systemRed
+        ghostGapsButton.target = self
+        ghostGapsButton.action = #selector(onGhostGapsToggleClicked)
+        ghostGapsButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        ghostGapsButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        updateGhostGapsButtonTitle()
+        centerStack.addArrangedSubview(ghostGapsButton)
+
+        // RIGHT (lato opposto al selettore timeline): Filtro Selezione + Zoom Slider
+        filterButton.translatesAutoresizingMaskIntoConstraints = false
+        filterButton.image = Lucide.template(.filter, size: 16)
+        filterButton.activeTintColor = .systemPurple
+        filterButton.target = self
+        filterButton.action = #selector(onFilterButtonClicked)
+        filterButton.isHidden = !model.isSelection
+        filterButton.isToggleActive = model.isSmartFilterActive
+        filterButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        filterButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        rightStack.addArrangedSubview(filterButton)
 
         let zoomIconView = NSImageView()
         zoomIconView.translatesAutoresizingMaskIntoConstraints = false
@@ -3669,15 +4575,31 @@ public final class TimelineViewController: NSViewController {
         zoomIconView.toolTip = "Zoom Timeline"
         zoomIconView.widthAnchor.constraint(equalToConstant: 16).isActive = true
         zoomIconView.heightAnchor.constraint(equalToConstant: 16).isActive = true
-        stack.addArrangedSubview(zoomIconView)
-        stack.addArrangedSubview(zoomSlider)
+        rightStack.addArrangedSubview(zoomIconView)
 
-        for view in stack.arrangedSubviews {
-            if let ctrl = view as? NSControl, !(ctrl is IconActionButton) {
-                ctrl.controlSize = .small
-                ctrl.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-            }
-        }
+        zoomSlider.minValue = 0.0
+        zoomSlider.maxValue = 1.0
+        zoomSlider.doubleValue = 0.5
+        zoomSlider.isContinuous = true
+        zoomSlider.controlSize = .small
+        zoomSlider.target = self
+        zoomSlider.action = #selector(onZoomChanged)
+        zoomSlider.widthAnchor.constraint(equalToConstant: 86).isActive = true
+        rightStack.addArrangedSubview(zoomSlider)
+
+        compareExitButton.font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
+        fpsWarningButton.font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
+        updateFPSWarningButton()
+    }
+
+    private func updateEditModeButtons() {
+        let isTrim = model.isRippleTrimMode || model.isSelection
+        editModeSwitchButton.title = isTrim ? "Senza scarto" : "Con scarto"
+        editModeSwitchButton.isAccentActive = isTrim
+        editModeSwitchButton.isEnabled = !model.isSelection
+        editModeSwitchButton.toolTip = isTrim
+            ? "Modalità Senza scarto / Ripple (T) — Clicca o premi A per Con scarto"
+            : "Modalità Con scarto (A) — Clicca o premi T per Senza scarto"
     }
 
     private func updateLinkButtonTitle() {
@@ -3696,17 +4618,107 @@ public final class TimelineViewController: NSViewController {
         cageLockButton.isToggleActive = model.isCageLockActive
     }
 
+    private func updateSourceBoundsButtonTitle() {
+        sourceBoundsSwitchButton.isToggleActive = model.isSelectionSourceConstrained
+        sourceBoundsSwitchButton.toolTip = model.isSelectionSourceConstrained
+            ? "Sorgente come Selezione (U) — Attivo: usa solo l'estratto ereditato dalla Selezione"
+            : "Sorgente come Clip Originale (U) — Disattivo: sblocca l'intera durata originale della clip"
+    }
+
+    private func updateGhostGapsButtonTitle() {
+        ghostGapsButton.isToggleActive = model.isEmptyGapsHighlighted
+    }
+
+    public func updateTimelineIndicator() {
+        timelineIndicatorBtn.configure(
+            name: model.name,
+            isSelection: model.isSelection,
+            isCompare: model.isTemporaryCompare,
+            showDropdownIndicator: EditorProject.shared.timelines.count > 1
+        )
+    }
+
+    public func presentClipContextMenu(
+        for clip: TimelineClip,
+        isVideo: Bool,
+        extraTopItems: [VisionMenuItem] = [],
+        event: NSEvent,
+        in sourceView: NSView
+    ) {
+        canvasView.presentClipContextMenu(
+            for: clip,
+            displayStart: nil,
+            isVideo: isVideo,
+            clickedTimelineSeconds: nil,
+            markerHit: nil,
+            extraTopItems: extraTopItems,
+            event: event,
+            in: sourceView
+        )
+    }
+
     public func reloadTimelineUI() {
-        timelineIndicatorBtn.configure(name: model.name, isSelection: model.isSelection)
+        timelineIndicatorBtn.configure(
+            name: model.name,
+            isSelection: model.isSelection,
+            isCompare: model.isTemporaryCompare,
+            showDropdownIndicator: EditorProject.shared.timelines.count > 1
+        )
         filterButton.isHidden = !model.isSelection
         filterButton.isToggleActive = model.isSmartFilterActive
+        compareButton.isToggleActive = model.isTemporaryCompare
+        compareExitButton.isHidden = !model.isTemporaryCompare
+        updateEditModeButtons()
         updateLinkButtonTitle()
         updateMagnetButtonTitle()
         updateSelectionFollowsPlayheadButtonTitle()
         updateCageLockButtonTitle()
+        updateSourceBoundsButtonTitle()
+        updateGhostGapsButtonTitle()
+        updateFPSWarningButton()
         syncAdaptiveZoomBounds()
         canvasView.updateWidth()
         canvasView.needsDisplay = true
+    }
+
+    public func updateFPSWarningButton() {
+        let badClips = model.nonConformantFrameRateClips()
+        guard !badClips.isEmpty else {
+            fpsWarningButton.isHidden = true
+            return
+        }
+        let tlFpsStr = TimelineModel.formatFPSLabel(model.format.fps)
+        fpsWarningButton.title = "⚠ \(badClips.count) clip ≠ \(tlFpsStr)fps"
+        let uniqueNames = Array(Set(badClips.map { "\($0.mediaItem.name) (\(TimelineModel.formatFPSLabel($0.mediaItem.frameRate))fps)" })).sorted()
+        fpsWarningButton.toolTip = "Clip con framerate non conforme a \(tlFpsStr)fps (sono ammessi solo multipli interi come \(tlFpsStr), \(TimelineModel.formatFPSLabel(model.format.fps * 2)), \(TimelineModel.formatFPSLabel(model.format.fps * 4))fps):\n• " + uniqueNames.joined(separator: "\n• ")
+        fpsWarningButton.isHidden = false
+    }
+
+    @objc private func onFPSWarningClicked() {
+        let badClips = model.nonConformantFrameRateClips()
+        guard !badClips.isEmpty else { return }
+        let tlFpsStr = TimelineModel.formatFPSLabel(model.format.fps)
+        model.selectedClipIds = Set(badClips.map(\.id))
+        canvasView.needsDisplay = true
+        let uniqueSummary = Array(Set(badClips.map { "\($0.mediaItem.name) (\(TimelineModel.formatFPSLabel($0.mediaItem.frameRate))fps)" })).sorted().joined(separator: ", ")
+        let msg = "⚠ Clip non conformi a \(tlFpsStr)fps: \(uniqueSummary)"
+        DebugLogger.shared.log(msg, level: .warning)
+        showWarningToast("\(badClips.count) clip selezionate non conformi a \(tlFpsStr)fps")
+    }
+
+    public func showWarningToast(_ message: String) {
+        warningToastDismissWork?.cancel()
+        warningToastLabel.stringValue = "⚠ \(message)"
+        warningToastBox.isHidden = false
+        let work = DispatchWorkItem { [weak self] in
+            self?.warningToastBox.isHidden = true
+        }
+        warningToastDismissWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.4, execute: work)
+    }
+
+    public func preserveSelectionForNextSeek(duration: TimeInterval = 0.25) {
+        suppressPlayheadSelectionUntil = CFAbsoluteTimeGetCurrent() + duration
     }
 
     public func switchModel(_ newModel: TimelineModel) {
@@ -3735,6 +4747,32 @@ public final class TimelineViewController: NSViewController {
             }
         }
         VisionMenu(items: menuItems).show(below: timelineIndicatorBtn)
+    }
+
+    @objc private func onToggleEditModeClicked() {
+        let isTrim = model.isRippleTrimMode || model.isSelection
+        setRippleTrimMode(!isTrim)
+    }
+
+    public func setRippleTrimMode(_ enabled: Bool) {
+        if model.isSelection && !enabled {
+            updateEditModeButtons()
+            DebugLogger.shared.log("In Selezione le clip restano sempre contigue (modalità T attiva).", level: .info)
+            return
+        }
+        guard model.isRippleTrimMode != enabled else {
+            updateEditModeButtons()
+            return
+        }
+        model.isRippleTrimMode = enabled
+        updateEditModeButtons()
+        notifyVCModified(enabled ? "Modalità Trim / Senza Scarto (T)" : "Modalità Selezione / Con Scarto (A)")
+        DebugLogger.shared.log(
+            enabled
+            ? "Modalità Montaggio: TRIM / SENZA SCARTO (T) — Q, W e taglio bordi spostano le clip chiudendo gli spazi."
+            : "Modalità Montaggio: SELEZIONE / CON SCARTO (A) — Q, W e taglio bordi lasciano lo spazio vuoto senza spostare la timeline.",
+            level: .info
+        )
     }
 
     @objc public func onSelectionFollowsPlayheadClicked() {
@@ -3789,8 +4827,38 @@ public final class TimelineViewController: NSViewController {
     @objc public func onCageLockToggleClicked() {
         model.isCageLockActive.toggle()
         updateCageLockButtonTitle()
+        canvasView.needsDisplay = true
         notifyVCModified(model.isCageLockActive ? "Blocco Gabbia Attivo" : "Montaggio Libero")
         DebugLogger.shared.log("Blocco Gabbia impostato su: \(model.isCageLockActive ? "ATTIVO (aggancia alle sbarre)" : "DISATTIVATO (montaggio libero)")", level: .info)
+    }
+
+    @objc public func onSourceBoundsToggleClicked() {
+        model.isSelectionSourceConstrained.toggle()
+        updateSourceBoundsButtonTitle()
+        canvasView.refreshFloatingSlipBoundsIfActive()
+        canvasView.needsDisplay = true
+        let title = model.isSelectionSourceConstrained
+            ? "Sorgente come Selezione (U)"
+            : "Sorgente come Clip Originale (U)"
+        notifyVCModified(title)
+        DebugLogger.shared.log(
+            model.isSelectionSourceConstrained
+            ? "Sorgente come Selezione (U): Slip, drag e span rispettano i limiti ereditati dalla Selezione."
+            : "Sorgente come Clip Originale (U): Slip, drag e span possono usare l'intera clip sorgente.",
+            level: .info
+        )
+    }
+
+    @objc public func onGhostGapsToggleClicked() {
+        model.isEmptyGapsHighlighted.toggle()
+        updateGhostGapsButtonTitle()
+        canvasView.needsDisplay = true
+        let gapCount = model.emptyTimelineGapIntervals().count
+        if model.isEmptyGapsHighlighted {
+            DebugLogger.shared.log("Evidenziazione Ghost vuoti video ATTIVA (\(gapCount) vuoti video rilevati).", level: .info)
+        } else {
+            DebugLogger.shared.log("Evidenziazione Ghost vuoti video DISATTIVATA.", level: .info)
+        }
     }
 
     private func notifyVCModified(_ title: String) {
@@ -3846,6 +4914,82 @@ public final class TimelineViewController: NSViewController {
         self.filterPopover = popover
     }
 
+    @objc private func onCompareClicked() {
+        if let existing = comparePopover, existing.isShown {
+            existing.performClose(nil)
+            return
+        }
+        let vc = ComparePopoverController(
+            timelines: EditorProject.shared.timelines,
+            activeSavedTimeline: EditorProject.shared.activeTimeline,
+            isCurrentlyComparing: model.isTemporaryCompare,
+            onOpenCompare: { [weak self] compareTL in
+                self?.comparePopover?.performClose(nil)
+                self?.onEnterCompareTimeline?(compareTL)
+            },
+            onExitCompare: { [weak self] in
+                self?.comparePopover?.performClose(nil)
+                self?.onExitCompareTimeline?()
+            }
+        )
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.appearance = NSAppearance(named: .darkAqua)
+        popover.contentViewController = vc
+        popover.contentSize = NSSize(width: 344, height: 224)
+        popover.show(relativeTo: compareButton.bounds, of: compareButton, preferredEdge: .maxY)
+        self.comparePopover = popover
+    }
+
+    @objc private func onExitCompareClicked() {
+        comparePopover?.performClose(nil)
+        onExitCompareTimeline?()
+    }
+
+    public func presentColorPaletteForCurrentTarget() {
+        var targetIds = model.selectedClipIds
+        if targetIds.isEmpty {
+            let t = playbackController.accurateCurrentTime
+            let queryTime = model.isSmartFilterActive ? model.realTimelineTime(forDisplayedTime: t) : t
+            let sec = CMTimeGetSeconds(queryTime)
+            for track in model.videoTracks {
+                if let c = track.clips.first(where: { sec >= CMTimeGetSeconds($0.timelineStart) - 0.001 && sec < CMTimeGetSeconds($0.timelineEnd) }) {
+                    targetIds.insert(c.id)
+                    break
+                }
+            }
+            if targetIds.isEmpty {
+                for track in model.audioTracks {
+                    if let c = track.clips.first(where: { sec >= CMTimeGetSeconds($0.timelineStart) - 0.001 && sec < CMTimeGetSeconds($0.timelineEnd) }) {
+                        targetIds.insert(c.id)
+                        break
+                    }
+                }
+            }
+        }
+        guard !targetIds.isEmpty else {
+            DebugLogger.shared.log("Seleziona una o più clip o posiziona la testina su una clip per cambiare colore (C).", level: .warning)
+            return
+        }
+
+        let anchorScreenRect: NSRect
+        if let win = view.window {
+            let clipRectInCanvas = targetIds.compactMap { canvasView.rectInCanvas(forClipId: $0) }.first
+            if let r = clipRectInCanvas, r.intersects(canvasView.visibleRect) {
+                let winRect = canvasView.convert(NSRect(x: r.midX, y: r.maxY, width: 2, height: 2), to: nil)
+                anchorScreenRect = win.convertToScreen(winRect)
+            } else {
+                let centerInScroll = NSRect(x: scrollView.bounds.midX - 94, y: scrollView.bounds.midY + 60, width: 2, height: 2)
+                let winRect = scrollView.convert(centerInScroll, to: nil)
+                anchorScreenRect = win.convertToScreen(winRect)
+            }
+        } else {
+            let mouse = NSEvent.mouseLocation
+            anchorScreenRect = NSRect(origin: mouse, size: NSSize(width: 2, height: 2))
+        }
+        canvasView.presentColorPalette(forClipIds: targetIds, anchorScreenRect: anchorScreenRect)
+    }
+
     // MARK: - Rhythmic Auto-Fill & Beat Finder Action Handlers
 
     @objc public func onRhythmicStudioClicked() {
@@ -3861,6 +5005,7 @@ public final class TimelineViewController: NSViewController {
     }
 
     public func openBeatFinder(for audioClip: TimelineClip) {
+        guard !model.isSelection else { return }
         BeatAnalysisDialog.showBeatFinderModal(for: model, audioClip: audioClip, relativeTo: view.window) { [weak self] in
             self?.reloadTimelineUI()
             self?.notifyVCModified("Beat Finder")
@@ -3883,32 +5028,64 @@ public final class TimelineViewController: NSViewController {
     }
 
     @objc public func onSpanClicked() {
-        guard let id = model.selectedClipId else { return }
+        guard let id = model.resolvedVideoClipId() ?? model.selectedClipId else { return }
         for track in model.videoTracks {
             if let clip = track.clips.first(where: { $0.id == id }) {
-                let nextSpan = (clip.span % 3) + 1
-                model.setClipSpan(clipId: id, newSpan: nextSpan)
-                reloadTimelineUI()
-                notifyVCModified("Aumenta Span Gabbia (⌥+)")
+                let currentSpan = max(1, clip.span)
+                let growRes = model.setClipSpanDetailed(clipId: id, newSpan: currentSpan + 1)
+                if growRes.didChange {
+                    reloadTimelineUI()
+                    notifyVCModified("Espandi in Gabbia (⌥+)")
+                } else if currentSpan > 1 {
+                    if model.setClipSpanDetailed(clipId: id, newSpan: 1).didChange {
+                        reloadTimelineUI()
+                        notifyVCModified("Riduci a 1 Gabbia (⌥+)")
+                    }
+                } else if let msg = growRes.errorMessage {
+                    showWarningToast(msg)
+                }
+                break
+            }
+        }
+    }
+
+    @objc public func onDecreaseSpanClicked() {
+        guard let id = model.resolvedVideoClipId() ?? model.selectedClipId else { return }
+        for track in model.videoTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                guard clip.span > 1 else { break }
+                let res = model.setClipSpanDetailed(clipId: id, newSpan: clip.span - 1)
+                if res.didChange {
+                    reloadTimelineUI()
+                    notifyVCModified("Riduci Span Gabbia (⌥-)")
+                } else if let msg = res.errorMessage {
+                    showWarningToast(msg)
+                }
                 break
             }
         }
     }
 
     @objc public func onToggleSpeedClicked() {
-        guard let id = model.selectedClipId else { return }
-        if model.toggleClipSpeed(clipId: id) != nil {
+        guard let id = model.resolvedVideoClipId() ?? model.selectedClipId else { return }
+        let res = model.toggleClipSpeedDetailed(clipId: id)
+        if res.newSpeed != nil {
             reloadTimelineUI()
             notifyVCModified("Slow Motion in Gabbia (R)")
+        } else if let err = res.errorMessage {
+            showWarningToast(err)
         }
     }
 
     @objc public func onToggleSlowMoMultiCageClicked() {
-        guard let id = model.selectedClipId else { return }
+        guard let id = model.resolvedVideoClipId() ?? model.selectedClipId else { return }
         let res = model.toggleSlowMoMultiCage(clipId: id)
         if res.didChange {
             reloadTimelineUI()
-            notifyVCModified(res.newSpan > 1 ? "Slow Motion 2 Gabbie (⌘R)" : "Riduci a 1 Gabbia (⌘R)")
+            notifyVCModified(res.newSpeed < 0.99 ? "Slow Motion 50% con scarto (⌘R)" : "Velocità 100% con scarto (⌘R)")
+        } else if let err = res.errorMessage {
+            DebugLogger.shared.log(err, level: .warning)
+            showWarningToast(err)
         }
     }
 
@@ -4001,7 +5178,7 @@ public final class TimelineViewController: NSViewController {
         let newAnchorCanvasX = headerW + CGFloat(anchorTimeSec * newPixelsPerSecond)
         let maxOriginX = max(0, canvasView.frame.width - clipBounds.width)
         let targetOriginX = max(0, min(maxOriginX, newAnchorCanvasX - viewportOffsetX))
-        clipView.scroll(to: NSPoint(x: targetOriginX, y: 0))
+        clipView.scroll(to: NSPoint(x: targetOriginX, y: clipBounds.origin.y))
         scrollView.reflectScrolledClipView(clipView)
         canvasView.updatePlayheadLayer()
         canvasView.needsDisplay = true
@@ -4012,6 +5189,7 @@ private final class SelectionFilterPopoverController: NSViewController {
     private var filter: SelectionSmartFilter
     private let onFilterChanged: (SelectionSmartFilter) -> Void
 
+    private let p4Check = NSButton(checkboxWithTitle: "4 — Dialogo / Intera", target: nil, action: nil)
     private let p1Check = NSButton(checkboxWithTitle: "1 — Blu chiaro", target: nil, action: nil)
     private let p2Check = NSButton(checkboxWithTitle: "2 — Blu medio", target: nil, action: nil)
     private let p3Check = NSButton(checkboxWithTitle: "3 — Blu scuro", target: nil, action: nil)
@@ -4028,7 +5206,7 @@ private final class SelectionFilterPopoverController: NSViewController {
     required init?(coder: NSCoder) { fatalError() }
 
     override func loadView() {
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: 245, height: 225))
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 245, height: 248))
         root.wantsLayer = true
 
         let headerRow = NSStackView()
@@ -4085,6 +5263,7 @@ private final class SelectionFilterPopoverController: NSViewController {
             return row
         }
 
+        stack.addArrangedSubview(makeColorRow(check: p4Check, dotColor: NSColor(calibratedRed: 0.56, green: 0.24, blue: 0.74, alpha: 1.0)))
         stack.addArrangedSubview(makeColorRow(check: p1Check, dotColor: NSColor(calibratedRed: 0.36, green: 0.72, blue: 0.98, alpha: 1.0)))
         stack.addArrangedSubview(makeColorRow(check: p2Check, dotColor: NSColor(calibratedRed: 0.16, green: 0.45, blue: 0.85, alpha: 1.0)))
         stack.addArrangedSubview(makeColorRow(check: p3Check, dotColor: NSColor(calibratedRed: 0.08, green: 0.22, blue: 0.48, alpha: 1.0)))
@@ -4121,6 +5300,7 @@ private final class SelectionFilterPopoverController: NSViewController {
     }
 
     private func syncCheckboxesFromFilter() {
+        p4Check.state = filter.includePriority4 ? .on : .off
         p1Check.state = filter.includePriority1 ? .on : .off
         p2Check.state = filter.includePriority2 ? .on : .off
         p3Check.state = filter.includePriority3 ? .on : .off
@@ -4130,6 +5310,7 @@ private final class SelectionFilterPopoverController: NSViewController {
     }
 
     @objc private func onCheckboxToggled() {
+        filter.includePriority4 = (p4Check.state == .on)
         filter.includePriority1 = (p1Check.state == .on)
         filter.includePriority2 = (p2Check.state == .on)
         filter.includePriority3 = (p3Check.state == .on)
@@ -4143,5 +5324,399 @@ private final class SelectionFilterPopoverController: NSViewController {
         filter = SelectionSmartFilter()
         syncCheckboxesFromFilter()
         onFilterChanged(filter)
+    }
+}
+
+private final class TimelineHorizontalScrollbarView: NSView {
+    var onScrollFractionChanged: ((CGFloat) -> Void)?
+    var onScrollDeltaX: ((CGFloat) -> Void)?
+
+    private var thumbProportion: CGFloat = 1.0
+    private var scrollFraction: CGFloat = 0.0
+    private var isDraggingThumb: Bool = false
+    private var isHovered: Bool = false
+    private var dragStartX: CGFloat = 0.0
+    private var dragStartFraction: CGFloat = 0.0
+    private var trackingArea: NSTrackingArea?
+
+    override var isFlipped: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func updateState(thumbProportion: CGFloat, scrollFraction: CGFloat) {
+        let clampedProp = max(0.02, min(1.0, thumbProportion))
+        let clampedFrac = max(0.0, min(1.0, scrollFraction))
+        if abs(self.thumbProportion - clampedProp) > 0.0005 || abs(self.scrollFraction - clampedFrac) > 0.0005 {
+            self.thumbProportion = clampedProp
+            self.scrollFraction = clampedFrac
+            needsDisplay = true
+        }
+    }
+
+    private func computeThumbRect() -> CGRect {
+        let hPad: CGFloat = 4.0
+        let vPad: CGFloat = 2.5
+        let trackW = max(1.0, bounds.width - hPad * 2.0)
+        let thumbW = max(28.0, min(trackW, trackW * thumbProportion))
+        let maxTravel = max(0.0, trackW - thumbW)
+        let thumbX = hPad + maxTravel * scrollFraction
+        return CGRect(x: thumbX, y: vPad, width: thumbW, height: max(4.0, bounds.height - vPad * 2.0))
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingArea {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+
+        // Track background (strictly confined to the timeline area right of track headers)
+        ctx.setFillColor(NSColor(calibratedWhite: 0.09, alpha: 0.92).cgColor)
+        ctx.fill(bounds)
+
+        // Subtle top border
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.08).cgColor)
+        ctx.setLineWidth(1.0)
+        ctx.strokeLineSegments(between: [
+            CGPoint(x: 0, y: 0.5),
+            CGPoint(x: bounds.width, y: 0.5)
+        ])
+
+        // Thumb pill
+        let thumbRect = computeThumbRect()
+        let thumbColor: NSColor
+        if isDraggingThumb {
+            thumbColor = NSColor.systemCyan.withAlphaComponent(0.85)
+        } else if isHovered {
+            thumbColor = NSColor(calibratedWhite: 0.58, alpha: 0.95)
+        } else {
+            thumbColor = NSColor(calibratedWhite: 0.42, alpha: 0.88)
+        }
+        let radius = thumbRect.height * 0.5
+        let path = CGPath(roundedRect: thumbRect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+        ctx.setFillColor(thumbColor.cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        let thumbRect = computeThumbRect()
+        let hPad: CGFloat = 4.0
+        let trackW = max(1.0, bounds.width - hPad * 2.0)
+        let maxTravel = max(1.0, trackW - thumbRect.width)
+
+        if thumbRect.contains(pt) {
+            isDraggingThumb = true
+            dragStartX = pt.x
+            dragStartFraction = scrollFraction
+            needsDisplay = true
+        } else {
+            let targetFraction = max(0.0, min(1.0, (pt.x - hPad - thumbRect.width * 0.5) / maxTravel))
+            isDraggingThumb = true
+            dragStartX = pt.x
+            dragStartFraction = targetFraction
+            scrollFraction = targetFraction
+            needsDisplay = true
+            onScrollFractionChanged?(targetFraction)
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isDraggingThumb else { return }
+        let pt = convert(event.locationInWindow, from: nil)
+        let thumbRect = computeThumbRect()
+        let hPad: CGFloat = 4.0
+        let trackW = max(1.0, bounds.width - hPad * 2.0)
+        let maxTravel = max(1.0, trackW - thumbRect.width)
+        let deltaFraction = (pt.x - dragStartX) / maxTravel
+        let targetFraction = max(0.0, min(1.0, dragStartFraction + deltaFraction))
+        scrollFraction = targetFraction
+        needsDisplay = true
+        onScrollFractionChanged?(targetFraction)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if isDraggingThumb {
+            isDraggingThumb = false
+            needsDisplay = true
+        }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        let delta = abs(event.scrollingDeltaX) >= abs(event.scrollingDeltaY) ? -event.scrollingDeltaX : -event.scrollingDeltaY
+        let step = event.hasPreciseScrollingDeltas ? delta : delta * 14.0
+        if abs(step) > 0.01 {
+            onScrollDeltaX?(step)
+        }
+    }
+}
+
+private final class ComparePopoverController: NSViewController {
+    private let timelines: [TimelineModel]
+    private let activeSavedTimeline: TimelineModel
+    private let isCurrentlyComparing: Bool
+    private let onOpenCompare: (TimelineModel) -> Void
+    private let onExitCompare: () -> Void
+
+    private let sourcePopUp = VisionDropdownButton()
+    private let referencePopUp = VisionDropdownButton()
+    private let swapBtn = FlatButton(title: "⇄ Scambia")
+    private let previewLabel = NSTextField(wrappingLabelWithString: "")
+    private let openBtn = FlatButton(title: "Apri Confronto")
+    private let exitBtn = FlatButton(title: "Esci Confronto")
+
+    private var cachedCompareResult: (timeline: TimelineModel, segmentCount: Int, totalSeconds: Double)?
+
+    init(
+        timelines: [TimelineModel],
+        activeSavedTimeline: TimelineModel,
+        isCurrentlyComparing: Bool,
+        onOpenCompare: @escaping (TimelineModel) -> Void,
+        onExitCompare: @escaping () -> Void
+    ) {
+        self.timelines = timelines
+        self.activeSavedTimeline = activeSavedTimeline
+        self.isCurrentlyComparing = isCurrentlyComparing
+        self.onOpenCompare = onOpenCompare
+        self.onExitCompare = onExitCompare
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func loadView() {
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 344, height: 224))
+        root.wantsLayer = true
+
+        let titleLbl = NSTextField(labelWithString: "Modalità Confronta (Temporanea)")
+        titleLbl.font = NSFont.systemFont(ofSize: 12.5, weight: .bold)
+        titleLbl.textColor = .white
+        titleLbl.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(titleLbl)
+
+        let subLbl = NSTextField(labelWithString: "Mostra in timeline il girato non usato (non salvato)")
+        subLbl.font = NSFont.systemFont(ofSize: 10.5, weight: .regular)
+        subLbl.textColor = NSColor(calibratedWhite: 0.62, alpha: 1.0)
+        subLbl.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(subLbl)
+
+        let srcLbl = NSTextField(labelWithString: "Mostra girato di:")
+        srcLbl.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        srcLbl.textColor = NSColor(calibratedWhite: 0.78, alpha: 1.0)
+        srcLbl.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(srcLbl)
+
+        sourcePopUp.translatesAutoresizingMaskIntoConstraints = false
+        sourcePopUp.onSelectionChanged = { [weak self] _, _ in
+            self?.recomputePreview()
+        }
+        root.addSubview(sourcePopUp)
+
+        let refLbl = NSTextField(labelWithString: "Escludi già in:")
+        refLbl.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        refLbl.textColor = NSColor(calibratedWhite: 0.78, alpha: 1.0)
+        refLbl.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(refLbl)
+
+        referencePopUp.translatesAutoresizingMaskIntoConstraints = false
+        referencePopUp.onSelectionChanged = { [weak self] _, _ in
+            self?.recomputePreview()
+        }
+        root.addSubview(referencePopUp)
+
+        swapBtn.translatesAutoresizingMaskIntoConstraints = false
+        swapBtn.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+        swapBtn.target = self
+        swapBtn.action = #selector(onSwapClicked)
+        root.addSubview(swapBtn)
+
+        previewLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        previewLabel.textColor = .systemCyan
+        previewLabel.maximumNumberOfLines = 2
+        previewLabel.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(previewLabel)
+
+        openBtn.translatesAutoresizingMaskIntoConstraints = false
+        openBtn.isAccentActive = true
+        openBtn.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        openBtn.target = self
+        openBtn.action = #selector(onOpenClicked)
+        root.addSubview(openBtn)
+
+        exitBtn.translatesAutoresizingMaskIntoConstraints = false
+        exitBtn.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        exitBtn.target = self
+        exitBtn.action = #selector(onExitClicked)
+        exitBtn.isHidden = !isCurrentlyComparing
+        root.addSubview(exitBtn)
+
+        NSLayoutConstraint.activate([
+            titleLbl.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
+            titleLbl.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            titleLbl.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+
+            subLbl.topAnchor.constraint(equalTo: titleLbl.bottomAnchor, constant: 2),
+            subLbl.leadingAnchor.constraint(equalTo: titleLbl.leadingAnchor),
+            subLbl.trailingAnchor.constraint(equalTo: titleLbl.trailingAnchor),
+
+            srcLbl.topAnchor.constraint(equalTo: subLbl.bottomAnchor, constant: 12),
+            srcLbl.leadingAnchor.constraint(equalTo: titleLbl.leadingAnchor),
+            srcLbl.widthAnchor.constraint(equalToConstant: 96),
+
+            sourcePopUp.centerYAnchor.constraint(equalTo: srcLbl.centerYAnchor),
+            sourcePopUp.leadingAnchor.constraint(equalTo: srcLbl.trailingAnchor, constant: 8),
+            sourcePopUp.trailingAnchor.constraint(equalTo: titleLbl.trailingAnchor),
+            sourcePopUp.heightAnchor.constraint(equalToConstant: 24),
+
+            refLbl.topAnchor.constraint(equalTo: sourcePopUp.bottomAnchor, constant: 10),
+            refLbl.leadingAnchor.constraint(equalTo: titleLbl.leadingAnchor),
+            refLbl.widthAnchor.constraint(equalToConstant: 96),
+
+            referencePopUp.centerYAnchor.constraint(equalTo: refLbl.centerYAnchor),
+            referencePopUp.leadingAnchor.constraint(equalTo: refLbl.trailingAnchor, constant: 8),
+            referencePopUp.trailingAnchor.constraint(equalTo: titleLbl.trailingAnchor),
+            referencePopUp.heightAnchor.constraint(equalToConstant: 24),
+
+            swapBtn.topAnchor.constraint(equalTo: referencePopUp.bottomAnchor, constant: 8),
+            swapBtn.trailingAnchor.constraint(equalTo: titleLbl.trailingAnchor),
+            swapBtn.widthAnchor.constraint(equalToConstant: 82),
+            swapBtn.heightAnchor.constraint(equalToConstant: 22),
+
+            previewLabel.centerYAnchor.constraint(equalTo: swapBtn.centerYAnchor),
+            previewLabel.leadingAnchor.constraint(equalTo: titleLbl.leadingAnchor),
+            previewLabel.trailingAnchor.constraint(equalTo: swapBtn.leadingAnchor, constant: -8),
+
+            openBtn.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
+            openBtn.trailingAnchor.constraint(equalTo: titleLbl.trailingAnchor),
+            openBtn.widthAnchor.constraint(equalToConstant: 124),
+            openBtn.heightAnchor.constraint(equalToConstant: 26),
+
+            exitBtn.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
+            exitBtn.leadingAnchor.constraint(equalTo: titleLbl.leadingAnchor),
+            exitBtn.widthAnchor.constraint(equalToConstant: 108),
+            exitBtn.heightAnchor.constraint(equalToConstant: 26)
+        ])
+
+        self.view = root
+        populatePopUps()
+        recomputePreview()
+    }
+
+    private func populatePopUps() {
+        sourcePopUp.removeAllItems()
+        referencePopUp.removeAllItems()
+
+        for tl in timelines {
+            let tag = tl.isSelection ? " [Selezione]" : ""
+            sourcePopUp.addItem(withTitle: "\(tl.name)\(tag)")
+            referencePopUp.addItem(withTitle: "\(tl.name)\(tag)")
+        }
+
+        guard !timelines.isEmpty else {
+            sourcePopUp.isEnabled = false
+            referencePopUp.isEnabled = false
+            swapBtn.isEnabled = false
+            openBtn.isEnabled = false
+            return
+        }
+
+        let activeIdx = timelines.firstIndex(where: { $0.id == activeSavedTimeline.id }) ?? 0
+        referencePopUp.selectItem(at: activeIdx)
+
+        // Default Sorgente: prima Selezione diversa dalla timeline attiva, altrimenti altro elemento
+        if let selIdx = timelines.firstIndex(where: { $0.isSelection && $0.id != activeSavedTimeline.id }) {
+            sourcePopUp.selectItem(at: selIdx)
+        } else if let otherIdx = timelines.firstIndex(where: { $0.id != activeSavedTimeline.id }) {
+            sourcePopUp.selectItem(at: otherIdx)
+        } else {
+            sourcePopUp.selectItem(at: activeIdx)
+        }
+    }
+
+    private func recomputePreview() {
+        guard timelines.count >= 2 else {
+            previewLabel.stringValue = "Servono almeno 2 timeline o selezioni."
+            previewLabel.textColor = .systemOrange
+            openBtn.isEnabled = false
+            openBtn.isAccentActive = false
+            cachedCompareResult = nil
+            return
+        }
+        let sIdx = max(0, min(timelines.count - 1, sourcePopUp.selectedIndex))
+        let rIdx = max(0, min(timelines.count - 1, referencePopUp.selectedIndex))
+        let src = timelines[sIdx]
+        let ref = timelines[rIdx]
+
+        if src.id == ref.id {
+            previewLabel.stringValue = "Scegli due timeline o selezioni diverse."
+            previewLabel.textColor = .systemOrange
+            openBtn.isEnabled = false
+            openBtn.isAccentActive = false
+            cachedCompareResult = nil
+            return
+        }
+
+        let res = TimelineModel.buildDifferenceCompareTimeline(source: src, excludingReference: ref)
+        cachedCompareResult = res
+        if res.segmentCount == 0 {
+            previewLabel.stringValue = "Nessuna differenza: tutto il girato è già incluso."
+            previewLabel.textColor = .systemGreen
+            openBtn.isEnabled = false
+            openBtn.isAccentActive = false
+        } else {
+            let mins = Int(res.totalSeconds) / 60
+            let secs = Int(res.totalSeconds) % 60
+            let durStr = String(format: "%02d:%02d", mins, secs)
+            previewLabel.stringValue = "\(res.segmentCount) spezzoni non inclusi (\(durStr))."
+            previewLabel.textColor = .systemCyan
+            openBtn.isEnabled = true
+            openBtn.isAccentActive = true
+        }
+    }
+
+    @objc private func onSwapClicked() {
+        let sIdx = sourcePopUp.selectedIndex
+        let rIdx = referencePopUp.selectedIndex
+        guard sIdx >= 0, rIdx >= 0 else { return }
+        sourcePopUp.selectItem(at: rIdx)
+        referencePopUp.selectItem(at: sIdx)
+        recomputePreview()
+    }
+
+    @objc private func onOpenClicked() {
+        guard let res = cachedCompareResult, res.segmentCount > 0 else { return }
+        onOpenCompare(res.timeline)
+    }
+
+    @objc private func onExitClicked() {
+        onExitCompare()
     }
 }

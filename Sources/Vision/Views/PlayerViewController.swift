@@ -20,9 +20,10 @@ public final class PlayerViewController: NSViewController {
     private let proxyToggleButton = IconActionButton(toolTip: "Riproduzione Proxy")
     private let proxyBadgeLabel = NSTextField(labelWithString: "⚡ PROXY")
     public var onProxyToggled: (() -> Void)?
+    public var hasAnyProxyProvider: (() -> Bool)?
 
     // Full Screen Button
-    private let fullScreenButton = IconActionButton(toolTip: "Schermo Intero (⌃F)", isToggleMode: false)
+    private let fullScreenButton = IconActionButton(toolTip: "Schermo Intero (⌘F)", isToggleMode: false)
     private var fullScreenController: FullScreenPlayerWindowController?
 
     // Video Canvas Frame Box (with gray workspace around it) + Zoom/Pan support
@@ -33,7 +34,35 @@ public final class PlayerViewController: NSViewController {
     private let interactionOverlay = ViewerZoomInteractionView()
     private let zoomButton = FlatButton(title: "Adatta ▾")
     private var zoomMenu: VisionMenu?
-    private var aspectConstraint: NSLayoutConstraint?
+    private var currentAspectRatio: CGFloat = 1920.0 / 1080.0
+
+    // Dual-Frame Slip Preview Overlay (Tab + Drag) — nello spazio di un singolo frame normale, zero resize/flicker
+    private let slipPreviewContainer = NSView()
+    private let slipHeaderLabel = NSTextField(labelWithString: "")
+    private let slipInCanvasView = NSView()
+    private let slipOutCanvasView = NSView()
+    private let slipInTimeLabel = NSTextField(labelWithString: "IN")
+    private let slipOutTimeLabel = NSTextField(labelWithString: "OUT")
+    private var slipGenerator: AVAssetImageGenerator?
+    private var slipGeneratorURL: URL?
+    private var slipRequestToken: Int = 0
+    private var isSlipDecodeInFlight: Bool = false
+    private var pendingSlipRequest: (url: URL, inSec: Double, outSec: Double, fps: Double)?
+
+    // Source Clip Preview Overlay (click su una clip nel Media Pool)
+    public private(set) var isSourcePreviewActive: Bool = false
+    public private(set) var sourcePreviewMediaId: UUID? = nil
+    private let sourcePreviewContainer = NSView()
+    private let sourcePlayerView = AVPlayerView()
+    private let sourceAudioPlaceholder = NSTextField(labelWithString: "♫ Audio Clip")
+    private let sourceTitlePill = NSView()
+    private let sourceTitleLabel = NSTextField(labelWithString: "")
+    private let sourceCloseButton = FlatButton(title: "✕")
+    private let sourceScrubBar = SourceClipScrubBar()
+    private var sourcePlayer: AVPlayer?
+    private var sourceTimeObserver: Any?
+    private var sourceEndObserver: Any?
+    private var isScrubbingSourceBar: Bool = false
 
     public private(set) var isZoomFitMode: Bool = true
     public private(set) var zoomScale: CGFloat = 1.0
@@ -64,10 +93,12 @@ public final class PlayerViewController: NSViewController {
         workspaceView.translatesAutoresizingMaskIntoConstraints = false
         workspaceView.wantsLayer = true
         workspaceView.layer?.backgroundColor = NSColor(calibratedWhite: 0.075, alpha: 1.0).cgColor
+        workspaceView.layer?.masksToBounds = true
         root.addSubview(workspaceView)
 
-        // Video Frame Box
-        videoFrameBox.translatesAutoresizingMaskIntoConstraints = false
+        // Video Frame Box (frame managed dynamically by viewer zoom & pan so the canvas itself resizes and moves)
+        videoFrameBox.translatesAutoresizingMaskIntoConstraints = true
+        videoFrameBox.autoresizingMask = []
         videoFrameBox.wantsLayer = true
         videoFrameBox.layer?.backgroundColor = NSColor.black.cgColor
         videoFrameBox.layer?.masksToBounds = true
@@ -78,10 +109,9 @@ public final class PlayerViewController: NSViewController {
         videoFrameBox.layer?.shadowRadius = 10
         workspaceView.addSubview(videoFrameBox)
 
-        // Zoomable Host inside videoFrameBox (frame managed dynamically to avoid AutoLayout churn during smooth zoom/pan)
+        // Host filling videoFrameBox
         zoomHostView.wantsLayer = true
-        zoomHostView.translatesAutoresizingMaskIntoConstraints = true
-        zoomHostView.autoresizingMask = []
+        zoomHostView.translatesAutoresizingMaskIntoConstraints = false
         videoFrameBox.addSubview(zoomHostView)
 
         // Player View inside zoomHostView
@@ -102,12 +132,13 @@ public final class PlayerViewController: NSViewController {
         // Still-frame layer overlay holds trimmed frame across AVPlayerItem reloads without affecting Auto Layout size
         freezeFrameOverlay.translatesAutoresizingMaskIntoConstraints = false
         freezeFrameOverlay.wantsLayer = true
+        freezeFrameOverlay.layer?.backgroundColor = NSColor.black.cgColor
         freezeFrameOverlay.layer?.contentsGravity = .resizeAspect
         freezeFrameOverlay.layer?.masksToBounds = true
         freezeFrameOverlay.isHidden = true
         zoomHostView.addSubview(freezeFrameOverlay)
 
-        // Interactive overlay for mouse scroll zoom & hand pan
+        // Interactive overlay across entire workspace for mouse scroll zoom & canvas grab pan
         interactionOverlay.translatesAutoresizingMaskIntoConstraints = false
         interactionOverlay.onScrollZoom = { [weak self] deltaY, pointInView, isPrecise in
             self?.handleScrollZoom(deltaY: deltaY, anchorPoint: pointInView, isPrecise: isPrecise)
@@ -118,9 +149,18 @@ public final class PlayerViewController: NSViewController {
         interactionOverlay.onDoubleClickReset = { [weak self] in
             self?.setViewerZoomFit()
         }
-        videoFrameBox.addSubview(interactionOverlay)
+        workspaceView.addSubview(interactionOverlay)
 
-        // Floating Proxy Active Indicator Badge (top-right inside frame)
+        setupSlipPreviewOverlay()
+        videoFrameBox.addSubview(slipPreviewContainer)
+
+        setupSourcePreviewOverlay()
+        workspaceView.addSubview(sourcePreviewContainer)
+        workspaceView.addSubview(sourceTitlePill)
+        workspaceView.addSubview(sourceCloseButton)
+        workspaceView.addSubview(sourceScrubBar)
+
+        // Floating Proxy Active Indicator Badge (top-right inside workspace)
         proxyBadgeLabel.translatesAutoresizingMaskIntoConstraints = false
         proxyBadgeLabel.wantsLayer = true
         proxyBadgeLabel.layer?.backgroundColor = NSColor(calibratedRed: 0.0, green: 0.75, blue: 0.45, alpha: 0.9).cgColor
@@ -128,13 +168,13 @@ public final class PlayerViewController: NSViewController {
         proxyBadgeLabel.textColor = .white
         proxyBadgeLabel.font = NSFont.systemFont(ofSize: 10, weight: .bold)
         proxyBadgeLabel.alignment = .center
-        proxyBadgeLabel.isHidden = !EditorProject.shared.isProxyPlaybackEnabled
-        videoFrameBox.addSubview(proxyBadgeLabel)
+        proxyBadgeLabel.isHidden = true
+        workspaceView.addSubview(proxyBadgeLabel)
 
         // Top-left Viewer Zoom Dropdown Button inside workspaceView
         zoomButton.translatesAutoresizingMaskIntoConstraints = false
         zoomButton.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
-        zoomButton.toolTip = "Zoom Viewer (Scroll: Zoom, Trascina: Sposta, Doppio click: Adatta)"
+        zoomButton.toolTip = "Zoom Viewer (Scroll: Zoom, Trascina: Sposta, Z / Doppio click: Adatta)"
         zoomButton.target = self
         zoomButton.action = #selector(onZoomDropdownClicked)
         workspaceView.addSubview(zoomButton)
@@ -148,31 +188,16 @@ public final class PlayerViewController: NSViewController {
 
         setupTransportBar(transportBar)
 
-        // Setup Frame Box constraints with Aspect Ratio (default 16:9)
-        let initialAspect: CGFloat = 1920.0 / 1080.0
-        let aspect = videoFrameBox.widthAnchor.constraint(equalTo: videoFrameBox.heightAnchor, multiplier: initialAspect)
-        self.aspectConstraint = aspect
-
-        let wConstraint = videoFrameBox.widthAnchor.constraint(equalTo: workspaceView.widthAnchor, constant: -28)
-        wConstraint.priority = .defaultLow
-        let hConstraint = videoFrameBox.heightAnchor.constraint(equalTo: workspaceView.heightAnchor, constant: -28)
-        hConstraint.priority = .defaultLow
-
         NSLayoutConstraint.activate([
             workspaceView.topAnchor.constraint(equalTo: root.topAnchor),
             workspaceView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             workspaceView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             workspaceView.bottomAnchor.constraint(equalTo: transportBar.topAnchor),
 
-            videoFrameBox.centerXAnchor.constraint(equalTo: workspaceView.centerXAnchor),
-            videoFrameBox.centerYAnchor.constraint(equalTo: workspaceView.centerYAnchor),
-            videoFrameBox.leadingAnchor.constraint(greaterThanOrEqualTo: workspaceView.leadingAnchor, constant: 14),
-            videoFrameBox.trailingAnchor.constraint(lessThanOrEqualTo: workspaceView.trailingAnchor, constant: -14),
-            videoFrameBox.topAnchor.constraint(greaterThanOrEqualTo: workspaceView.topAnchor, constant: 14),
-            videoFrameBox.bottomAnchor.constraint(lessThanOrEqualTo: workspaceView.bottomAnchor, constant: -14),
-            wConstraint,
-            hConstraint,
-            aspect,
+            zoomHostView.topAnchor.constraint(equalTo: videoFrameBox.topAnchor),
+            zoomHostView.leadingAnchor.constraint(equalTo: videoFrameBox.leadingAnchor),
+            zoomHostView.trailingAnchor.constraint(equalTo: videoFrameBox.trailingAnchor),
+            zoomHostView.bottomAnchor.constraint(equalTo: videoFrameBox.bottomAnchor),
 
             playerView.topAnchor.constraint(equalTo: zoomHostView.topAnchor),
             playerView.leadingAnchor.constraint(equalTo: zoomHostView.leadingAnchor),
@@ -184,13 +209,38 @@ public final class PlayerViewController: NSViewController {
             freezeFrameOverlay.trailingAnchor.constraint(equalTo: zoomHostView.trailingAnchor),
             freezeFrameOverlay.bottomAnchor.constraint(equalTo: zoomHostView.bottomAnchor),
 
-            interactionOverlay.topAnchor.constraint(equalTo: videoFrameBox.topAnchor),
-            interactionOverlay.leadingAnchor.constraint(equalTo: videoFrameBox.leadingAnchor),
-            interactionOverlay.trailingAnchor.constraint(equalTo: videoFrameBox.trailingAnchor),
-            interactionOverlay.bottomAnchor.constraint(equalTo: videoFrameBox.bottomAnchor),
+            interactionOverlay.topAnchor.constraint(equalTo: workspaceView.topAnchor),
+            interactionOverlay.leadingAnchor.constraint(equalTo: workspaceView.leadingAnchor),
+            interactionOverlay.trailingAnchor.constraint(equalTo: workspaceView.trailingAnchor),
+            interactionOverlay.bottomAnchor.constraint(equalTo: workspaceView.bottomAnchor),
 
-            proxyBadgeLabel.topAnchor.constraint(equalTo: videoFrameBox.topAnchor, constant: 10),
-            proxyBadgeLabel.trailingAnchor.constraint(equalTo: videoFrameBox.trailingAnchor, constant: -10),
+            slipPreviewContainer.topAnchor.constraint(equalTo: videoFrameBox.topAnchor),
+            slipPreviewContainer.leadingAnchor.constraint(equalTo: videoFrameBox.leadingAnchor),
+            slipPreviewContainer.trailingAnchor.constraint(equalTo: videoFrameBox.trailingAnchor),
+            slipPreviewContainer.bottomAnchor.constraint(equalTo: videoFrameBox.bottomAnchor),
+
+            sourcePreviewContainer.topAnchor.constraint(equalTo: workspaceView.topAnchor),
+            sourcePreviewContainer.leadingAnchor.constraint(equalTo: workspaceView.leadingAnchor),
+            sourcePreviewContainer.trailingAnchor.constraint(equalTo: workspaceView.trailingAnchor),
+            sourcePreviewContainer.bottomAnchor.constraint(equalTo: sourceScrubBar.topAnchor, constant: -4),
+
+            sourceTitlePill.topAnchor.constraint(equalTo: workspaceView.topAnchor, constant: 10),
+            sourceTitlePill.leadingAnchor.constraint(equalTo: workspaceView.leadingAnchor, constant: 10),
+            sourceTitlePill.trailingAnchor.constraint(lessThanOrEqualTo: sourceCloseButton.leadingAnchor, constant: -10),
+            sourceTitlePill.heightAnchor.constraint(equalToConstant: 24),
+
+            sourceCloseButton.topAnchor.constraint(equalTo: workspaceView.topAnchor, constant: 10),
+            sourceCloseButton.trailingAnchor.constraint(equalTo: workspaceView.trailingAnchor, constant: -10),
+            sourceCloseButton.widthAnchor.constraint(equalToConstant: 26),
+            sourceCloseButton.heightAnchor.constraint(equalToConstant: 24),
+
+            sourceScrubBar.leadingAnchor.constraint(equalTo: workspaceView.leadingAnchor, constant: 10),
+            sourceScrubBar.trailingAnchor.constraint(equalTo: workspaceView.trailingAnchor, constant: -10),
+            sourceScrubBar.bottomAnchor.constraint(equalTo: workspaceView.bottomAnchor, constant: -8),
+            sourceScrubBar.heightAnchor.constraint(equalToConstant: 30),
+
+            proxyBadgeLabel.topAnchor.constraint(equalTo: workspaceView.topAnchor, constant: 10),
+            proxyBadgeLabel.trailingAnchor.constraint(equalTo: workspaceView.trailingAnchor, constant: -10),
             proxyBadgeLabel.widthAnchor.constraint(equalToConstant: 72),
             proxyBadgeLabel.heightAnchor.constraint(equalToConstant: 20),
 
@@ -207,6 +257,15 @@ public final class PlayerViewController: NSViewController {
 
         setupControllerBindings()
         setupLUTBindings()
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("MediaItemProxyGenerated"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.updateProxyUI()
+            }
+        }
 
         self.view = root
     }
@@ -231,7 +290,7 @@ public final class PlayerViewController: NSViewController {
         let clamped = max(0.5, min(6.0, scale))
         isZoomFitMode = false
         zoomScale = clamped
-        interactionOverlay.isPanEnabled = (clamped > 1.01)
+        interactionOverlay.isPanEnabled = true
         updateZoomButtonTitle()
         applyZoomHostLayout()
     }
@@ -242,29 +301,24 @@ public final class PlayerViewController: NSViewController {
         let factor = isPrecise ? exp(deltaY * 0.009) : exp(deltaY * 0.08)
         let newScale = max(0.5, min(6.0, oldScale * factor))
 
-        let boxSize = videoFrameBox.bounds.size
-        if boxSize.width > 0, boxSize.height > 0, oldScale > 0 {
+        let wsSize = workspaceView.bounds.size
+        if wsSize.width > 0, wsSize.height > 0, oldScale > 0 {
             let ratio = newScale / oldScale
-            let dx = anchorPoint.x - boxSize.width * 0.5 - zoomPanOffset.x
-            let dy = anchorPoint.y - boxSize.height * 0.5 - zoomPanOffset.y
+            let dx = anchorPoint.x - wsSize.width * 0.5 - zoomPanOffset.x
+            let dy = anchorPoint.y - wsSize.height * 0.5 - zoomPanOffset.y
             zoomPanOffset.x += dx * (1.0 - ratio)
             zoomPanOffset.y += dy * (1.0 - ratio)
         }
 
-        if abs(newScale - 1.0) < 0.025 && (isZoomFitMode == false && oldScale > 1.0 && newScale <= 1.025) {
-            setViewerZoomFit()
-            return
-        }
-
         isZoomFitMode = false
         zoomScale = newScale
-        interactionOverlay.isPanEnabled = (newScale > 1.01)
+        interactionOverlay.isPanEnabled = true
         updateZoomButtonTitle()
         applyZoomHostLayout()
     }
 
     private func handlePanDelta(dx: CGFloat, dy: CGFloat) {
-        guard !isZoomFitMode, zoomScale > 1.01 else { return }
+        guard !isZoomFitMode else { return }
         zoomPanOffset.x += dx
         zoomPanOffset.y += dy
         applyZoomHostLayout()
@@ -282,22 +336,39 @@ public final class PlayerViewController: NSViewController {
     }
 
     private func applyZoomHostLayout() {
-        let boxSize = videoFrameBox.bounds.size
-        guard boxSize.width > 0, boxSize.height > 0 else { return }
-        let s = isZoomFitMode ? 1.0 : zoomScale
-        let w = boxSize.width * s
-        let h = boxSize.height * s
-        let maxPanX = max(0.0, (w - boxSize.width) * 0.5)
-        let maxPanY = max(0.0, (h - boxSize.height) * 0.5)
-        zoomPanOffset.x = max(-maxPanX, min(maxPanX, zoomPanOffset.x))
-        zoomPanOffset.y = max(-maxPanY, min(maxPanY, zoomPanOffset.y))
-        if s <= 1.0 {
-            zoomPanOffset = .zero
+        let wsSize = workspaceView.bounds.size
+        guard wsSize.width > 0, wsSize.height > 0 else { return }
+
+        let availW = max(1.0, wsSize.width - 28.0)
+        let availH = max(1.0, wsSize.height - 28.0)
+        let ratio = max(0.1, currentAspectRatio)
+        let fitW: CGFloat
+        let fitH: CGFloat
+        if (availW / availH) > ratio {
+            fitH = availH
+            fitW = fitH * ratio
+        } else {
+            fitW = availW
+            fitH = fitW / ratio
         }
-        let x = (boxSize.width - w) * 0.5 + zoomPanOffset.x
-        let y = (boxSize.height - h) * 0.5 + zoomPanOffset.y
-        zoomHostView.frame = CGRect(x: x, y: y, width: w, height: h)
-        zoomHostView.layoutSubtreeIfNeeded()
+
+        let s = isZoomFitMode ? 1.0 : zoomScale
+        let w = fitW * s
+        let h = fitH * s
+
+        if isZoomFitMode {
+            zoomPanOffset = .zero
+        } else {
+            let maxPanX = abs(w - wsSize.width) * 0.5
+            let maxPanY = abs(h - wsSize.height) * 0.5
+            zoomPanOffset.x = max(-maxPanX, min(maxPanX, zoomPanOffset.x))
+            zoomPanOffset.y = max(-maxPanY, min(maxPanY, zoomPanOffset.y))
+        }
+
+        let x = (wsSize.width - w) * 0.5 + zoomPanOffset.x
+        let y = (wsSize.height - h) * 0.5 + zoomPanOffset.y
+        videoFrameBox.frame = CGRect(x: x, y: y, width: w, height: h)
+        videoFrameBox.layoutSubtreeIfNeeded()
     }
 
     @objc private func onZoomDropdownClicked() {
@@ -456,25 +527,19 @@ public final class PlayerViewController: NSViewController {
         let icon: LucideIcon = playbackController.isPlaying ? .pause : .play
         playPauseButton.image = Lucide.template(icon, size: 18)
 
-        playbackController.onWillReplaceItem = { [weak self] cgImage in
-            let apply = { [weak self] in
-                guard let self = self else { return }
-                if let cg = cgImage {
-                    self.freezeFrameOverlay.layer?.contents = cg
-                    self.freezeFrameOverlay.isHidden = false
-                } else {
-                    self.freezeFrameOverlay.isHidden = true
-                    self.freezeFrameOverlay.layer?.contents = nil
-                }
+        playbackController.addWillReplaceItemObserver(self) { [weak self] cgImage in
+            guard let self = self else { return }
+            if let cg = cgImage {
+                self.freezeFrameOverlay.layer?.contents = cg
+                self.freezeFrameOverlay.isHidden = false
+            } else {
+                // Keep previous held frame if already showing; otherwise hold black until seek finishes so frame 0 never flashes
+                self.freezeFrameOverlay.isHidden = false
             }
-            if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
         }
-        playbackController.onReadyFrameRendered = { [weak self] in
-            let clear = { [weak self] in
-                self?.freezeFrameOverlay.isHidden = true
-                self?.freezeFrameOverlay.layer?.contents = nil
-            }
-            if Thread.isMainThread { clear() } else { DispatchQueue.main.async(execute: clear) }
+        playbackController.addReadyFrameObserver(self) { [weak self] in
+            self?.freezeFrameOverlay.isHidden = true
+            self?.freezeFrameOverlay.layer?.contents = nil
         }
     }
 
@@ -495,13 +560,46 @@ public final class PlayerViewController: NSViewController {
         lutToggleButton.isToggleActive = LUTEngine.shared.isEnabled
     }
 
+    private static let lutCIContext: CIContext = {
+        // Must match VisionLUTCompositor (CompositionEngine) working space so Media Pool Source Preview & Timeline Player render identical LUT colors
+        if let device = MTLCreateSystemDefaultDevice() {
+            return CIContext(mtlDevice: device, options: [.cacheIntermediates: false, .useSoftwareRenderer: false])
+        }
+        return CIContext(options: [.cacheIntermediates: false])
+    }()
+
+    private static let renderColorSpace: CGColorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+
+    private func applyLUTToPlayerItemIfNeeded(_ playerItem: AVPlayerItem, hasVideo: Bool) {
+        guard hasVideo, let lutParams = LUTEngine.shared.currentLUTParameters() else {
+            playerItem.videoComposition = nil
+            return
+        }
+        let vComp = AVVideoComposition(asset: playerItem.asset) { request in
+            let src = request.sourceImage
+            let filtered = LUTEngine.apply(lutParams, to: src.clampedToExtent()).cropped(to: src.extent)
+            request.finish(with: filtered, context: Self.lutCIContext)
+        }
+        playerItem.videoComposition = vComp
+    }
+
+    private func applyLUTToCGImageIfNeeded(_ cgImage: CGImage) -> CGImage {
+        guard let lutParams = LUTEngine.shared.currentLUTParameters() else { return cgImage }
+        let ci = CIImage(cgImage: cgImage)
+        let filtered = LUTEngine.apply(lutParams, to: ci.clampedToExtent()).cropped(to: ci.extent)
+        return Self.lutCIContext.createCGImage(filtered, from: ci.extent, format: .RGBA8, colorSpace: Self.renderColorSpace) ?? cgImage
+    }
+
     private func updateLUTFilter() {
-        // LUT rendering executes cleanly in CompositionEngine GPU VisionLUTCompositor (never layer?.filters on AVPlayerView).
+        // Timeline rendering executes cleanly in CompositionEngine GPU VisionLUTCompositor (never layer?.filters on AVPlayerView).
         if !(playerView.layer?.filters?.isEmpty ?? true) {
             playerView.layer?.filters = []
         }
         if !(freezeFrameOverlay.layer?.filters?.isEmpty ?? true) {
             freezeFrameOverlay.layer?.filters = []
+        }
+        if isSourcePreviewActive, let srcItem = sourcePlayer?.currentItem {
+            applyLUTToPlayerItemIfNeeded(srcItem, hasVideo: !sourcePlayerView.isHidden)
         }
     }
 
@@ -579,14 +677,8 @@ public final class PlayerViewController: NSViewController {
     public func setAspectRatio(width: CGFloat, height: CGFloat) {
         guard height > 0 else { return }
         let newRatio = width / height
-        if let current = aspectConstraint {
-            videoFrameBox.removeConstraint(current)
-        }
-        let newConstraint = videoFrameBox.widthAnchor.constraint(equalTo: videoFrameBox.heightAnchor, multiplier: newRatio)
-        newConstraint.isActive = true
-        self.aspectConstraint = newConstraint
-        videoFrameBox.needsLayout = true
-        workspaceView.layoutSubtreeIfNeeded()
+        self.currentAspectRatio = newRatio
+        applyZoomHostLayout()
         DebugLogger.shared.log("Aspect ratio riquadro aggiornato a: \(Int(width))x\(Int(height)) (ratio: \(String(format: "%.2f", newRatio)))", level: .info)
     }
 
@@ -600,21 +692,232 @@ public final class PlayerViewController: NSViewController {
     }
 
     @objc private func onPlayPauseClicked() {
+        hideSourcePreview()
         playbackController.togglePlayPause()
     }
 
     @objc private func onStepBackClicked() {
+        hideSourcePreview()
         playbackController.step(by: -1)
     }
 
     @objc private func onStepForwardClicked() {
+        hideSourcePreview()
         playbackController.step(by: 1)
     }
 
     public func updateProxyUI() {
-        let isEnabled = EditorProject.shared.isProxyPlaybackEnabled
-        proxyToggleButton.isToggleActive = isEnabled
-        proxyBadgeLabel.isHidden = !isEnabled
+        let hasAnyProxy = hasAnyProxyProvider?() ?? false
+        proxyToggleButton.isHidden = !hasAnyProxy
+        let isEnabled = hasAnyProxy && EditorProject.shared.isProxyPlaybackEnabled
+        proxyToggleButton.isToggleActive = EditorProject.shared.isProxyPlaybackEnabled
+        proxyBadgeLabel.isHidden = !isEnabled || isSourcePreviewActive
+    }
+
+    private func setupSlipPreviewOverlay() {
+        slipPreviewContainer.translatesAutoresizingMaskIntoConstraints = false
+        slipPreviewContainer.wantsLayer = true
+        slipPreviewContainer.layer?.backgroundColor = NSColor(calibratedWhite: 0.04, alpha: 0.98).cgColor
+        slipPreviewContainer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+        slipPreviewContainer.setContentCompressionResistancePriority(.init(1), for: .vertical)
+        slipPreviewContainer.isHidden = true
+
+        slipHeaderLabel.translatesAutoresizingMaskIntoConstraints = false
+        slipHeaderLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold)
+        slipHeaderLabel.textColor = NSColor(calibratedWhite: 0.88, alpha: 1.0)
+        slipHeaderLabel.alignment = .center
+        slipHeaderLabel.lineBreakMode = .byTruncatingMiddle
+        slipHeaderLabel.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+
+        func makeFramePanel(
+            canvasView: NSView,
+            badgeLabel: NSTextField,
+            accentColor: NSColor
+        ) -> NSView {
+            let box = NSView()
+            box.translatesAutoresizingMaskIntoConstraints = false
+            box.wantsLayer = true
+            box.layer?.backgroundColor = NSColor.black.cgColor
+            box.layer?.cornerRadius = 4
+            box.layer?.borderWidth = 1.2
+            box.layer?.borderColor = accentColor.withAlphaComponent(0.75).cgColor
+            box.layer?.masksToBounds = true
+            box.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+            box.setContentCompressionResistancePriority(.init(1), for: .vertical)
+
+            canvasView.translatesAutoresizingMaskIntoConstraints = false
+            canvasView.wantsLayer = true
+            canvasView.layer?.backgroundColor = NSColor.black.cgColor
+            canvasView.layer?.contentsGravity = .resizeAspect
+            canvasView.layer?.masksToBounds = true
+            canvasView.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+            canvasView.setContentCompressionResistancePriority(.init(1), for: .vertical)
+            box.addSubview(canvasView)
+
+            let pill = NSView()
+            pill.translatesAutoresizingMaskIntoConstraints = false
+            pill.wantsLayer = true
+            pill.layer?.backgroundColor = NSColor(calibratedWhite: 0.06, alpha: 0.86).cgColor
+            pill.layer?.cornerRadius = 3
+            pill.layer?.borderWidth = 0.8
+            pill.layer?.borderColor = accentColor.withAlphaComponent(0.65).cgColor
+            box.addSubview(pill)
+
+            badgeLabel.translatesAutoresizingMaskIntoConstraints = false
+            badgeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .bold)
+            badgeLabel.textColor = accentColor
+            pill.addSubview(badgeLabel)
+
+            NSLayoutConstraint.activate([
+                canvasView.topAnchor.constraint(equalTo: box.topAnchor),
+                canvasView.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+                canvasView.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+                canvasView.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+
+                pill.topAnchor.constraint(equalTo: box.topAnchor, constant: 6),
+                pill.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 6),
+                badgeLabel.topAnchor.constraint(equalTo: pill.topAnchor, constant: 2),
+                badgeLabel.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -2),
+                badgeLabel.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 5),
+                badgeLabel.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -5)
+            ])
+            return box
+        }
+
+        let inPanel = makeFramePanel(
+            canvasView: slipInCanvasView,
+            badgeLabel: slipInTimeLabel,
+            accentColor: NSColor(calibratedRed: 0.25, green: 0.85, blue: 0.55, alpha: 1.0)
+        )
+        let outPanel = makeFramePanel(
+            canvasView: slipOutCanvasView,
+            badgeLabel: slipOutTimeLabel,
+            accentColor: NSColor(calibratedRed: 1.0, green: 0.65, blue: 0.20, alpha: 1.0)
+        )
+
+        let stack = NSStackView(views: [inPanel, outPanel])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .horizontal
+        stack.distribution = .fillEqually
+        stack.spacing = 6
+        stack.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+        stack.setContentCompressionResistancePriority(.init(1), for: .vertical)
+
+        slipPreviewContainer.addSubview(slipHeaderLabel)
+        slipPreviewContainer.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            slipHeaderLabel.topAnchor.constraint(equalTo: slipPreviewContainer.topAnchor, constant: 4),
+            slipHeaderLabel.leadingAnchor.constraint(equalTo: slipPreviewContainer.leadingAnchor, constant: 8),
+            slipHeaderLabel.trailingAnchor.constraint(equalTo: slipPreviewContainer.trailingAnchor, constant: -8),
+
+            stack.topAnchor.constraint(equalTo: slipHeaderLabel.bottomAnchor, constant: 4),
+            stack.leadingAnchor.constraint(equalTo: slipPreviewContainer.leadingAnchor, constant: 4),
+            stack.trailingAnchor.constraint(equalTo: slipPreviewContainer.trailingAnchor, constant: -4),
+            stack.bottomAnchor.constraint(equalTo: slipPreviewContainer.bottomAnchor, constant: -4)
+        ])
+    }
+
+    private func formatSlipTimecode(_ seconds: Double, fps: Double) -> String {
+        let safeSec = max(0.0, seconds)
+        let safeFps = max(1.0, fps)
+        let totalFrames = Int((safeSec * safeFps).rounded())
+        let fpsInt = max(1, Int(safeFps.rounded()))
+        let ff = totalFrames % fpsInt
+        let totalSecs = totalFrames / fpsInt
+        let ss = totalSecs % 60
+        let mm = (totalSecs / 60) % 60
+        let hh = totalSecs / 3600
+        if hh > 0 {
+            return String(format: "%02d:%02d:%02d:%02d", hh, mm, ss, ff)
+        }
+        return String(format: "%02d:%02d:%02d", mm, ss, ff)
+    }
+
+    public func showSlipDualPreview(url: URL, inSeconds: Double, outSeconds: Double, fps: Double, clipName: String) {
+        if isSourcePreviewActive {
+            hideSourcePreview()
+        }
+        let wasHidden = slipPreviewContainer.isHidden
+        let urlChanged = slipGeneratorURL != url
+        if urlChanged || wasHidden {
+            slipGenerator?.cancelAllCGImageGeneration()
+            isSlipDecodeInFlight = false
+            pendingSlipRequest = nil
+            if urlChanged {
+                let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+                let gen = AVAssetImageGenerator(asset: asset)
+                gen.appliesPreferredTrackTransform = true
+                gen.maximumSize = CGSize(width: 960, height: 540)
+                let tol = CMTime(seconds: 0.04, preferredTimescale: 600)
+                gen.requestedTimeToleranceBefore = tol
+                gen.requestedTimeToleranceAfter = tol
+                slipGenerator = gen
+                slipGeneratorURL = url
+                slipInCanvasView.layer?.contents = nil
+                slipOutCanvasView.layer?.contents = nil
+            }
+        }
+
+        slipPreviewContainer.isHidden = false
+        let inTC = formatSlipTimecode(inSeconds, fps: fps)
+        let outTC = formatSlipTimecode(outSeconds, fps: fps)
+        slipHeaderLabel.stringValue = "SLIP — \(clipName)"
+        slipInTimeLabel.stringValue = "IN \(inTC)"
+        slipOutTimeLabel.stringValue = "OUT \(outTC)"
+
+        if isSlipDecodeInFlight {
+            pendingSlipRequest = (url: url, inSec: inSeconds, outSec: outSeconds, fps: fps)
+            return
+        }
+        startSlipDecode(url: url, inSeconds: inSeconds, outSeconds: outSeconds, fps: fps)
+    }
+
+    private func startSlipDecode(url: URL, inSeconds: Double, outSeconds: Double, fps: Double) {
+        guard let gen = slipGenerator, slipGeneratorURL == url, !slipPreviewContainer.isHidden else { return }
+        isSlipDecodeInFlight = true
+        slipRequestToken &+= 1
+        let token = slipRequestToken
+
+        let frameStep = 0.5 / max(1.0, fps)
+        let reqInSec = max(0.0, inSeconds)
+        let reqOutSec = max(reqInSec, outSeconds - frameStep)
+        let inCM = CMTime(seconds: reqInSec, preferredTimescale: 600)
+        let outCM = CMTime(seconds: reqOutSec, preferredTimescale: 600)
+
+        var remaining = 2
+        gen.generateCGImagesAsynchronously(forTimes: [NSValue(time: inCM), NSValue(time: outCM)]) { [weak self] requestedTime, cgImage, _, result, _ in
+            let processedCG: CGImage? = (result == .succeeded) ? cgImage.map { self?.applyLUTToCGImageIfNeeded($0) ?? $0 } : nil
+            let isStart = abs(CMTimeGetSeconds(requestedTime) - reqInSec) <= abs(CMTimeGetSeconds(requestedTime) - reqOutSec)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if self.slipRequestToken == token, !self.slipPreviewContainer.isHidden, let cg = processedCG {
+                    if isStart {
+                        self.slipInCanvasView.layer?.contents = cg
+                    } else {
+                        self.slipOutCanvasView.layer?.contents = cg
+                    }
+                }
+                remaining -= 1
+                if remaining <= 0, self.slipRequestToken == token {
+                    self.isSlipDecodeInFlight = false
+                    if let next = self.pendingSlipRequest {
+                        self.pendingSlipRequest = nil
+                        if !self.slipPreviewContainer.isHidden {
+                            self.startSlipDecode(url: next.url, inSeconds: next.inSec, outSeconds: next.outSec, fps: next.fps)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public func hideSlipDualPreview() {
+        slipRequestToken &+= 1
+        isSlipDecodeInFlight = false
+        pendingSlipRequest = nil
+        slipGenerator?.cancelAllCGImageGeneration()
+        slipPreviewContainer.isHidden = true
     }
 
     @objc private func onProxyToggleClicked() {
@@ -622,6 +925,354 @@ public final class PlayerViewController: NSViewController {
         updateProxyUI()
         DebugLogger.shared.log("Riproduzione Proxy: \(EditorProject.shared.isProxyPlaybackEnabled ? "ATTIVA ⚡ (File leggeri conformi)" : "DISATTIVA (File originali alta ris.)")", level: .info)
         onProxyToggled?()
+    }
+
+    // MARK: - Media Pool Source Clip Preview
+
+    private func setupSourcePreviewOverlay() {
+        sourcePreviewContainer.translatesAutoresizingMaskIntoConstraints = false
+        sourcePreviewContainer.wantsLayer = true
+        sourcePreviewContainer.layer?.backgroundColor = NSColor(calibratedWhite: 0.05, alpha: 1.0).cgColor
+        sourcePreviewContainer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+        sourcePreviewContainer.setContentCompressionResistancePriority(.init(1), for: .vertical)
+        sourcePreviewContainer.isHidden = true
+
+        sourcePlayerView.translatesAutoresizingMaskIntoConstraints = false
+        sourcePlayerView.wantsLayer = true
+        sourcePlayerView.controlsStyle = .none
+        sourcePlayerView.showsFullScreenToggleButton = false
+        sourcePlayerView.videoGravity = .resizeAspect
+        if #available(macOS 13.0, *) {
+            sourcePlayerView.allowsVideoFrameAnalysis = false
+        }
+        sourcePreviewContainer.addSubview(sourcePlayerView)
+
+        sourceAudioPlaceholder.translatesAutoresizingMaskIntoConstraints = false
+        sourceAudioPlaceholder.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        sourceAudioPlaceholder.textColor = .systemGreen
+        sourceAudioPlaceholder.alignment = .center
+        sourceAudioPlaceholder.isHidden = true
+        sourcePreviewContainer.addSubview(sourceAudioPlaceholder)
+
+        sourceTitlePill.translatesAutoresizingMaskIntoConstraints = false
+        sourceTitlePill.wantsLayer = true
+        sourceTitlePill.layer?.backgroundColor = NSColor(calibratedWhite: 0.08, alpha: 0.88).cgColor
+        sourceTitlePill.layer?.cornerRadius = 5
+        sourceTitlePill.layer?.borderWidth = 1.0
+        sourceTitlePill.layer?.borderColor = NSColor.systemCyan.withAlphaComponent(0.45).cgColor
+        sourceTitlePill.isHidden = true
+
+        sourceTitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        sourceTitleLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        sourceTitleLabel.textColor = .white
+        sourceTitleLabel.lineBreakMode = .byTruncatingMiddle
+        sourceTitlePill.addSubview(sourceTitleLabel)
+
+        sourceCloseButton.translatesAutoresizingMaskIntoConstraints = false
+        sourceCloseButton.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+        sourceCloseButton.toolTip = "Chiudi anteprima clip"
+        sourceCloseButton.target = self
+        sourceCloseButton.action = #selector(onCloseSourcePreviewClicked)
+        sourceCloseButton.isHidden = true
+
+        sourceScrubBar.translatesAutoresizingMaskIntoConstraints = false
+        sourceScrubBar.isHidden = true
+        sourceScrubBar.onTogglePlayPause = { [weak self] in
+            self?.toggleSourcePlayPause()
+        }
+        sourceScrubBar.onScrubSeconds = { [weak self] sec, isStart in
+            guard let self = self, let player = self.sourcePlayer else { return }
+            if isStart {
+                self.isScrubbingSourceBar = true
+                player.pause()
+                self.sourceScrubBar.setPlayingState(false)
+            }
+            let target = CMTime(seconds: max(0.0, sec), preferredTimescale: 600)
+            player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+        }
+        sourceScrubBar.onScrubEnded = { [weak self] in
+            self?.isScrubbingSourceBar = false
+        }
+
+        NSLayoutConstraint.activate([
+            sourcePlayerView.topAnchor.constraint(equalTo: sourcePreviewContainer.topAnchor),
+            sourcePlayerView.leadingAnchor.constraint(equalTo: sourcePreviewContainer.leadingAnchor),
+            sourcePlayerView.trailingAnchor.constraint(equalTo: sourcePreviewContainer.trailingAnchor),
+            sourcePlayerView.bottomAnchor.constraint(equalTo: sourcePreviewContainer.bottomAnchor),
+
+            sourceAudioPlaceholder.centerXAnchor.constraint(equalTo: sourcePreviewContainer.centerXAnchor),
+            sourceAudioPlaceholder.centerYAnchor.constraint(equalTo: sourcePreviewContainer.centerYAnchor),
+
+            sourceTitleLabel.leadingAnchor.constraint(equalTo: sourceTitlePill.leadingAnchor, constant: 8),
+            sourceTitleLabel.trailingAnchor.constraint(equalTo: sourceTitlePill.trailingAnchor, constant: -8),
+            sourceTitleLabel.centerYAnchor.constraint(equalTo: sourceTitlePill.centerYAnchor)
+        ])
+    }
+
+    @objc private func onCloseSourcePreviewClicked() {
+        hideSourcePreview()
+    }
+
+    public func showSourcePreview(item: MediaItem, usedRangesInTimeline: [(start: Double, end: Double)]) {
+        if !slipPreviewContainer.isHidden {
+            hideSlipDualPreview()
+        }
+        cleanupSourcePlayerObservers()
+
+        let durSec = max(0.05, CMTimeGetSeconds(item.duration))
+        let playerItem = AVPlayerItem(url: item.effectiveURL)
+        applyLUTToPlayerItemIfNeeded(playerItem, hasVideo: item.hasVideo)
+        let player = AVPlayer(playerItem: playerItem)
+        sourcePlayer = player
+        sourcePlayerView.player = player
+
+        sourcePreviewMediaId = item.id
+        isSourcePreviewActive = true
+        sourcePreviewContainer.isHidden = false
+        sourceTitlePill.isHidden = false
+        sourceCloseButton.isHidden = false
+        sourceScrubBar.isHidden = false
+        sourceAudioPlaceholder.isHidden = item.hasVideo
+        sourcePlayerView.isHidden = !item.hasVideo
+        zoomButton.isHidden = true
+        proxyBadgeLabel.isHidden = true
+
+        sourceTitleLabel.stringValue = "Sorgente: \(item.name)"
+        sourceScrubBar.configure(duration: durSec, current: 0.0, usedRanges: usedRangesInTimeline, isPlaying: false)
+
+        let interval = CMTime(seconds: 0.03, preferredTimescale: 600)
+        sourceTimeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+            guard let self = self, self.isSourcePreviewActive, !self.isScrubbingSourceBar else { return }
+            let sec = max(0.0, CMTimeGetSeconds(time))
+            self.sourceScrubBar.updateCurrentTime(sec)
+        }
+        sourceEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: playerItem,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self, let p = self.sourcePlayer else { return }
+            p.pause()
+            p.seek(to: .zero)
+            self.sourceScrubBar.setPlayingState(false)
+            self.sourceScrubBar.updateCurrentTime(0.0)
+        }
+    }
+
+    public func updateSourceUsedRanges(_ ranges: [(start: Double, end: Double)], forMediaId mediaId: UUID) {
+        guard isSourcePreviewActive, sourcePreviewMediaId == mediaId else { return }
+        sourceScrubBar.updateUsedRanges(ranges)
+    }
+
+    public func toggleSourcePlayPause() {
+        guard isSourcePreviewActive, let player = sourcePlayer else { return }
+        if player.rate > 0.01 {
+            player.pause()
+            sourceScrubBar.setPlayingState(false)
+        } else {
+            player.play()
+            sourceScrubBar.setPlayingState(true)
+        }
+    }
+
+    public func hideSourcePreview() {
+        guard isSourcePreviewActive else { return }
+        cleanupSourcePlayerObservers()
+        sourcePlayer?.pause()
+        sourcePlayer?.replaceCurrentItem(with: nil)
+        sourcePlayerView.player = nil
+        sourcePlayer = nil
+        isSourcePreviewActive = false
+        sourcePreviewMediaId = nil
+        isScrubbingSourceBar = false
+        sourcePreviewContainer.isHidden = true
+        sourceTitlePill.isHidden = true
+        sourceCloseButton.isHidden = true
+        sourceScrubBar.isHidden = true
+        zoomButton.isHidden = false
+        updateProxyUI()
+    }
+
+    private func cleanupSourcePlayerObservers() {
+        if let obs = sourceTimeObserver, let player = sourcePlayer {
+            player.removeTimeObserver(obs)
+        }
+        sourceTimeObserver = nil
+        if let endObs = sourceEndObserver {
+            NotificationCenter.default.removeObserver(endObs)
+        }
+        sourceEndObserver = nil
+    }
+}
+
+private final class SourceClipScrubBar: NSView {
+    var onTogglePlayPause: (() -> Void)?
+    var onScrubSeconds: ((Double, Bool) -> Void)?
+    var onScrubEnded: (() -> Void)?
+
+    private var totalDuration: Double = 1.0
+    private var currentSeconds: Double = 0.0
+    private var usedRanges: [(start: Double, end: Double)] = []
+    private var isPlaying: Bool = false
+    private var isDraggingTrack: Bool = false
+
+    private let playButton = IconActionButton(toolTip: "Riproduci / Pausa clip originale (Spazio)", isToggleMode: false)
+    private let timeLabel = NSTextField(labelWithString: "00:00 / 00:00")
+
+    override var isFlipped: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(calibratedWhite: 0.07, alpha: 0.90).cgColor
+        layer?.cornerRadius = 6
+        layer?.borderWidth = 1.0
+        layer?.borderColor = NSColor(calibratedWhite: 0.24, alpha: 0.9).cgColor
+
+        playButton.translatesAutoresizingMaskIntoConstraints = false
+        playButton.image = Lucide.template(.play, size: 13)
+        playButton.activeTintColor = .white
+        playButton.target = self
+        playButton.action = #selector(onPlayClicked)
+        addSubview(playButton)
+
+        timeLabel.translatesAutoresizingMaskIntoConstraints = false
+        timeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold)
+        timeLabel.textColor = NSColor(calibratedWhite: 0.85, alpha: 1.0)
+        timeLabel.alignment = .right
+        addSubview(timeLabel)
+
+        NSLayoutConstraint.activate([
+            playButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            playButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            playButton.widthAnchor.constraint(equalToConstant: 20),
+            playButton.heightAnchor.constraint(equalToConstant: 20),
+
+            timeLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            timeLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            timeLabel.widthAnchor.constraint(equalToConstant: 82)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func onPlayClicked() {
+        onTogglePlayPause?()
+    }
+
+    func configure(duration: Double, current: Double, usedRanges: [(start: Double, end: Double)], isPlaying: Bool) {
+        self.totalDuration = max(0.05, duration)
+        self.currentSeconds = max(0.0, min(self.totalDuration, current))
+        self.usedRanges = usedRanges
+        setPlayingState(isPlaying)
+        updateTimeLabel()
+        needsDisplay = true
+    }
+
+    func updateCurrentTime(_ sec: Double) {
+        currentSeconds = max(0.0, min(totalDuration, sec))
+        updateTimeLabel()
+        needsDisplay = true
+    }
+
+    func updateUsedRanges(_ ranges: [(start: Double, end: Double)]) {
+        self.usedRanges = ranges
+        needsDisplay = true
+    }
+
+    func setPlayingState(_ playing: Bool) {
+        isPlaying = playing
+        playButton.image = Lucide.template(playing ? .pause : .play, size: 13)
+    }
+
+    private func formatMMSS(_ sec: Double) -> String {
+        let s = max(0, Int(sec.rounded(.down)))
+        return String(format: "%02d:%02d", s / 60, s % 60)
+    }
+
+    private func updateTimeLabel() {
+        timeLabel.stringValue = "\(formatMMSS(currentSeconds)) / \(formatMMSS(totalDuration))"
+    }
+
+    private var trackRect: CGRect {
+        let startX: CGFloat = 32
+        let endX = max(startX + 40, bounds.width - 96)
+        return CGRect(x: startX, y: (bounds.height - 6) * 0.5, width: endX - startX, height: 6)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let tr = trackRect
+        guard tr.width > 8 else { return }
+
+        // Traccia base dell'intera clip originale
+        ctx.setFillColor(NSColor(calibratedWhite: 0.24, alpha: 1.0).cgColor)
+        ctx.addPath(CGPath(roundedRect: tr, cornerWidth: 3, cornerHeight: 3, transform: nil))
+        ctx.fillPath()
+
+        // Evidenzia le parti attualmente presenti nella timeline attiva
+        for seg in usedRanges {
+            let s = max(0.0, min(totalDuration, seg.start))
+            let e = max(s, min(totalDuration, seg.end))
+            guard e > s + 0.005 else { continue }
+            let x1 = tr.minX + CGFloat(s / totalDuration) * tr.width
+            let x2 = tr.minX + CGFloat(e / totalDuration) * tr.width
+            let w = max(3.0, x2 - x1)
+            let hlRect = CGRect(x: x1, y: tr.minY - 1, width: min(tr.maxX - x1, w), height: tr.height + 2)
+            ctx.setFillColor(NSColor.systemCyan.withAlphaComponent(0.92).cgColor)
+            ctx.addPath(CGPath(roundedRect: hlRect, cornerWidth: 2, cornerHeight: 2, transform: nil))
+            ctx.fillPath()
+        }
+
+        // Posizione corrente (testina sorgente)
+        let frac = max(0.0, min(1.0, currentSeconds / totalDuration))
+        let px = tr.minX + CGFloat(frac) * tr.width
+        ctx.setFillColor(NSColor.white.cgColor)
+        let cursorRect = CGRect(x: px - 1.5, y: tr.minY - 4, width: 3, height: tr.height + 8)
+        ctx.addPath(CGPath(roundedRect: cursorRect, cornerWidth: 1.5, cornerHeight: 1.5, transform: nil))
+        ctx.fillPath()
+    }
+
+    private func secondsAtPoint(_ pt: CGPoint) -> Double {
+        let tr = trackRect
+        guard tr.width > 1 else { return 0 }
+        let norm = max(0.0, min(1.0, Double((pt.x - tr.minX) / tr.width)))
+        return norm * totalDuration
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        let hitZone = trackRect.insetBy(dx: -4, dy: -8)
+        guard hitZone.contains(pt) else {
+            super.mouseDown(with: event)
+            return
+        }
+        isDraggingTrack = true
+        let sec = secondsAtPoint(pt)
+        updateCurrentTime(sec)
+        onScrubSeconds?(sec, true)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isDraggingTrack else {
+            super.mouseDragged(with: event)
+            return
+        }
+        let pt = convert(event.locationInWindow, from: nil)
+        let sec = secondsAtPoint(pt)
+        updateCurrentTime(sec)
+        onScrubSeconds?(sec, false)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if isDraggingTrack {
+            isDraggingTrack = false
+            onScrubEnded?()
+        } else {
+            super.mouseUp(with: event)
+        }
     }
 }
 

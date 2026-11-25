@@ -262,6 +262,14 @@ public final class LUTEngine: @unchecked Sendable {
         return cachedFilter
     }
 
+    /// Chiave univoca per la cache miniature quando una LUT è attiva (`"off"` se disattivata).
+    public var cacheSignature: String {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard isEnabled else { return "off" }
+        return "\(currentPreset.rawValue)|\(activeCustomLUTPath ?? "")"
+    }
+
     /// Snapshot thread-safe e immutabile dei parametri LUT per l'esecuzione hardware Metal su `AVVideoCompositing`.
     public func currentLUTParameters() -> LUTParameters? {
         stateLock.lock()

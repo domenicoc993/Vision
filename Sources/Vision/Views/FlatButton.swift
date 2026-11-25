@@ -1,6 +1,102 @@
 import AppKit
 
+private final class FlatButtonCell: NSButtonCell {
+    override func drawInterior(withFrame cellFrame: NSRect, in controlView: NSView) {
+        let btn = controlView as? FlatButton
+        let tint = btn?.contentTintColor ?? .labelColor
+        let hPad: CGFloat = 8
+        let gap: CGFloat = 6
+
+        let hasImage = (imagePosition != .noImage) && (image != nil)
+        let rawTitle = self.title ?? ""
+        let hasTitle = !rawTitle.isEmpty && (imagePosition != .imageOnly)
+
+        let drawFont = font ?? NSFont.systemFont(ofSize: 11, weight: .medium)
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byTruncatingTail
+        style.alignment = .left
+        let attrTitle = NSAttributedString(
+            string: rawTitle,
+            attributes: [
+                .font: drawFont,
+                .foregroundColor: tint,
+                .paragraphStyle: style
+            ]
+        )
+
+        func drawTintedImage(_ img: NSImage, in rect: NSRect) {
+            let finalImg: NSImage
+            if img.isTemplate {
+                let targetSize = rect.size
+                finalImg = NSImage(size: targetSize, flipped: false) { bounds in
+                    img.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1.0)
+                    tint.setFill()
+                    bounds.fill(using: .sourceAtop)
+                    return true
+                }
+            } else {
+                finalImg = img
+            }
+            finalImg.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: true, hints: nil)
+        }
+
+        if hasImage, let img = image, hasTitle {
+            let imgSize = img.size
+            let textSize = attrTitle.size()
+            let totalW = imgSize.width + gap + ceil(textSize.width)
+            let startX = max(cellFrame.minX + hPad, floor(cellFrame.midX - totalW * 0.5))
+            let imgRect = NSRect(
+                x: startX,
+                y: floor(cellFrame.midY - imgSize.height * 0.5),
+                width: imgSize.width,
+                height: imgSize.height
+            )
+            drawTintedImage(img, in: imgRect)
+
+            let textX = startX + imgSize.width + gap
+            let maxTextW = max(0, cellFrame.maxX - hPad - textX)
+            let textRect = NSRect(
+                x: textX,
+                y: floor(cellFrame.midY - textSize.height * 0.5),
+                width: min(ceil(textSize.width), maxTextW),
+                height: ceil(textSize.height)
+            )
+            attrTitle.draw(in: textRect)
+        } else if hasImage, let img = image {
+            let imgSize = img.size
+            let imgRect = NSRect(
+                x: floor(cellFrame.midX - imgSize.width * 0.5),
+                y: floor(cellFrame.midY - imgSize.height * 0.5),
+                width: imgSize.width,
+                height: imgSize.height
+            )
+            drawTintedImage(img, in: imgRect)
+        } else if hasTitle {
+            let textSize = attrTitle.size()
+            let maxTextW = max(0, cellFrame.width - hPad * 2)
+            let drawW = min(ceil(textSize.width), maxTextW)
+            let textX = max(cellFrame.minX + hPad, floor(cellFrame.midX - drawW * 0.5))
+            let textRect = NSRect(
+                x: textX,
+                y: floor(cellFrame.midY - textSize.height * 0.5),
+                width: drawW,
+                height: ceil(textSize.height)
+            )
+            attrTitle.draw(in: textRect)
+        }
+    }
+}
+
 public final class FlatButton: NSButton {
+    public override class var cellClass: AnyClass? {
+        get { FlatButtonCell.self }
+        set {}
+    }
+
+    public var customBackgroundColor: NSColor? { didSet { updateColors() } }
+    public var customBorderColor: NSColor? { didSet { updateColors() } }
+    public var customTextColor: NSColor? { didSet { updateColors() } }
+
     public override var isEnabled: Bool {
         didSet {
             if !isEnabled {
@@ -40,7 +136,34 @@ public final class FlatButton: NSButton {
 
     public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    public override var intrinsicContentSize: NSSize {
+        let hPad: CGFloat = 10
+        let gap: CGFloat = 6
+        let hasImg = (imagePosition != .noImage) && (image != nil)
+        let hasTxt = !title.isEmpty && (imagePosition != .imageOnly)
+        let imgW = hasImg ? (image?.size.width ?? 0) : 0
+        let imgH = hasImg ? (image?.size.height ?? 0) : 0
+        let textSize = hasTxt ? (title as NSString).size(withAttributes: [.font: font ?? NSFont.systemFont(ofSize: 11, weight: .medium)]) : .zero
+        var w = hPad * 2
+        if hasImg && hasTxt {
+            w += imgW + gap + ceil(textSize.width)
+        } else if hasImg {
+            w += imgW
+        } else if hasTxt {
+            w += ceil(textSize.width)
+        }
+        let h = max(22, max(imgH, ceil(textSize.height)) + 6)
+        return NSSize(width: ceil(w), height: ceil(h))
+    }
+
     private func setupUI() {
+        if !(cell is FlatButtonCell) {
+            let newCell = FlatButtonCell(textCell: title)
+            newCell.image = image
+            newCell.target = target
+            newCell.action = action
+            self.cell = newCell
+        }
         wantsLayer = true
         isBordered = false
         bezelStyle = .regularSquare
@@ -110,7 +233,12 @@ public final class FlatButton: NSButton {
             return
         }
 
-        if !isEnabled {
+        if let customBg = customBackgroundColor {
+            layer?.backgroundColor = customBg.withAlphaComponent(isPressed ? 0.42 : (isHovered ? 0.34 : customBg.alphaComponent)).cgColor
+            layer?.borderColor = (customBorderColor ?? customBg).cgColor
+            layer?.borderWidth = 1.0
+            contentTintColor = customTextColor ?? .white
+        } else if !isEnabled {
             layer?.backgroundColor = NSColor(calibratedWhite: 0.11, alpha: 1.0).cgColor
             layer?.borderColor = NSColor(calibratedWhite: 0.18, alpha: 1.0).cgColor
             layer?.borderWidth = 1.0
